@@ -13,9 +13,12 @@ use tokio::time::{sleep, Duration};
 include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
 use crate::ev::protos::*;
 use crate::ev::SensorMessageId::*;
+use crate::mitm::protos::InputMessageId::INPUT_MESSAGE_INPUT_REPORT;
+use crate::mitm::protos::{InputReport, KeyEvent};
 use crate::mitm::Packet;
 use crate::mitm::{ENCRYPTED, FRAME_TYPE_FIRST, FRAME_TYPE_LAST};
 use protobuf::Message;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -117,6 +120,59 @@ pub async fn send_ev_data(tx: Sender<Packet>, sensor_ch: u8, batt: BatteryData) 
     };
     tx.send(pkt).await?;
     info!("{} injecting ENERGY_MODEL_DATA packet...", NAME);
+
+    Ok(())
+}
+
+pub async fn send_key_event(tx: Sender<Packet>, input_ch: u8, keycode: u32) -> Result<()> {
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+
+    // Helper to build one InputReport (down=true or down=false)
+    let build_pkt = |ch: u8, down: bool, flags: u8| -> Packet {
+        let mut key = crate::mitm::protos::key_event::Key::new();
+        key.set_keycode(keycode);
+        key.set_down(down);
+
+        let mut key_event = KeyEvent::new();
+        key_event.keys.push(key);
+
+        let mut report = InputReport::new();
+        report.set_timestamp(now_us);
+        report.key_event = protobuf::MessageField::some(key_event);
+
+        let mut payload = report.write_to_bytes().expect("serialize InputReport");
+        let msg_id = INPUT_MESSAGE_INPUT_REPORT as u16;
+        payload.insert(0, (msg_id >> 8) as u8);
+        payload.insert(1, (msg_id & 0xff) as u8);
+
+        Packet {
+            channel: ch,
+            flags,
+            final_length: None,
+            payload,
+        }
+    };
+
+    // Send key DOWN
+    tx.send(build_pkt(
+        input_ch,
+        true,
+        ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+    ))
+    .await?;
+    info!("{} injecting key DOWN (keycode={})", NAME, keycode);
+
+    // Send key UP
+    tx.send(build_pkt(
+        input_ch,
+        false,
+        ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+    ))
+    .await?;
+    info!("{} injecting key UP (keycode={})", NAME, keycode);
 
     Ok(())
 }

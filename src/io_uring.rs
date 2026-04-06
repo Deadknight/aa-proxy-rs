@@ -321,6 +321,7 @@ pub async fn io_loop(
     config: SharedConfig,
     tx: Arc<Mutex<Option<Sender<Packet>>>>,
     sensor_channel: Arc<Mutex<Option<u8>>>,
+    input_channel: Arc<Mutex<Option<u8>>>,
 ) -> Result<()> {
     let shared_config = config.clone();
     #[allow(unused_variables)]
@@ -507,6 +508,7 @@ pub async fn io_loop(
             rxr_md,
             shared_config.clone(),
             sensor_channel.clone(),
+            input_channel.clone(),
             ev_tx.clone(),
         ));
         from_stream = tokio_uring::spawn(proxy(
@@ -518,6 +520,7 @@ pub async fn io_loop(
             rxr_hu,
             shared_config.clone(),
             sensor_channel.clone(),
+            input_channel.clone(),
             ev_tx.clone(),
         ));
 
