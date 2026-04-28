@@ -211,6 +211,10 @@
           "typ": "boolean",
           "description": "Enable to disable driving restrictions."
         },
+	"hu_button_handler": {
+          "typ": "string",
+          "description": "Path to a script or executable invoked on HU media-key long press.\nTwo arguments are always appended by aa-proxy-rs:\n  1. keycode (u32) — Android key code of the long-pressed key\n  2. elapsed_ms — how long the key was held, in milliseconds\nAdditional arguments embedded in the path are supported (shell-word splitting).\nWhen empty or absent, HU media-key interception is fully disabled.\nRequires `mitm = true`."
+        },
         "tire_pressure": {
           "typ": "boolean",
           "description": "Enable tire pressure sensor reporting (for head units that don't provide this data). Once active, readings for up to 4 tires can be pushed via POST /tire-pressure (values in kPa, order: FL, FR, RL, RR)."

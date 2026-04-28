@@ -148,6 +148,19 @@ pub struct AppConfig {
     pub media_wait_for_live_idr: bool,
     pub collect_speed: bool,
     pub disable_driving_status: bool,
+    /// Optional shell command invoked on HU media-key long press.
+    ///
+    /// The command is split on whitespace (shell-word rules), so you can include
+    /// arguments, e.g. `/data/bin/my-script --mode aa`.
+    /// Two extra arguments are always appended by aa-proxy-rs:
+    ///   1. keycode (u32) — the raw Android key code that was long-pressed
+    ///   2. elapsed_ms (u128) — how long the key was held in milliseconds
+    ///
+    /// When this option is empty or absent, HU media-key interception is disabled
+    /// and all key events are forwarded unmodified.
+    /// Requires `mitm = true`.
+    #[serde(default, deserialize_with = "empty_string_as_none")]
+    pub hu_button_handler: Option<String>,
 
     #[serde(skip)]
     pub action_requested: Option<Action>,
@@ -305,6 +318,7 @@ impl Default for AppConfig {
             media_wait_for_live_idr: true,
             collect_speed: false,
             disable_driving_status: false,
+            hu_button_handler: None,
         }
     }
 }
@@ -399,6 +413,9 @@ impl AppConfig {
         doc["media_wait_for_live_idr"] = value(self.media_wait_for_live_idr);
         doc["collect_speed"] = value(self.collect_speed);
         doc["disable_driving_status"] = value(self.disable_driving_status);
+        if let Some(cmd) = &self.hu_button_handler {
+            doc["hu_button_handler"] = value(cmd);
+        }
 
         let _ = fs::write(config_file, doc.to_string());
     }

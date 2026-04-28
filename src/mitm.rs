@@ -53,6 +53,7 @@ use protos::ControlMessageType::{self, *};
 use crate::config::{Action::Stop, AppConfig, SharedConfig};
 use crate::config_types::HexdumpLevel;
 use crate::ev::EvTaskCommand;
+use crate::hu_input::{handle_hu_input, HuInputState};
 use crate::io_uring::Endpoint;
 use crate::io_uring::IoDevice;
 use crate::io_uring::BUFFER_LEN;
@@ -96,6 +97,7 @@ pub struct ModifyContext {
     ev_tx: Sender<EvTaskCommand>,
     input_channel: Option<u8>,
     hu_tx: Option<Sender<Packet>>,
+    hu_input_state: HuInputState,
     /// Offset→sink map (keys 0-6). Used only at SDR time to look up which sink
     /// to assign to each real channel. Never used for tapping.
     media_sinks: HashMap<u8, MediaSink>,
@@ -126,7 +128,7 @@ pub enum ProxyType {
     MobileDevice,
 }
 
-/// Action returned by [`pkt_modify_hook`].
+/// Action returned by [`pkt_modify_hook`] and [`handle_hu_input`].
 ///
 /// The main loop uses this to decide what to do with the packet after
 /// the hook has run.
@@ -432,6 +434,32 @@ pub async fn pkt_modify_hook(
         match handled {
             true => return Ok(PacketAction::SendBack),
             false => {}
+        }
+    }
+
+    // HU button interception (only active when a handler command is configured)
+    if proxy_type == ProxyType::HeadUnit && cfg.hu_button_handler.is_some() {
+        if let Some(input_ch) = ctx.input_channel {
+            let action = handle_hu_input(
+                pkt,
+                &mut ctx.hu_input_state,
+                ctx.hu_tx.as_ref(),
+                input_ch,
+                cfg.hu_button_handler.as_deref(),
+            )
+            .await;
+
+            match action {
+                PacketAction::Drop => {
+                    debug!("{} hu_input: packet dropped", get_name(proxy_type));
+                    return Ok(PacketAction::Drop);
+                }
+                PacketAction::SendBack => {
+                    debug!("{} hu_input: sending packet back", get_name(proxy_type));
+                    return Ok(PacketAction::SendBack);
+                }
+                PacketAction::Forward => {}
+            }
         }
     }
 
@@ -1721,6 +1749,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         audio_channels: vec![],
         ev_tx,
         hu_tx,
+        hu_input_state: HuInputState::default(),
         media_sinks,
         media_channels: HashMap::new(),
         media_fragments: HashMap::new(),
