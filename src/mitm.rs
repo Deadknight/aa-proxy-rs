@@ -126,6 +126,20 @@ pub enum ProxyType {
     MobileDevice,
 }
 
+/// Action returned by [`pkt_modify_hook`].
+///
+/// The main loop uses this to decide what to do with the packet after
+/// the hook has run.
+#[derive(Debug, PartialEq)]
+pub enum PacketAction {
+    /// Forward the packet to the other side in the normal way.
+    Forward,
+    /// Drop the packet entirely — do not transmit it anywhere.
+    Drop,
+    /// Send the packet back toward the originating side (crafted reply).
+    SendBack,
+}
+
 /// rust-openssl doesn't support BIO_s_mem
 /// This SslMemBuf is about to provide `Read` and `Write` implementations
 /// to be used with `openssl::ssl::SslStream`
@@ -408,15 +422,16 @@ pub async fn pkt_modify_hook(
     config: &mut SharedConfig,
     script_registry: Option<&ScriptRegistry>,
     ws_event_tx: BroadcastSender<ServerEvent>,
-) -> Result<bool> {
+) -> Result<PacketAction> {
     // if for some reason we have too small packet, bail out
     if pkt.payload.len() < 2 {
-        return Ok(false);
+        return Ok(PacketAction::Forward);
     }
 
     if let Some(handled) = run_wasm_hooks(proxy_type, pkt, ctx, cfg, script_registry).await? {
-        if handled {
-            return Ok(true);
+        match handled {
+            true => return Ok(PacketAction::SendBack),
+            false => {}
         }
     }
 
@@ -458,7 +473,7 @@ pub async fn pkt_modify_hook(
                                     .await?;
 
                                 // return true => send own reply without processing
-                                return Ok(true);
+                                return Ok(PacketAction::SendBack);
                             } else {
                                 // MD requests the energy model sensor from the HU. Since we do not
                                 // have any data logger configured for EV data, we assume the following
@@ -483,7 +498,7 @@ pub async fn pkt_modify_hook(
 
                                 // return false = forward the modified request to the HU,
                                 // do not send an early reply
-                                return Ok(false);
+                                return Ok(PacketAction::Forward);
                             }
                         }
                     }
@@ -639,7 +654,7 @@ pub async fn pkt_modify_hook(
                 _ => (),
             }
             // end sensors processing
-            return Ok(false);
+            return Ok(PacketAction::Forward);
         }
     }
 
@@ -669,11 +684,11 @@ pub async fn pkt_modify_hook(
                     // inserting 2 bytes of message_id at the beginning
                     pkt.payload.insert(0, (message_id >> 8) as u8);
                     pkt.payload.insert(1, (message_id & 0xff) as u8);
-                    return Ok(false);
+                    return Ok(PacketAction::Forward);
                 }
             }
             // end navigation service processing
-            return Ok(false);
+            return Ok(PacketAction::Forward);
         }
     }
 
@@ -705,10 +720,10 @@ pub async fn pkt_modify_hook(
                     // inserting 2 bytes of message_id at the beginning
                     pkt.payload.insert(0, (message_id >> 8) as u8);
                     pkt.payload.insert(1, (message_id & 0xff) as u8);
-                    return Ok(false);
+                    return Ok(PacketAction::Forward);
                 }
                 // end processing
-                return Ok(false);
+                return Ok(PacketAction::Forward);
             }
             _ => (),
         }
@@ -726,7 +741,7 @@ pub async fn pkt_modify_hook(
     }
 
     if pkt.channel != 0 {
-        return Ok(false);
+        return Ok(PacketAction::Forward);
     }
     // trying to obtain an Enum from message_id
     let control = protos::ControlMessageType::from_i32(message_id);
@@ -758,7 +773,7 @@ pub async fn pkt_modify_hook(
                         get_name(proxy_type),
                         e
                     );
-                    return Ok(false);
+                    return Ok(PacketAction::Forward);
                 }
                 Ok(msg) => msg,
             };
@@ -837,7 +852,7 @@ pub async fn pkt_modify_hook(
 
             // SDR rewriting is HeadUnit-only; MobileDevice sees SDR read-only (for channel map above)
             if proxy_type == ProxyType::MobileDevice {
-                return Ok(false);
+                return Ok(PacketAction::Forward);
             }
 
             // DPI
@@ -1155,10 +1170,10 @@ pub async fn pkt_modify_hook(
             pkt.payload.insert(0, (message_id >> 8) as u8);
             pkt.payload.insert(1, (message_id & 0xff) as u8);
         }
-        _ => return Ok(false),
+        _ => return Ok(PacketAction::Forward),
     };
 
-    Ok(false)
+    Ok(PacketAction::Forward)
 }
 
 pub async fn send_key_event(tx: Sender<Packet>, input_ch: u8, keycode: u32) -> Result<()> {
@@ -1714,7 +1729,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         tokio::select! {
         // handling data from opposite device's thread, which needs to be transmitted
         Some(mut pkt) = rx.recv() => {
-            let handled = pkt_modify_hook(
+            let action = pkt_modify_hook(
                 proxy_type,
                 &mut pkt,
                 &mut ctx,
@@ -1737,22 +1752,29 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
             )
             .await;
 
-            if handled {
-                debug!(
+            match action {
+                PacketAction::Drop => {
+                    debug!("{} pkt_modify_hook: packet dropped", get_name(proxy_type));
+                }
+                PacketAction::SendBack => {
+                    debug!(
                     "{} pkt_modify_hook: message has been handled, sending reply packet only...",
                     get_name(proxy_type)
                 );
-                tx.send(pkt).await?;
-            } else {
-                pkt.encrypt_payload(&mut mem_buf, &mut server).await?;
-                let _ = pkt_debug(proxy_type, HexdumpLevel::RawOutput, hex_requested, &pkt).await;
-                pkt.transmit(&mut device)
-                    .await
-                    .with_context(|| format!("proxy/{}: transmit failed", get_name(proxy_type)))?;
+                    tx.send(pkt).await?;
+                }
+                PacketAction::Forward => {
+                    pkt.encrypt_payload(&mut mem_buf, &mut server).await?;
+                    let _ =
+                        pkt_debug(proxy_type, HexdumpLevel::RawOutput, hex_requested, &pkt).await;
+                    pkt.transmit(&mut device).await.with_context(|| {
+                        format!("proxy/{}: transmit failed", get_name(proxy_type))
+                    })?;
 
-                // Increment byte counters for statistics
-                // fixme: compute final_len for precise stats
-                bytes_written.fetch_add(HEADER_LENGTH + pkt.payload.len(), Ordering::Relaxed);
+                    // Increment byte counters for statistics
+                    // fixme: compute final_len for precise stats
+                    bytes_written.fetch_add(HEADER_LENGTH + pkt.payload.len(), Ordering::Relaxed);
+                }
             }
         }
 
@@ -1761,7 +1783,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
             let _ = pkt_debug(proxy_type, HexdumpLevel::RawInput, hex_requested, &pkt).await;
             match pkt.decrypt_payload(&mut mem_buf, &mut server).await {
                 Ok(_) => {
-                    let _ = pkt_modify_hook(
+                    let action = pkt_modify_hook(
                         proxy_type,
                         &mut pkt,
                         &mut ctx,
@@ -1783,7 +1805,12 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         &pkt,
                     )
                     .await;
-                    tx.send(pkt).await?;
+                    match action {
+                        PacketAction::Drop => {}
+                        PacketAction::SendBack | PacketAction::Forward => {
+                            tx.send(pkt).await?;
+                        }
+                    }
                 }
                 Err(e) => error!("decrypt_payload: {:?}", e),
             }
