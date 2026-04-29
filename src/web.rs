@@ -123,7 +123,7 @@ pub struct AppState {
     pub input_channel: Arc<Mutex<Option<u8>>>,
     pub last_battery_data: Arc<RwLock<Option<BatteryData>>>,
     pub last_odometer_data: Arc<RwLock<Option<OdometerData>>>,
-    pub last_speed: Arc<RwLock<Option<u32>>>,
+    pub last_speed: Arc<RwLock<Option<i32>>>,
     pub last_tire_pressure_data: Arc<RwLock<Option<TirePressureData>>>,
     pub ws_event_tx: broadcast::Sender<ServerEvent>,
     pub script_registry: Option<Arc<ScriptRegistry>>,

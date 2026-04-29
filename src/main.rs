@@ -209,7 +209,7 @@ async fn tokio_main(
     input_channel: Arc<Mutex<Option<u8>>>,
     last_battery_data: Arc<RwLock<Option<BatteryData>>>,
     last_odometer_data: Arc<RwLock<Option<OdometerData>>>,
-    last_speed: Arc<RwLock<Option<u32>>>,
+    last_speed: Arc<RwLock<Option<i32>>>,
     last_tire_pressure_data: Arc<RwLock<Option<TirePressureData>>>,
     led_support: bool,
     button_support: bool,
@@ -612,7 +612,7 @@ fn main() -> Result<()> {
     let last_battery_data = Arc::new(RwLock::new(None));
     let last_battery_data_cloned = last_battery_data.clone();
     let last_odometer_data = Arc::new(RwLock::new(None));
-    let last_speed: Arc<RwLock<Option<u32>>> = Arc::new(RwLock::new(None));
+    let last_speed: Arc<RwLock<Option<i32>>> = Arc::new(RwLock::new(None));
     let last_speed_cloned = last_speed.clone();
     let last_tire_pressure_data = Arc::new(RwLock::new(None));
     let (ws_event_tx, _ws_event_rx) = broadcast::channel(256);
