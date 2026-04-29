@@ -419,7 +419,7 @@ pub async fn pkt_modify_hook(
     sensor_channel: Arc<tokio::sync::Mutex<Option<u8>>>,
     input_channel: Arc<tokio::sync::Mutex<Option<u8>>>,
     last_battery: Arc<RwLock<Option<BatteryData>>>,
-    last_speed: Arc<RwLock<Option<u32>>>,
+    last_speed: Arc<RwLock<Option<i32>>>,
     cfg: &AppConfig,
     config: &mut SharedConfig,
     script_registry: Option<&ScriptRegistry>,
@@ -624,11 +624,11 @@ pub async fn pkt_modify_hook(
                         if cfg.collect_speed {
                             if !msg.speed_data.is_empty() {
                                 let speed_e3 = msg.speed_data[0].speed_e3();
-
+                        
                                 match speed_e3.try_into() {
                                     Ok(speed) => {
                                         *last_speed.write().await = Some(speed);
-
+                        
                                         let _ = ws_event_tx.send(ServerEvent {
                                             topic: "speed".to_string(),
                                             payload: speed_e3.to_string(),
@@ -1602,7 +1602,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
     sensor_channel: Arc<tokio::sync::Mutex<Option<u8>>>,
     input_channel: Arc<tokio::sync::Mutex<Option<u8>>>,
     last_battery: Arc<RwLock<Option<BatteryData>>>,
-    last_speed: Arc<RwLock<Option<u32>>>,
+    last_speed: Arc<RwLock<Option<i32>>>,
     ev_tx: Sender<EvTaskCommand>,
     hu_tx: Option<Sender<Packet>>,
     script_registry: Option<Arc<ScriptRegistry>>,

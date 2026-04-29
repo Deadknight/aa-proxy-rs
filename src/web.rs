@@ -1,8 +1,10 @@
+use crate::bt_helper;
 use crate::config::Action;
 use crate::config::AppConfig;
 use crate::config::ConfigJson;
 use crate::config::SharedConfig;
 use crate::config::SharedConfigJson;
+use crate::device_info;
 use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
 use crate::ev::EV_MODEL_FILE;
@@ -25,7 +27,7 @@ use axum::{
     },
     http::{header, HeaderMap, Response, StatusCode},
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::Local;
@@ -123,7 +125,7 @@ pub struct AppState {
     pub input_channel: Arc<Mutex<Option<u8>>>,
     pub last_battery_data: Arc<RwLock<Option<BatteryData>>>,
     pub last_odometer_data: Arc<RwLock<Option<OdometerData>>>,
-    pub last_speed: Arc<RwLock<Option<u32>>>,
+    pub last_speed: Arc<RwLock<Option<i32>>>,
     pub last_tire_pressure_data: Arc<RwLock<Option<TirePressureData>>>,
     pub ws_event_tx: broadcast::Sender<ServerEvent>,
     pub script_registry: Option<Arc<ScriptRegistry>>,
@@ -154,7 +156,13 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/factory-reset", post(factory_reset_handler))
         .route("/set-time", post(set_time_handler))
         .route("/speed", get(speed_handler))
+        .route("/version", get(version_handler))
         .route("/ws", get(ws_handler))
+
+        .route("/bt/devices", get(bt_helper::bt_devices_handler))
+        .route("/bt/devices/paired", get(bt_helper::bt_paired_devices_handler))
+        .route("/bt/devices/:id", delete(bt_helper::bt_remove_device_handler))
+
         .with_state(state)
 }
 
@@ -963,6 +971,14 @@ async fn speed_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     } else {
         (StatusCode::NO_CONTENT, "No speed data yet").into_response()
     }
+}
+
+pub async fn version_handler() -> impl IntoResponse {
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "board": device_info::board_prefix(),
+        "model": device_info::get_sbc_model().ok()
+    }))
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
