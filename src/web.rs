@@ -1,3 +1,4 @@
+use crate::bt_helper;
 use crate::config::Action;
 use crate::config::AppConfig;
 use crate::config::ConfigJson;
@@ -26,7 +27,7 @@ use axum::{
     },
     http::{header, HeaderMap, Response, StatusCode},
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::Local;
@@ -157,6 +158,15 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/speed", get(speed_handler))
         .route("/version", get(version_handler))
         .route("/ws", get(ws_handler))
+        .route("/bt/devices", get(bt_helper::bt_devices_handler))
+        .route(
+            "/bt/devices/paired",
+            get(bt_helper::bt_paired_devices_handler),
+        )
+        .route(
+            "/bt/devices/:id",
+            delete(bt_helper::bt_remove_device_handler),
+        )
         .with_state(state)
 }
 

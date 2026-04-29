@@ -1,5 +1,6 @@
 pub mod aoa;
 pub mod bluetooth;
+pub mod bt_helper;
 pub mod btle;
 pub mod button;
 pub mod config;
