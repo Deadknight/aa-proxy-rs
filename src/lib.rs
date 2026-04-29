@@ -4,6 +4,7 @@ pub mod btle;
 pub mod button;
 pub mod config;
 pub mod config_types;
+pub mod device_info;
 pub mod ev;
 pub mod hu_input;
 pub mod io_uring;

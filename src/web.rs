@@ -3,6 +3,7 @@ use crate::config::AppConfig;
 use crate::config::ConfigJson;
 use crate::config::SharedConfig;
 use crate::config::SharedConfigJson;
+use crate::device_info;
 use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
 use crate::ev::EV_MODEL_FILE;
@@ -154,6 +155,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/factory-reset", post(factory_reset_handler))
         .route("/set-time", post(set_time_handler))
         .route("/speed", get(speed_handler))
+        .route("/version", get(version_handler))
         .route("/ws", get(ws_handler))
         .with_state(state)
 }
@@ -963,6 +965,14 @@ async fn speed_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     } else {
         (StatusCode::NO_CONTENT, "No speed data yet").into_response()
     }
+}
+
+pub async fn version_handler() -> impl IntoResponse {
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "board": device_info::board_prefix(),
+        "model": device_info::get_sbc_model().ok()
+    }))
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {

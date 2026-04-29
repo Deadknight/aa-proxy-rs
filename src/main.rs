@@ -5,6 +5,7 @@ use aa_proxy_rs::config::SharedConfigJson;
 use aa_proxy_rs::config::WifiConfig;
 use aa_proxy_rs::config::{Action, AppConfig};
 use aa_proxy_rs::config::{DEFAULT_WLAN_ADDR, TCP_SERVER_PORT};
+use aa_proxy_rs::device_info;
 use aa_proxy_rs::ev::BatteryData;
 use aa_proxy_rs::io_uring::io_loop;
 use aa_proxy_rs::led::{LedColor, LedManager, LedMode};
@@ -394,14 +395,6 @@ async fn tokio_main(
     }
 }
 
-/// Returns the SBC model string (currently supports only Raspberry Pi)
-pub fn get_sbc_model() -> Result<String> {
-    Ok(fs::read_to_string("/sys/firmware/devicetree/base/model")?
-        .trim_end_matches(char::from(0))
-        .trim()
-        .to_string())
-}
-
 /// Returns the full device serial number from Device Tree
 pub fn get_serial_number() -> Result<String> {
     Ok(
@@ -472,7 +465,8 @@ fn generate_usb_strings(input: &str, output: &str) -> std::io::Result<()> {
         &[
             (
                 "MODEL",
-                &get_sbc_model().map_or(String::new(), |model| format!(" ({})", model)),
+                &device_info::get_sbc_model()
+                    .map_or(String::new(), |model| format!(" ({})", model)),
             ),
             (
                 "SERIAL",
@@ -552,7 +546,7 @@ fn main() -> Result<()> {
     // show SBC model
     let mut led_support = false;
     let mut button_support = false;
-    if let Ok(model) = get_sbc_model() {
+    if let Ok(model) = device_info::get_sbc_model() {
         info!("{} 📟 host device: <bold><blue>{}</>", NAME, model);
         if model.starts_with("AAWireless") {
             led_support = true;
