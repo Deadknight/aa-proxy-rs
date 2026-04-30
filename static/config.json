@@ -163,6 +163,10 @@
           "typ": "integer",
           "description": "Override the `max_unacked` setting for audio channels. This may improve audio performance on some head units, but may worsen it on others. Adjust this value experimentally only if you experience audio stuttering.\n0 = leave unchanged."
         },
+        "add_vendor_channel": {
+          "typ": "boolean",
+          "description": "Add vendor channel for android companion app"
+        },
         "remove_tap_restriction": {
           "typ": "boolean",
           "description": "Remove tap restrictions. This affects situations where tapping too frequently while driving triggers a temporary lockout warning. Might not work, depending on phone and Android version."

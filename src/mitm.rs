@@ -16,6 +16,7 @@ use openssl::ssl::{ErrorCode, Ssl, SslContextBuilder, SslFiletype, SslMethod};
 use serde::{Deserialize, Serialize};
 use simplelog::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Read, Write};
@@ -89,6 +90,8 @@ const KEYS_PATH: &str = "/etc/aa-proxy-rs";
 // DHU string consts for developer mode
 pub const DHU_MAKE: &str = "Google";
 pub const DHU_MODEL: &str = "Desktop Head Unit";
+const OUR_VEC_SERVICE_NAME: &str = "aaproxy_companion";
+const OUR_VEC_PACKAGE: &str = "com.github.deadknight.aaproxycompanion";
 
 pub struct ModifyContext {
     pub(crate) sensor_channel: Option<u8>,
@@ -106,6 +109,10 @@ pub struct ModifyContext {
     /// Per-channel reassembly state for tapped media messages that span multiple
     /// AA transport frames.
     media_fragments: HashMap<u8, MediaFrameBuffer>,
+    /// VEC service ids injected by aa-proxy-rs into the service discovery response.
+    vendor_service_ids: HashSet<u8>,
+    /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
+    vendor_open_channels: HashSet<u8>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -781,6 +788,14 @@ pub async fn pkt_modify_hook(
     }
 
     if pkt.channel != 0 {
+        if ctx.vendor_open_channels.contains(&pkt.channel) {
+            if proxy_type == ProxyType::MobileDevice {
+                return handle_vendor_channel_packet(pkt, ctx).await;
+            }
+    
+            return Ok(PacketAction::Drop);
+        }
+
         return Ok(PacketAction::Forward);
     }
     // trying to obtain an Enum from message_id
@@ -803,6 +818,39 @@ pub async fn pkt_modify_hook(
                         config.write().await.action_requested = Some(Stop);
                     }
                 }
+            }
+        }
+        MESSAGE_CHANNEL_OPEN_REQUEST => {
+            let msg = match ChannelOpenRequest::parse_from_bytes(data) {
+                Err(e) => {
+                    error!(
+                        "{} error parsing ChannelOpenRequest: {}, ignored!",
+                        get_name(proxy_type),
+                        e
+                    );
+                    return Ok(PacketAction::Forward);
+                }
+                Ok(msg) => msg,
+            };
+        
+            let service_id = msg.service_id() as u8;
+            if proxy_type == ProxyType::MobileDevice && ctx.vendor_service_ids.contains(&service_id) {
+                let mut response = ChannelOpenResponse::new();
+                response.set_status(MessageStatus::STATUS_SUCCESS);
+        
+                let payload: Vec<u8> = response.write_to_bytes()?;
+                *pkt = build_control_reply(MESSAGE_CHANNEL_OPEN_RESPONSE, payload);
+        
+                ctx.vendor_open_channels.insert(service_id);
+        
+                info!(
+                    "{} <yellow>{:?}</>: accepted open for injected VEC service_id=<b>{:#04x}</>",
+                    get_name(proxy_type),
+                    control.unwrap(),
+                    service_id,
+                );
+        
+                return Ok(PacketAction::SendBack);
             }
         }
         MESSAGE_SERVICE_DISCOVERY_RESPONSE => {
@@ -1198,6 +1246,48 @@ pub async fn pkt_modify_hook(
                 }
             }
 
+            // add vendor channel as extra, do not touch existing HU channels
+            // this must be last entry do not replace
+            if cfg.add_vendor_channel {
+                let already_present = msg.services.iter().any(|svc| {
+                    svc.vendor_extension_service
+                        .as_ref()
+                        .map(|ves| ves.service_name() == OUR_VEC_SERVICE_NAME)
+                        .unwrap_or(false)
+                });
+
+                if !already_present {
+                    let next_service_id = msg
+                        .services
+                        .iter()
+                        .map(|svc| svc.id())
+                        .max()
+                        .unwrap_or(0)
+                        + 1;
+
+                    let mut service = Service::new();
+                    service.set_id(next_service_id);
+
+                    let mut ves = VendorExtensionService::new();
+                    ves.set_service_name(OUR_VEC_SERVICE_NAME.to_string());
+                    ves.package_white_list.push(OUR_VEC_PACKAGE.to_string());
+
+                    service.vendor_extension_service = protobuf::MessageField::some(ves);
+                    msg.services.push(service);
+
+                    ctx.vendor_service_ids.insert(next_service_id as u8);
+
+                    info!(
+                        "{} <yellow>{:?}</>: added extra <blue>vendor_extension_service</> id=<b>{:#04x}</> name=<b>{}</> package=<b>{}</>",
+                        get_name(proxy_type),
+                        control.unwrap(),
+                        next_service_id as u8,
+                        OUR_VEC_SERVICE_NAME,
+                        OUR_VEC_PACKAGE,
+                    );
+                }
+            }
+
             debug!(
                 "{} SDR after changes: {}",
                 get_name(proxy_type),
@@ -1590,6 +1680,116 @@ fn ssl_check_failure<T>(res: std::result::Result<T, openssl::ssl::Error>) -> Res
     }
 }
 
+fn build_control_reply(message_id: ControlMessageType, payload: Vec<u8>) -> Packet {
+    let mut payload = payload;
+    payload.insert(0, ((message_id as u16) >> 8) as u8);
+    payload.insert(1, ((message_id as u16) & 0xff) as u8);
+
+    Packet {
+        channel: 0,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    }
+}
+
+fn build_vendor_reply(channel: u8, opcode: u8, payload: Vec<u8>) -> Packet {
+    let mut out = Vec::with_capacity(2 + payload.len());
+    out.push(0x01); // version
+    out.push(opcode);
+    out.extend_from_slice(&payload);
+
+    Packet {
+        channel,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload: out,
+    }
+}
+
+async fn handle_vendor_channel_packet(
+    pkt: &mut Packet,
+    ctx: &mut ModifyContext,
+) -> Result<PacketAction> {
+    if pkt.payload.len() < 2 {
+        warn!(
+            "VEC short packet on channel {:#04x}, len={}",
+            pkt.channel,
+            pkt.payload.len()
+        );
+
+        *pkt = build_vendor_reply(pkt.channel, 0xFF, b"short packet".to_vec());
+        return Ok(PacketAction::SendBack);
+    }
+
+    let version = pkt.payload[0];
+    let opcode = pkt.payload[1];
+    let payload = &pkt.payload[2..];
+
+    if version != 0x01 {
+        warn!(
+            "VEC unsupported version {} on channel {:#04x}",
+            version,
+            pkt.channel
+        );
+
+        *pkt = build_vendor_reply(pkt.channel, 0xFF, b"unsupported version".to_vec());
+        return Ok(PacketAction::SendBack);
+    }
+
+    match opcode {
+        0x01 => {
+            // ping -> pong with same payload
+            info!(
+                "VEC ping on channel {:#04x}: {} bytes",
+                pkt.channel,
+                payload.len()
+            );
+
+            *pkt = build_vendor_reply(pkt.channel, 0x81, payload.to_vec());
+            Ok(PacketAction::SendBack)
+        }
+
+        0x02 => {
+            // get_status -> small JSON text payload
+            let status = format!(
+                r#"{{"ok":true,"sensor_channel":{:?},"nav_channel":{:?},"audio_channels":{:?}}}"#,
+                ctx.sensor_channel,
+                ctx.nav_channel,
+                ctx.audio_channels
+            );
+
+            info!("VEC get_status on channel {:#04x}", pkt.channel);
+
+            *pkt = build_vendor_reply(pkt.channel, 0x82, status.into_bytes());
+            Ok(PacketAction::SendBack)
+        }
+
+        0x03 => {
+            // echo -> echo_reply
+            info!(
+                "VEC echo on channel {:#04x}: {} bytes",
+                pkt.channel,
+                payload.len()
+            );
+
+            *pkt = build_vendor_reply(pkt.channel, 0x83, payload.to_vec());
+            Ok(PacketAction::SendBack)
+        }
+
+        _ => {
+            warn!(
+                "VEC unknown opcode 0x{:02x} on channel {:#04x}",
+                opcode,
+                pkt.channel
+            );
+
+            *pkt = build_vendor_reply(pkt.channel, 0xFF, b"unknown opcode".to_vec());
+            Ok(PacketAction::SendBack)
+        }
+    }
+}
+
 /// main thread doing all packet processing of an endpoint/device
 pub async fn proxy<A: Endpoint<A> + 'static>(
     proxy_type: ProxyType,
@@ -1765,6 +1965,8 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         media_sinks,
         media_channels: HashMap::new(),
         media_fragments: HashMap::new(),
+        vendor_service_ids: HashSet::new(),
+        vendor_open_channels: HashSet::new(),
     };
     loop {
         tokio::select! {
@@ -1875,6 +2077,8 @@ mod tests {
             media_sinks: HashMap::new(),
             media_channels: HashMap::new(),
             media_fragments: HashMap::new(),
+            vendor_service_ids: HashSet::new(),
+            vendor_open_channels: HashSet::new(),
         }
     }
 

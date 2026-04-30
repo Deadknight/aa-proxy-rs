@@ -105,6 +105,7 @@ pub struct AppConfig {
     pub mitm: bool,
     pub dpi: u16,
     pub audio_max_unacked: u8,
+    pub add_vendor_channel: bool,
     pub remove_tap_restriction: bool,
     pub video_in_motion: bool,
     pub disable_media_sink: bool,
@@ -269,6 +270,7 @@ impl Default for AppConfig {
             mitm: false,
             dpi: 0,
             audio_max_unacked: 0,
+            add_vendor_channel: true,
             remove_tap_restriction: false,
             video_in_motion: false,
             disable_media_sink: false,
@@ -376,6 +378,7 @@ impl AppConfig {
         doc["mitm"] = value(self.mitm);
         doc["dpi"] = value(self.dpi as i64);
         doc["audio_max_unacked"] = value(self.audio_max_unacked as i64);
+        doc["add_vendor_channel"] = value(self.add_vendor_channel);
         doc["remove_tap_restriction"] = value(self.remove_tap_restriction);
         doc["video_in_motion"] = value(self.video_in_motion);
         doc["disable_media_sink"] = value(self.disable_media_sink);
