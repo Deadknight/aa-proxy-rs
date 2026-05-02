@@ -164,6 +164,9 @@ pub struct AppConfig {
 
     #[serde(skip)]
     pub action_requested: Option<Action>,
+
+    #[serde(skip)]
+    pub runtime_mitm_failed: bool,
 }
 
 impl Default for ConfigValue {
@@ -319,6 +322,7 @@ impl Default for AppConfig {
             collect_speed: false,
             disable_driving_status: false,
             hu_button_handler: None,
+            runtime_mitm_failed: false,
         }
     }
 }
