@@ -93,8 +93,14 @@ pub const DHU_MODEL: &str = "Desktop Head Unit";
 const OUR_VEC_SERVICE_NAME: &str = "aaproxy_companion";
 const OUR_VEC_PACKAGE: &str = "com.github.deadknight.aaproxycompanion";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VecChannelState {
+    Opened,
+}
+
 pub struct ModifyContext {
     pub(crate) sensor_channel: Option<u8>,
+    pub(crate) sensors: Option<Vec<Sensor>>,
     pub(crate) nav_channel: Option<u8>,
     pub(crate) audio_channels: Vec<u8>,
     ev_tx: Sender<EvTaskCommand>,
@@ -112,7 +118,7 @@ pub struct ModifyContext {
     /// VEC service ids injected by aa-proxy-rs into the service discovery response.
     vendor_service_ids: HashSet<u8>,
     /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
-    vendor_open_channels: HashSet<u8>,
+    vendor_channel_states: HashMap<u8, VecChannelState>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -482,32 +488,45 @@ pub async fn pkt_modify_hook(
                     if let Ok(mut msg) = SensorRequest::parse_from_bytes(data) {
                         if msg.type_() == SensorType::SENSOR_VEHICLE_ENERGY_MODEL_DATA {
                             // check if we have some battery logger configured
-                            if let Some(path) = &cfg.ev_battery_logger {
+                            let has_sensor_fuel = ctx
+                            .sensors
+                            .as_ref()
+                            .map(|sensors| {
+                                sensors
+                                    .iter()
+                                    .any(|sensor| sensor.sensor_type() == SENSOR_FUEL)
+                            })
+                            .unwrap_or(false);
+                        
+                            if cfg.ev_battery_logger.is_some() || !has_sensor_fuel {
                                 debug!(
-                                  "additional SENSOR_MESSAGE_REQUEST for {:?}, making a response with success...",
-                                  msg.type_()
+                                    "additional SENSOR_MESSAGE_REQUEST for {:?}, making a response with success...",
+                                    msg.type_()
                                 );
+                                
                                 let mut response = SensorResponse::new();
                                 response.set_status(MessageStatus::STATUS_SUCCESS);
-
+                                
                                 let mut payload: Vec<u8> = response.write_to_bytes()?;
                                 payload.insert(0, ((SENSOR_MESSAGE_RESPONSE as u16) >> 8) as u8);
                                 payload.insert(1, ((SENSOR_MESSAGE_RESPONSE as u16) & 0xff) as u8);
-
+                                
                                 let reply = Packet {
                                     channel: ch,
                                     flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
                                     final_length: None,
-                                    payload: payload,
+                                    payload,
                                 };
+                                
                                 *pkt = reply;
-
-                                // start EV battery logger if needed
-                                ctx.ev_tx
-                                    .send(EvTaskCommand::Start(path.to_string()))
-                                    .await?;
-
-                                // return true => send own reply without processing
+                                
+                                // start EV battery logger only if path exists
+                                if let Some(path) = &cfg.ev_battery_logger {
+                                    ctx.ev_tx
+                                        .send(EvTaskCommand::Start(path.to_string()))
+                                        .await?;
+                                }
+                                
                                 return Ok(PacketAction::SendBack);
                             } else {
                                 // MD requests the energy model sensor from the HU. Since we do not
@@ -788,12 +807,69 @@ pub async fn pkt_modify_hook(
     }
 
     if pkt.channel != 0 {
-        if ctx.vendor_open_channels.contains(&pkt.channel) {
-            if proxy_type == ProxyType::MobileDevice {
-                return handle_vendor_channel_packet(pkt, ctx).await;
+        let is_vendor_channel = ctx.vendor_service_ids.contains(&pkt.channel)
+            || ctx.vendor_channel_states.contains_key(&pkt.channel);
+
+        if is_vendor_channel {
+            info!(
+                "{} intercepted vendor packet on channel=<b>{:#04x}</> len={} proxy_type={:?} state={:?}",
+                get_name(proxy_type),
+                pkt.channel,
+                pkt.payload.len(),
+                proxy_type,
+                ctx.vendor_channel_states.get(&pkt.channel),
+            );
+
+            // Some phones/frameworks send ChannelOpenRequest on the target service channel.
+            // Handle that here before vendor bootstrap/app parsing.
+            if pkt.payload.len() >= 2 {
+                let vendor_msg_id = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]);
+                if vendor_msg_id == MESSAGE_CHANNEL_OPEN_REQUEST as u16 {
+                    let req = match ChannelOpenRequest::parse_from_bytes(&pkt.payload[2..]) {
+                        Ok(req) => req,
+                        Err(e) => {
+                            error!(
+                                "{} failed to parse vendor-channel ChannelOpenRequest on channel {:#04x}: {}",
+                                get_name(proxy_type),
+                                pkt.channel,
+                                e
+                            );
+                            return Ok(PacketAction::Drop);
+                        }
+                    };
+
+                    info!(
+                        "{} vendor-channel CHANNEL_OPEN_REQUEST on channel={:#04x} priority={} service_id={}",
+                        get_name(proxy_type),
+                        pkt.channel,
+                        req.priority(),
+                        req.service_id(),
+                    );
+
+                    let mut resp = ChannelOpenResponse::new();
+                    resp.set_status(MessageStatus::STATUS_SUCCESS);
+
+                    let payload = resp.write_to_bytes()?;
+                    *pkt = build_control_reply_on_channel(
+                        pkt.channel,
+                        MESSAGE_CHANNEL_OPEN_RESPONSE,
+                        payload,
+                    );
+
+                    ctx.vendor_channel_states
+                        .insert(pkt.channel, VecChannelState::Opened);
+
+                    info!(
+                        "{} accepted vendor-channel open on channel={:#04x}; subsequent VEC packets will be forwarded",
+                        get_name(proxy_type),
+                        pkt.channel,
+                    );
+
+                    return Ok(PacketAction::SendBack);
+                }
             }
-    
-            return Ok(PacketAction::Drop);
+
+            return handle_vendor_channel_packet(pkt, ctx).await;
         }
 
         return Ok(PacketAction::Forward);
@@ -832,24 +908,35 @@ pub async fn pkt_modify_hook(
                 }
                 Ok(msg) => msg,
             };
-        
+
             let service_id = msg.service_id() as u8;
+
+            info!(
+                "{} <yellow>{:?}</>: received CHANNEL_OPEN_REQUEST for service_id=<b>{:#04x}</> vendor_match={}",
+                get_name(proxy_type),
+                control.unwrap(),
+                service_id,
+                ctx.vendor_service_ids.contains(&service_id),
+            );
+
             if proxy_type == ProxyType::MobileDevice && ctx.vendor_service_ids.contains(&service_id) {
                 let mut response = ChannelOpenResponse::new();
                 response.set_status(MessageStatus::STATUS_SUCCESS);
-        
+
                 let payload: Vec<u8> = response.write_to_bytes()?;
                 *pkt = build_control_reply(MESSAGE_CHANNEL_OPEN_RESPONSE, payload);
-        
-                ctx.vendor_open_channels.insert(service_id);
-        
+
+                ctx.vendor_channel_states
+                    .entry(service_id)
+                    .or_insert(VecChannelState::Opened);
+
                 info!(
                     "{} <yellow>{:?}</>: accepted open for injected VEC service_id=<b>{:#04x}</>",
                     get_name(proxy_type),
                     control.unwrap(),
                     service_id,
                 );
-        
+
                 return Ok(PacketAction::SendBack);
             }
         }
@@ -865,6 +952,14 @@ pub async fn pkt_modify_hook(
                 }
                 Ok(msg) => msg,
             };
+
+            if let Some(svc) = msg
+                .services
+                .iter()
+                .find(|svc| !svc.sensor_source_service.sensors.is_empty())
+            {
+                ctx.sensors = Some(svc.sensor_source_service.sensors.clone());
+            }
 
             // Populate media_channels (channel_id→sink) from the offset→sink map.
             // Must run in MobileDevice context where the sinks are held —
@@ -1288,6 +1383,18 @@ pub async fn pkt_modify_hook(
                 }
             }
 
+            info!(
+                "{} vendor_service_ids now = {:?}",
+                get_name(proxy_type),
+                ctx.vendor_service_ids
+            );
+
+            info!(
+                "{} final SDR service ids: {:?}",
+                get_name(proxy_type),
+                msg.services.iter().map(|s| s.id()).collect::<Vec<_>>()
+            );
+
             debug!(
                 "{} SDR after changes: {}",
                 get_name(proxy_type),
@@ -1693,17 +1800,20 @@ fn build_control_reply(message_id: ControlMessageType, payload: Vec<u8>) -> Pack
     }
 }
 
-fn build_vendor_reply(channel: u8, opcode: u8, payload: Vec<u8>) -> Packet {
-    let mut out = Vec::with_capacity(2 + payload.len());
-    out.push(0x01); // version
-    out.push(opcode);
-    out.extend_from_slice(&payload);
+fn build_control_reply_on_channel(
+    channel: u8,
+    message_id: ControlMessageType,
+    payload: Vec<u8>,
+) -> Packet {
+    let mut payload = payload;
+    payload.insert(0, ((message_id as u16) >> 8) as u8);
+    payload.insert(1, ((message_id as u16) & 0xff) as u8);
 
     Packet {
         channel,
         flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
         final_length: None,
-        payload: out,
+        payload,
     }
 }
 
@@ -1711,83 +1821,17 @@ async fn handle_vendor_channel_packet(
     pkt: &mut Packet,
     ctx: &mut ModifyContext,
 ) -> Result<PacketAction> {
-    if pkt.payload.len() < 2 {
-        warn!(
-            "VEC short packet on channel {:#04x}, len={}",
-            pkt.channel,
-            pkt.payload.len()
-        );
+    let state = ctx.vendor_channel_states.get(&pkt.channel).copied();
 
-        *pkt = build_vendor_reply(pkt.channel, 0xFF, b"short packet".to_vec());
-        return Ok(PacketAction::SendBack);
-    }
+    info!(
+        "VEC forwarding packet channel={:#04x} state={:?} len={} payload={:02X?}",
+        pkt.channel,
+        state,
+        pkt.payload.len(),
+        pkt.payload
+    );
 
-    let version = pkt.payload[0];
-    let opcode = pkt.payload[1];
-    let payload = &pkt.payload[2..];
-
-    if version != 0x01 {
-        warn!(
-            "VEC unsupported version {} on channel {:#04x}",
-            version,
-            pkt.channel
-        );
-
-        *pkt = build_vendor_reply(pkt.channel, 0xFF, b"unsupported version".to_vec());
-        return Ok(PacketAction::SendBack);
-    }
-
-    match opcode {
-        0x01 => {
-            // ping -> pong with same payload
-            info!(
-                "VEC ping on channel {:#04x}: {} bytes",
-                pkt.channel,
-                payload.len()
-            );
-
-            *pkt = build_vendor_reply(pkt.channel, 0x81, payload.to_vec());
-            Ok(PacketAction::SendBack)
-        }
-
-        0x02 => {
-            // get_status -> small JSON text payload
-            let status = format!(
-                r#"{{"ok":true,"sensor_channel":{:?},"nav_channel":{:?},"audio_channels":{:?}}}"#,
-                ctx.sensor_channel,
-                ctx.nav_channel,
-                ctx.audio_channels
-            );
-
-            info!("VEC get_status on channel {:#04x}", pkt.channel);
-
-            *pkt = build_vendor_reply(pkt.channel, 0x82, status.into_bytes());
-            Ok(PacketAction::SendBack)
-        }
-
-        0x03 => {
-            // echo -> echo_reply
-            info!(
-                "VEC echo on channel {:#04x}: {} bytes",
-                pkt.channel,
-                payload.len()
-            );
-
-            *pkt = build_vendor_reply(pkt.channel, 0x83, payload.to_vec());
-            Ok(PacketAction::SendBack)
-        }
-
-        _ => {
-            warn!(
-                "VEC unknown opcode 0x{:02x} on channel {:#04x}",
-                opcode,
-                pkt.channel
-            );
-
-            *pkt = build_vendor_reply(pkt.channel, 0xFF, b"unknown opcode".to_vec());
-            Ok(PacketAction::SendBack)
-        }
-    }
+    Ok(PacketAction::Forward)
 }
 
 /// main thread doing all packet processing of an endpoint/device
@@ -1956,6 +2000,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
     // main data processing/transfer loop
     let mut ctx = ModifyContext {
         sensor_channel: None,
+        sensors: None,
         input_channel: None,
         nav_channel: None,
         audio_channels: vec![],
@@ -1966,12 +2011,23 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         media_channels: HashMap::new(),
         media_fragments: HashMap::new(),
         vendor_service_ids: HashSet::new(),
-        vendor_open_channels: HashSet::new(),
+        vendor_channel_states: HashMap::new(),
     };
     loop {
         tokio::select! {
         // handling data from opposite device's thread, which needs to be transmitted
         Some(mut pkt) = rx.recv() => {
+            /*info!(
+                "{} LOOP {} channel={:#04x} len={} first2={:02X?}",
+                get_name(proxy_type),
+                "rx",
+                pkt.channel,
+                pkt.payload.len(),
+                pkt.payload
+                    .get(0..std::cmp::min(2, pkt.payload.len()))
+                    .unwrap_or(&[])
+            );*/
+
             let action = pkt_modify_hook(
                 proxy_type,
                 &mut pkt,
@@ -2000,11 +2056,15 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                     debug!("{} pkt_modify_hook: packet dropped", get_name(proxy_type));
                 }
                 PacketAction::SendBack => {
-                    debug!(
-                    "{} pkt_modify_hook: message has been handled, sending reply packet only...",
-                    get_name(proxy_type)
-                );
+                    info!(
+                        "{} SEND_BACK reply channel={:#04x} len={} payload={:02X?}",
+                        get_name(proxy_type),
+                        pkt.channel,
+                        pkt.payload.len(),
+                        pkt.payload
+                    );
                     tx.send(pkt).await?;
+                    info!("{} SEND_BACK queued successfully", get_name(proxy_type));
                 }
                 PacketAction::Forward => {
                     pkt.encrypt_payload(&mut mem_buf, &mut server).await?;
@@ -2023,6 +2083,17 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
 
         // handling input data from the reader thread
         Some(mut pkt) = rxr.recv() => {
+            /*info!(
+                "{} LOOP {} channel={:#04x} len={} first2={:02X?}",
+                get_name(proxy_type),
+                "rxr",
+                pkt.channel,
+                pkt.payload.len(),
+                pkt.payload
+                    .get(0..std::cmp::min(2, pkt.payload.len()))
+                    .unwrap_or(&[])
+            );*/
+
             let _ = pkt_debug(proxy_type, HexdumpLevel::RawInput, hex_requested, &pkt).await;
             match pkt.decrypt_payload(&mut mem_buf, &mut server).await {
                 Ok(_) => {
@@ -2050,7 +2121,18 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                     .await;
                     match action {
                         PacketAction::Drop => {}
-                        PacketAction::SendBack | PacketAction::Forward => {
+                        PacketAction::SendBack => {
+                            info!(
+                                "{} SEND_BACK reply channel={:#04x} len={} payload={:02X?}",
+                                get_name(proxy_type),
+                                pkt.channel,
+                                pkt.payload.len(),
+                                pkt.payload
+                            );
+                            tx.send(pkt).await?;
+                            info!("{} SEND_BACK queued successfully", get_name(proxy_type));
+                        }
+                        PacketAction::Forward => {
                             tx.send(pkt).await?;
                         }
                     }
@@ -2074,11 +2156,14 @@ mod tests {
             nav_channel: None,
             audio_channels: vec![],
             ev_tx,
+            input_channel: None,
+            hu_tx: None,
+            hu_input_state: HuInputState::default(),
             media_sinks: HashMap::new(),
             media_channels: HashMap::new(),
             media_fragments: HashMap::new(),
             vendor_service_ids: HashSet::new(),
-            vendor_open_channels: HashSet::new(),
+            vendor_channel_states: HashMap::new(),
         }
     }
 
