@@ -480,6 +480,8 @@ pub async fn pkt_modify_hook(
     let message_id: i32 = u16::from_be_bytes(pkt.payload[0..=1].try_into()?).into();
     let data = &pkt.payload[2..]; // start of message data
 
+    trace_packet(proxy_type, "modify_hook/in", pkt, ctx);
+
     // handling data on sensor channel
     if let Some(ch) = ctx.sensor_channel {
         if ch == pkt.channel {
@@ -487,46 +489,52 @@ pub async fn pkt_modify_hook(
                 SENSOR_MESSAGE_REQUEST => {
                     if let Ok(mut msg) = SensorRequest::parse_from_bytes(data) {
                         if msg.type_() == SensorType::SENSOR_VEHICLE_ENERGY_MODEL_DATA {
-                            // check if we have some battery logger configured
                             let has_sensor_fuel = ctx
-                            .sensors
-                            .as_ref()
-                            .map(|sensors| {
-                                sensors
-                                    .iter()
-                                    .any(|sensor| sensor.sensor_type() == SENSOR_FUEL)
-                            })
-                            .unwrap_or(false);
-                        
+                                .sensors
+                                .as_ref()
+                                .map(|sensors| {
+                                    sensors
+                                        .iter()
+                                        .any(|sensor| sensor.sensor_type() == SENSOR_FUEL)
+                                })
+                                .unwrap_or(false);
+
+                            info!(
+                                "{} EV: AA requested SENSOR_VEHICLE_ENERGY_MODEL_DATA; ev_battery_logger={} has_sensor_fuel={}",
+                                get_name(proxy_type),
+                                cfg.ev_battery_logger.is_some(),
+                                has_sensor_fuel
+                            );
+
                             if cfg.ev_battery_logger.is_some() || !has_sensor_fuel {
                                 debug!(
                                     "additional SENSOR_MESSAGE_REQUEST for {:?}, making a response with success...",
                                     msg.type_()
                                 );
-                                
+
                                 let mut response = SensorResponse::new();
                                 response.set_status(MessageStatus::STATUS_SUCCESS);
-                                
+
                                 let mut payload: Vec<u8> = response.write_to_bytes()?;
                                 payload.insert(0, ((SENSOR_MESSAGE_RESPONSE as u16) >> 8) as u8);
                                 payload.insert(1, ((SENSOR_MESSAGE_RESPONSE as u16) & 0xff) as u8);
-                                
+
                                 let reply = Packet {
                                     channel: ch,
                                     flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
                                     final_length: None,
                                     payload,
                                 };
-                                
+
                                 *pkt = reply;
-                                
+
                                 // start EV battery logger only if path exists
                                 if let Some(path) = &cfg.ev_battery_logger {
                                     ctx.ev_tx
                                         .send(EvTaskCommand::Start(path.to_string()))
                                         .await?;
                                 }
-                                
+
                                 return Ok(PacketAction::SendBack);
                             } else {
                                 // MD requests the energy model sensor from the HU. Since we do not
@@ -822,7 +830,7 @@ pub async fn pkt_modify_hook(
 
             // Some phones/frameworks send ChannelOpenRequest on the target service channel.
             // Handle that here before vendor bootstrap/app parsing.
-            if pkt.payload.len() >= 2 {
+            if pkt.payload.len() >= 2 && (pkt.flags & _CONTROL) == _CONTROL {
                 let vendor_msg_id = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]);
                 if vendor_msg_id == MESSAGE_CHANNEL_OPEN_REQUEST as u16 {
                     let req = match ChannelOpenRequest::parse_from_bytes(&pkt.payload[2..]) {
@@ -953,12 +961,31 @@ pub async fn pkt_modify_hook(
                 Ok(msg) => msg,
             };
 
+            log_sdr_services(proxy_type, "before_rewrite", &msg);
+            info!(
+                "{} SDR_TRACE config add_vendor_channel={} remove_bluetooth={} remove_wifi={} ev={} odometer={} tire_pressure={} developer_mode={}",
+                get_name(proxy_type),
+                cfg.add_vendor_channel,
+                cfg.remove_bluetooth,
+                cfg.remove_wifi,
+                cfg.ev,
+                cfg.odometer,
+                cfg.tire_pressure,
+                cfg.developer_mode
+            );
+
             if let Some(svc) = msg
                 .services
                 .iter()
                 .find(|svc| !svc.sensor_source_service.sensors.is_empty())
             {
                 ctx.sensors = Some(svc.sensor_source_service.sensors.clone());
+                info!(
+                    "{} SDR_TRACE cached {} sensor definitions from service id={:#04x}",
+                    get_name(proxy_type),
+                    svc.sensor_source_service.sensors.len(),
+                    svc.id() as u8
+                );
             }
 
             // Populate media_channels (channel_id→sink) from the offset→sink map.
@@ -1351,6 +1378,13 @@ pub async fn pkt_modify_hook(
                         .unwrap_or(false)
                 });
 
+                info!(
+                    "{} SDR_TRACE add_vendor_channel requested; already_present={} current_ids={:?}",
+                    get_name(proxy_type),
+                    already_present,
+                    msg.services.iter().map(|svc| svc.id()).collect::<Vec<_>>()
+                );
+
                 if !already_present {
                     let next_service_id = msg
                         .services
@@ -1394,6 +1428,8 @@ pub async fn pkt_modify_hook(
                 get_name(proxy_type),
                 msg.services.iter().map(|s| s.id()).collect::<Vec<_>>()
             );
+
+            log_sdr_services(proxy_type, "after_rewrite", &msg);
 
             debug!(
                 "{} SDR after changes: {}",
@@ -1811,9 +1847,160 @@ fn build_control_reply_on_channel(
 
     Packet {
         channel,
-        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        // Important:
+        // Non-zero channel control frames must include CONTROL bit.
+        // Real DHU CHANNEL_OPEN_RESPONSE frames on service channels are 0x0f:
+        // ENCRYPTED | CONTROL | FRAME_TYPE_FIRST | FRAME_TYPE_LAST.
+        // Our previous synthetic vendor response was 0x0b, missing CONTROL.
+        flags: ENCRYPTED | _CONTROL | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
         final_length: None,
         payload,
+    }
+}
+
+fn packet_message_id(pkt: &Packet) -> Option<u16> {
+    if pkt.payload.len() >= 2 {
+        Some(u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]))
+    } else {
+        None
+    }
+}
+
+fn control_message_name(message_id: u16) -> String {
+    match ControlMessageType::from_i32(message_id as i32) {
+        Some(control) => format!("{:?}", control),
+        None => "NON_CONTROL_OR_UNKNOWN".to_string(),
+    }
+}
+
+fn should_trace_packet(pkt: &Packet, ctx: &ModifyContext) -> bool {
+    if pkt.channel == 0
+        || ctx.vendor_service_ids.contains(&pkt.channel)
+        || ctx.vendor_channel_states.contains_key(&pkt.channel)
+    {
+        return true;
+    }
+
+    match packet_message_id(pkt) {
+        Some(id) => {
+            id == MESSAGE_CHANNEL_OPEN_REQUEST as u16
+                || id == MESSAGE_CHANNEL_OPEN_RESPONSE as u16
+                || id == MESSAGE_PING_REQUEST as u16
+                || id == MESSAGE_PING_RESPONSE as u16
+                || id == MESSAGE_BYEBYE_REQUEST as u16
+                || id == MESSAGE_BYEBYE_RESPONSE as u16
+                || id == MESSAGE_SERVICE_DISCOVERY_REQUEST as u16
+                || id == MESSAGE_SERVICE_DISCOVERY_RESPONSE as u16
+        }
+        None => false,
+    }
+}
+
+fn trace_packet(proxy_type: ProxyType, stage: &str, pkt: &Packet, ctx: &ModifyContext) {
+    if !should_trace_packet(pkt, ctx) {
+        return;
+    }
+
+    let msg_id = packet_message_id(pkt).unwrap_or(0);
+    let first16_len = std::cmp::min(16, pkt.payload.len());
+
+    info!(
+        "{} AA_TRACE {} proxy={:?} channel={:#04x} flags={:#04x} final_len={:?} len={} msg_id=0x{:04X} msg={} vendor_ids={:?} vendor_state={:?} first16={:02X?}",
+        get_name(proxy_type),
+        stage,
+        proxy_type,
+        pkt.channel,
+        pkt.flags,
+        pkt.final_length,
+        pkt.payload.len(),
+        msg_id,
+        control_message_name(msg_id),
+        ctx.vendor_service_ids,
+        ctx.vendor_channel_states.get(&pkt.channel),
+        &pkt.payload[..first16_len]
+    );
+}
+
+fn describe_service(svc: &Service) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(ves) = svc.vendor_extension_service.as_ref() {
+        parts.push(format!(
+            "vendor(name={}, whitelist={:?})",
+            ves.service_name(),
+            &ves.package_white_list
+        ));
+    }
+
+    if !svc.sensor_source_service.sensors.is_empty() {
+        let sensors: Vec<String> = svc
+            .sensor_source_service
+            .sensors
+            .iter()
+            .map(|sensor| format!("{:?}", sensor.sensor_type()))
+            .collect();
+        parts.push(format!("sensor({})", sensors.join(",")));
+    }
+
+    if !svc.media_sink_service.video_configs.is_empty() {
+        parts.push(format!(
+            "video(display={:?}, available={:?})",
+            svc.media_sink_service.display_type(),
+            svc.media_sink_service.available_type()
+        ));
+    }
+
+    if !svc.media_sink_service.audio_configs.is_empty()
+        || svc.media_sink_service.audio_type.is_some()
+    {
+        parts.push(format!(
+            "audio(type={:?}, available={:?})",
+            svc.media_sink_service.audio_type(),
+            svc.media_sink_service.available_type()
+        ));
+    }
+
+    if svc.input_source_service.is_some() {
+        parts.push("input".to_string());
+    }
+    if svc.navigation_status_service.is_some() {
+        parts.push("navigation".to_string());
+    }
+    if svc.bluetooth_service.is_some() {
+        parts.push("bluetooth".to_string());
+    }
+    if svc.wifi_projection_service.is_some() {
+        parts.push("wifi_projection".to_string());
+    }
+
+    if parts.is_empty() {
+        parts.push("unknown_or_empty".to_string());
+    }
+
+    parts.join(" | ")
+}
+
+fn log_sdr_services(proxy_type: ProxyType, stage: &str, msg: &ServiceDiscoveryResponse) {
+    info!(
+        "{} SDR_TRACE {} service_count={} make={} model={} head_unit_make={} head_unit_model={}",
+        get_name(proxy_type),
+        stage,
+        msg.services.len(),
+        msg.make(),
+        msg.model(),
+        msg.head_unit_make(),
+        msg.head_unit_model()
+    );
+
+    for svc in msg.services.iter() {
+        info!(
+            "{} SDR_TRACE {} service id={} ({:#04x}) {}",
+            get_name(proxy_type),
+            stage,
+            svc.id(),
+            svc.id() as u8,
+            describe_service(svc)
+        );
     }
 }
 
@@ -1822,12 +2009,15 @@ async fn handle_vendor_channel_packet(
     ctx: &mut ModifyContext,
 ) -> Result<PacketAction> {
     let state = ctx.vendor_channel_states.get(&pkt.channel).copied();
+    let msg_id = packet_message_id(pkt).unwrap_or(0);
 
     info!(
-        "VEC forwarding packet channel={:#04x} state={:?} len={} payload={:02X?}",
+        "VEC forwarding packet channel={:#04x} state={:?} len={} msg_id=0x{:04X} msg={} payload={:02X?}",
         pkt.channel,
         state,
         pkt.payload.len(),
+        msg_id,
+        control_message_name(msg_id),
         pkt.payload
     );
 
@@ -2017,7 +2207,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         tokio::select! {
         // handling data from opposite device's thread, which needs to be transmitted
         Some(mut pkt) = rx.recv() => {
-            /*info!(
+            info!(
                 "{} LOOP {} channel={:#04x} len={} first2={:02X?}",
                 get_name(proxy_type),
                 "rx",
@@ -2026,7 +2216,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 pkt.payload
                     .get(0..std::cmp::min(2, pkt.payload.len()))
                     .unwrap_or(&[])
-            );*/
+            );
 
             let action = pkt_modify_hook(
                 proxy_type,
@@ -2043,6 +2233,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 ws_event_tx.clone()
             )
             .await?;
+            trace_packet(proxy_type, "after_modify/rx_to_device", &pkt, &ctx);
             let _ = pkt_debug(
                 proxy_type,
                 HexdumpLevel::DecryptedOutput,
@@ -2053,9 +2244,11 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
 
             match action {
                 PacketAction::Drop => {
+                    trace_packet(proxy_type, "decision/drop/rx", &pkt, &ctx);
                     debug!("{} pkt_modify_hook: packet dropped", get_name(proxy_type));
                 }
                 PacketAction::SendBack => {
+                    trace_packet(proxy_type, "decision/sendback/rx", &pkt, &ctx);
                     info!(
                         "{} SEND_BACK reply channel={:#04x} len={} payload={:02X?}",
                         get_name(proxy_type),
@@ -2067,6 +2260,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                     info!("{} SEND_BACK queued successfully", get_name(proxy_type));
                 }
                 PacketAction::Forward => {
+                    trace_packet(proxy_type, "decision/forward/rx", &pkt, &ctx);
                     pkt.encrypt_payload(&mut mem_buf, &mut server).await?;
                     let _ =
                         pkt_debug(proxy_type, HexdumpLevel::RawOutput, hex_requested, &pkt).await;
@@ -2083,7 +2277,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
 
         // handling input data from the reader thread
         Some(mut pkt) = rxr.recv() => {
-            /*info!(
+            info!(
                 "{} LOOP {} channel={:#04x} len={} first2={:02X?}",
                 get_name(proxy_type),
                 "rxr",
@@ -2092,7 +2286,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 pkt.payload
                     .get(0..std::cmp::min(2, pkt.payload.len()))
                     .unwrap_or(&[])
-            );*/
+            );
 
             let _ = pkt_debug(proxy_type, HexdumpLevel::RawInput, hex_requested, &pkt).await;
             match pkt.decrypt_payload(&mut mem_buf, &mut server).await {
@@ -2112,6 +2306,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         ws_event_tx.clone(),
                     )
                     .await?;
+                    trace_packet(proxy_type, "after_modify/rxr_to_peer", &pkt, &ctx);
                     let _ = pkt_debug(
                         proxy_type,
                         HexdumpLevel::DecryptedInput,
@@ -2120,8 +2315,11 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                     )
                     .await;
                     match action {
-                        PacketAction::Drop => {}
+                        PacketAction::Drop => {
+                            trace_packet(proxy_type, "decision/drop/rxr", &pkt, &ctx);
+                        }
                         PacketAction::SendBack => {
+                            trace_packet(proxy_type, "decision/sendback/rxr", &pkt, &ctx);
                             info!(
                                 "{} SEND_BACK reply channel={:#04x} len={} payload={:02X?}",
                                 get_name(proxy_type),
@@ -2133,6 +2331,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                             info!("{} SEND_BACK queued successfully", get_name(proxy_type));
                         }
                         PacketAction::Forward => {
+                            trace_packet(proxy_type, "decision/forward/rxr", &pkt, &ctx);
                             tx.send(pkt).await?;
                         }
                     }
@@ -2153,6 +2352,7 @@ mod tests {
         let (ev_tx, _) = mpsc::channel(1);
         ModifyContext {
             sensor_channel: None,
+            sensors: None,
             nav_channel: None,
             audio_channels: vec![],
             ev_tx,
