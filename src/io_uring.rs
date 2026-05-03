@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::net::IpAddr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs::File as TokioFile;
@@ -365,6 +365,7 @@ pub async fn io_loop(
     input_channel: Arc<Mutex<Option<u8>>>,
     last_battery: Arc<RwLock<Option<BatteryData>>>,
     last_speed: Arc<RwLock<Option<i32>>>,
+    usb_connected: Arc<AtomicBool>,
     script_registry: Option<Arc<ScriptRegistry>>,
     ws_event_tx: BroadcastSender<ServerEvent>,
 ) -> Result<()> {
@@ -436,20 +437,37 @@ pub async fn io_loop(
         let mut md_usb = None;
         let mut hu_tcp = None;
         let mut hu_usb = None;
+        let mut usb_used = false;
+
         if config.wired.is_some() {
-            info!(
-                "{} 💤 trying to enable Android Auto mode on USB port...",
-                NAME
-            );
-            match usb_stream::new(config.wired.clone()).await {
-                Err(e) => {
-                    error!("{} 🔴 Enabling Android Auto: {}", NAME, e);
-                    // notify main loop to restart
-                    let _ = need_restart.send(None);
-                    continue;
+            info!("{} 💤 waiting for USB or bluetooth handshake...", NAME);
+
+            let wired_clone = config.wired.clone();
+            let usb_future = async move {
+                loop {
+                    if let Ok(s) = usb_stream::new(wired_clone.clone()).await {
+                        return s;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                Ok(s) => {
-                    md_usb = Some(s);
+            };
+
+            tokio::select! {
+                usb_res = usb_future => {
+                    info!("{} 🔌 USB device connected, disabling wireless...", NAME);
+                    usb_connected.store(true, Ordering::Relaxed);
+                    usb_used = true;
+                    md_usb = Some(usb_res);
+                }
+                _ = tcp_start.notified() => {
+                    info!("{} 🛰️ MD TCP server: listening for phone connection...", NAME);
+                    if let Ok((s, ip)) = tcp_wait_for_connection(&mut md_listener.as_mut().unwrap()).await {
+                        md_tcp = Some(s);
+                        client_mac = mac_from_ipv4(ip).await.unwrap_or(None);
+                    } else {
+                        let _ = need_restart.send(None);
+                        continue;
+                    }
                 }
             }
         } else {
@@ -464,6 +482,7 @@ pub async fn io_loop(
                 md_tcp = Some(s);
                 // Get MAC address of the connected client for later disassociation
                 client_mac = mac_from_ipv4(ip).await.unwrap_or(None);
+                usb_connected.store(false, Ordering::Relaxed);
             } else {
                 // notify main loop to restart
                 let _ = need_restart.send(None);
@@ -625,13 +644,31 @@ pub async fn io_loop(
             shared_config.clone(),
         ));
 
+        // Background task to interrupt wireless session if USB is plugged in
+        let wired_clone = config.wired.clone();
+        let mut usb_monitor = tokio::spawn(async move {
+            if let Some(wired) = wired_clone {
+                if !usb_used {
+                    loop {
+                        if usb_stream::is_present(&Some(wired.clone())) {
+                            return Err("USB device detected during wireless session".into());
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            let pending: std::future::Pending<Result<()>> = std::future::pending();
+            pending.await
+        });
+
         // Stop as soon as one of them errors
         let res = tokio::try_join!(
             flatten(&mut reader_hu),
             flatten(&mut reader_md),
             flatten(&mut from_file),
             flatten(&mut from_stream),
-            flatten(&mut monitor)
+            flatten(&mut monitor),
+            flatten(&mut usb_monitor)
         );
         if let Err(e) = res {
             error!("{} 🔴 Connection error: {}", NAME, e);
@@ -648,6 +685,7 @@ pub async fn io_loop(
         from_file.abort();
         from_stream.abort();
         monitor.abort();
+        usb_monitor.abort();
 
         // make sure TCP connections are closed before next connection attempts
         if let Some(stream) = md_tcp_stream {
@@ -689,6 +727,9 @@ pub async fn io_loop(
         let action = shared_config.read().await.action_requested.clone();
         // stream(s) closed, notify main loop to restart
         let _ = need_restart.send(action);
+
+        // Reset usb_connected so main loop can resume wireless broadcasting
+        usb_connected.store(false, Ordering::Relaxed);
     }
 
     #[allow(unreachable_code)]

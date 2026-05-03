@@ -53,6 +53,25 @@ pub struct UsbStreamWrite {
     pub write_queue: Endpoint<Bulk, Out>,
 }
 
+/// Lightweight USB presence check — enumerates devices without opening,
+/// claiming an interface, or switching to accessory mode.
+pub fn is_present(wired: &Option<UsbId>) -> bool {
+    nusb::list_devices()
+        .wait()
+        .ok()
+        .map(|mut devices| {
+            devices.any(|info| match wired {
+                Some(id) if id.vid > 0 && id.pid > 0 => {
+                    info.vendor_id() == id.vid && info.product_id() == id.pid
+                }
+                Some(id) if id.pid > 0 => info.product_id() == id.pid,
+                Some(id) if id.vid > 0 => info.vendor_id() == id.vid,
+                _ => true,
+            })
+        })
+        .unwrap_or(false)
+}
+
 // switch a USB device to accessory mode
 pub fn switch_to_accessory(info: &nusb::DeviceInfo) -> Result<(), ConnectError> {
     info!(
