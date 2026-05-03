@@ -32,6 +32,8 @@ pub enum ConnectError {
     CantOpenUsbAccessoryEndpoint(EndpointError),
     #[error(transparent)]
     CantJoin(#[from] tokio::task::JoinError),
+    #[error("{0}")]
+    Other(String),
 }
 
 #[derive(Debug, Error)]
@@ -77,9 +79,7 @@ pub fn switch_to_accessory(info: &nusb::DeviceInfo) -> Result<(), ConnectError> 
         .map_err(ConnectError::CantOpenUsbHandle)?;
 
     let strings = AccessoryStrings::new("Android", "Android Auto", "Android Auto", "1.0", "", "")
-        .map_err(|_| {
-        ConnectError::CantOpenUsbHandle(nusb::Error::other("Invalid accessory settings"))
-    })?;
+        .map_err(|_| ConnectError::Other("Invalid accessory settings".to_string()))?;
 
     let protocol = iface
         .start_accessory(&strings, Duration::from_secs(1))
@@ -131,10 +131,9 @@ pub async fn new(
             .wait()
             .map_err(ConnectError::NoUsbDevice)?
             .find(|d| d.in_accessory_mode())
-            .ok_or(nusb::Error::other(
-                "No android phone found after switching to accessory. Make sure the phone is set to charging only mode.",
-            ))
-            .map_err(ConnectError::NoUsbDevice)?;
+            .ok_or_else(|| ConnectError::Other(
+                "No android phone found after switching to accessory. Make sure the phone is set to charging only mode.".to_string(),
+            ))?;
 
         let device = info
             .open()
