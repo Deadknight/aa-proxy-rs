@@ -1,5 +1,10 @@
 use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
+use crate::vendor_ext::{
+    add_vendor_extension_service, ensure_vendor_channel_open, handle_vendor_channel_packet,
+    has_vendor_extension_service, is_vendor_channel, is_vendor_service_id, mark_vendor_channel_open,
+    VecChannelState, OUR_VEC_PACKAGE, OUR_VEC_SERVICE_NAME,
+};
 #[cfg(feature = "wasm-scripting")]
 use crate::script_wasm::bindings::aa::packet::types::Decision;
 #[cfg(feature = "wasm-scripting")]
@@ -90,21 +95,13 @@ const KEYS_PATH: &str = "/etc/aa-proxy-rs";
 // DHU string consts for developer mode
 pub const DHU_MAKE: &str = "Google";
 pub const DHU_MODEL: &str = "Desktop Head Unit";
-const OUR_VEC_SERVICE_NAME: &str = "aaproxy_companion";
-const OUR_VEC_PACKAGE: &str = "com.github.deadknight.aaproxycompanion";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VecChannelState {
-    Opened,
-}
-
 pub struct ModifyContext {
     pub(crate) sensor_channel: Option<u8>,
     pub(crate) sensors: Option<Vec<Sensor>>,
     pub(crate) nav_channel: Option<u8>,
     pub(crate) audio_channels: Vec<u8>,
     ev_tx: Sender<EvTaskCommand>,
-    input_channel: Option<u8>,
+    pub(crate) input_channel: Option<u8>,
     hu_tx: Option<Sender<Packet>>,
     hu_input_state: HuInputState,
     /// Offset→sink map (keys 0-6). Used only at SDR time to look up which sink
@@ -116,9 +113,9 @@ pub struct ModifyContext {
     /// AA transport frames.
     media_fragments: HashMap<u8, MediaFrameBuffer>,
     /// VEC service ids injected by aa-proxy-rs into the service discovery response.
-    vendor_service_ids: HashSet<u8>,
+    pub(crate) vendor_service_ids: HashSet<u8>,
     /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
-    vendor_channel_states: HashMap<u8, VecChannelState>,
+    pub(crate) vendor_channel_states: HashMap<u8, VecChannelState>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -836,7 +833,7 @@ pub async fn pkt_modify_hook(
                 };
 
                 let service_id = req.service_id() as u8;
-                let is_our_vendor_service = ctx.vendor_service_ids.contains(&service_id);
+                let is_our_vendor_service = is_vendor_service_id(ctx, service_id);
 
                 info!(
                     "{} non-zero CHANNEL_OPEN_REQUEST channel={:#04x} priority={} service_id={} vendor_match={}",
@@ -858,8 +855,7 @@ pub async fn pkt_modify_hook(
                         payload,
                     );
 
-                    ctx.vendor_channel_states
-                        .insert(pkt.channel, VecChannelState::Opened);
+                    mark_vendor_channel_open(ctx, pkt.channel);
 
                     info!(
                         "{} accepted injected VEC open channel={:#04x} service_id={}; custom app messages will be handled locally",
@@ -873,10 +869,7 @@ pub async fn pkt_modify_hook(
             }
         }
 
-        let is_vendor_channel = ctx.vendor_service_ids.contains(&pkt.channel)
-            || ctx.vendor_channel_states.contains_key(&pkt.channel);
-
-        if is_vendor_channel {
+        if is_vendor_channel(ctx, pkt.channel) {
             info!(
                 "{} intercepted VEC app-data packet channel=<b>{:#04x}</> len={} proxy_type={:?} state={:?}",
                 get_name(proxy_type),
@@ -933,23 +926,21 @@ pub async fn pkt_modify_hook(
                 get_name(proxy_type),
                 control.unwrap(),
                 service_id,
-                ctx.vendor_service_ids.contains(&service_id),
+                is_vendor_service_id(ctx, service_id),
             );
 
             // If the phone sends the synthetic vendor open as a normal channel-0
             // CHANNEL_OPEN_REQUEST, catch it in the proxy context that owns
             // vendor_service_ids. In current DHU traces the phone uses channel 0x08,
             // but real phones/HUs may use channel 0 for this control message.
-            if ctx.vendor_service_ids.contains(&service_id) {
+            if is_vendor_service_id(ctx, service_id) {
                 let mut response = ChannelOpenResponse::new();
                 response.set_status(MessageStatus::STATUS_SUCCESS);
 
                 let payload: Vec<u8> = response.write_to_bytes()?;
                 *pkt = build_control_reply(MESSAGE_CHANNEL_OPEN_RESPONSE, payload);
 
-                ctx.vendor_channel_states
-                    .entry(service_id)
-                    .or_insert(VecChannelState::Opened);
+                ensure_vendor_channel_open(ctx, service_id);
 
                 info!(
                     "{} <yellow>{:?}</>: accepted channel-0 open for injected VEC service_id=<b>{:#04x}</>; replying locally",
@@ -1367,12 +1358,7 @@ pub async fn pkt_modify_hook(
             // add vendor channel as extra, do not touch existing HU channels
             // this must be last entry do not replace
             if cfg.add_vendor_channel {
-                let already_present = msg.services.iter().any(|svc| {
-                    svc.vendor_extension_service
-                        .as_ref()
-                        .map(|ves| ves.service_name() == OUR_VEC_SERVICE_NAME)
-                        .unwrap_or(false)
-                });
+                let already_present = has_vendor_extension_service(&msg);
 
                 info!(
                     "{} SDR_TRACE add_vendor_channel requested; already_present={} current_ids={:?}",
@@ -1381,32 +1367,12 @@ pub async fn pkt_modify_hook(
                     msg.services.iter().map(|svc| svc.id()).collect::<Vec<_>>()
                 );
 
-                if !already_present {
-                    let next_service_id = msg
-                        .services
-                        .iter()
-                        .map(|svc| svc.id())
-                        .max()
-                        .unwrap_or(0)
-                        + 1;
-
-                    let mut service = Service::new();
-                    service.set_id(next_service_id);
-
-                    let mut ves = VendorExtensionService::new();
-                    ves.set_service_name(OUR_VEC_SERVICE_NAME.to_string());
-                    ves.package_white_list.push(OUR_VEC_PACKAGE.to_string());
-
-                    service.vendor_extension_service = protobuf::MessageField::some(ves);
-                    msg.services.push(service);
-
-                    ctx.vendor_service_ids.insert(next_service_id as u8);
-
+                if let Some(service_id) = add_vendor_extension_service(&mut msg, ctx) {
                     info!(
                         "{} <yellow>{:?}</>: added extra <blue>vendor_extension_service</> id=<b>{:#04x}</> name=<b>{}</> package=<b>{}</>",
                         get_name(proxy_type),
                         control.unwrap(),
-                        next_service_id as u8,
+                        service_id,
                         OUR_VEC_SERVICE_NAME,
                         OUR_VEC_PACKAGE,
                     );
@@ -1852,31 +1818,6 @@ fn build_control_reply_on_channel(
     }
 }
 
-const VEC_APP_VERSION: u8 = 0x01;
-const VEC_OP_PING: u8 = 0x01;
-const VEC_OP_GET_STATUS: u8 = 0x02;
-const VEC_OP_ECHO: u8 = 0x03;
-
-const VEC_OP_PONG: u8 = 0x81;
-const VEC_OP_STATUS: u8 = 0x82;
-const VEC_OP_ECHO_REPLY: u8 = 0x83;
-const VEC_OP_ERROR: u8 = 0xFF;
-
-fn build_vendor_app_reply(channel: u8, opcode: u8, payload: Vec<u8>) -> Packet {
-    let mut out = Vec::with_capacity(2 + payload.len());
-    out.push(VEC_APP_VERSION);
-    out.push(opcode);
-    out.extend_from_slice(&payload);
-
-    Packet {
-        channel,
-        // Custom vendor app-data frame. Do not set CONTROL here.
-        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
-        final_length: None,
-        payload: out,
-    }
-}
-
 fn packet_message_id(pkt: &Packet) -> Option<u16> {
     if pkt.payload.len() >= 2 {
         Some(u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]))
@@ -1893,10 +1834,7 @@ fn control_message_name(message_id: u16) -> String {
 }
 
 fn should_trace_packet(pkt: &Packet, ctx: &ModifyContext) -> bool {
-    if pkt.channel == 0
-        || ctx.vendor_service_ids.contains(&pkt.channel)
-        || ctx.vendor_channel_states.contains_key(&pkt.channel)
-    {
+    if pkt.channel == 0 || is_vendor_channel(ctx, pkt.channel) {
         return true;
     }
 
@@ -2020,115 +1958,6 @@ fn log_sdr_services(proxy_type: ProxyType, stage: &str, msg: &ServiceDiscoveryRe
             svc.id() as u8,
             describe_service(svc)
         );
-    }
-}
-
-async fn handle_vendor_channel_packet(
-    pkt: &mut Packet,
-    ctx: &mut ModifyContext,
-) -> Result<PacketAction> {
-    let state = ctx.vendor_channel_states.get(&pkt.channel).copied();
-
-    info!(
-        "VEC app packet channel={:#04x} state={:?} flags={:#04x} len={} payload={:02X?}",
-        pkt.channel,
-        state,
-        pkt.flags,
-        pkt.payload.len(),
-        pkt.payload
-    );
-
-    if pkt.payload.len() < 2 {
-        warn!(
-            "VEC app packet too short channel={:#04x} payload={:02X?}",
-            pkt.channel,
-            pkt.payload
-        );
-
-        *pkt = build_vendor_app_reply(
-            pkt.channel,
-            VEC_OP_ERROR,
-            b"short packet".to_vec(),
-        );
-        return Ok(PacketAction::SendBack);
-    }
-
-    let version = pkt.payload[0];
-    let opcode = pkt.payload[1];
-    let body = pkt.payload[2..].to_vec();
-
-    if version != VEC_APP_VERSION {
-        warn!(
-            "VEC unsupported app version={} opcode={:#04x} channel={:#04x}",
-            version,
-            opcode,
-            pkt.channel
-        );
-
-        *pkt = build_vendor_app_reply(
-            pkt.channel,
-            VEC_OP_ERROR,
-            format!("unsupported version {}", version).into_bytes(),
-        );
-        return Ok(PacketAction::SendBack);
-    }
-
-    match opcode {
-        VEC_OP_PING => {
-            info!(
-                "VEC PING received channel={:#04x} payload={:02X?}",
-                pkt.channel,
-                body
-            );
-
-            *pkt = build_vendor_app_reply(pkt.channel, VEC_OP_PONG, body);
-            Ok(PacketAction::SendBack)
-        }
-        VEC_OP_GET_STATUS => {
-            let status = serde_json::json!({
-                "ok": true,
-                "channel": pkt.channel,
-                "sensor_channel": ctx.sensor_channel,
-                "input_channel": ctx.input_channel,
-                "nav_channel": ctx.nav_channel,
-                "audio_channels": ctx.audio_channels,
-            })
-            .to_string();
-
-            info!("VEC GET_STATUS received channel={:#04x}", pkt.channel);
-
-            *pkt = build_vendor_app_reply(
-                pkt.channel,
-                VEC_OP_STATUS,
-                status.into_bytes(),
-            );
-            Ok(PacketAction::SendBack)
-        }
-        VEC_OP_ECHO => {
-            info!(
-                "VEC ECHO received channel={:#04x} payload_len={}",
-                pkt.channel,
-                body.len()
-            );
-
-            *pkt = build_vendor_app_reply(pkt.channel, VEC_OP_ECHO_REPLY, body);
-            Ok(PacketAction::SendBack)
-        }
-        _ => {
-            warn!(
-                "VEC unknown app opcode={:#04x} channel={:#04x} payload={:02X?}",
-                opcode,
-                pkt.channel,
-                body
-            );
-
-            *pkt = build_vendor_app_reply(
-                pkt.channel,
-                VEC_OP_ERROR,
-                format!("unknown opcode 0x{:02x}", opcode).into_bytes(),
-            );
-            Ok(PacketAction::SendBack)
-        }
     }
 }
 
