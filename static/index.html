@@ -45,6 +45,44 @@
       .grid-cols-2 {
         grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
       }
+
+      .floating-save-btn {
+        position: fixed;
+        top: 1rem;
+        right: 1rem;
+        z-index: 9999;
+
+        width: 3.25rem;
+        height: 3.25rem;
+        min-width: 3.25rem;
+        padding: 0;
+        margin: 0;
+
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+
+        font-size: 1.35rem;
+        line-height: 1;
+
+        box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.35);
+      }
+
+      .floating-save-btn:hover {
+        transform: scale(1.05);
+      }
+
+      @media (max-width: 576px) {
+        .floating-save-btn {
+          top: 0.75rem;
+          right: 0.75rem;
+          width: 2.75rem;
+          height: 2.75rem;
+          min-width: 2.75rem;
+          font-size: 1.15rem;
+        }
+      }
     </style>
   </head>
   <body>
@@ -54,6 +92,16 @@
       </h3>
       <small>build: {BUILD_DATE}, git: {GIT_INFO}</small>
     </header>
+
+    <button
+      type="button"
+      class="floating-save-btn"
+      onclick="saveConfig()"
+      title="Save configuration"
+      aria-label="Save configuration"
+    >
+      💾
+    </button>
 
     <template id="actions-template">
       <fieldset>
