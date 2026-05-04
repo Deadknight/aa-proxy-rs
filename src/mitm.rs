@@ -475,7 +475,7 @@ pub async fn pkt_modify_hook(
                     if let Ok(mut msg) = SensorRequest::parse_from_bytes(data) {
                         if msg.type_() == SensorType::SENSOR_VEHICLE_ENERGY_MODEL_DATA {
                             // check if we have some battery logger configured
-                            if let Some(path) = &cfg.ev_battery_logger {
+                            if cfg.ev_battery_logger.is_some() {
                                 debug!(
                                   "additional SENSOR_MESSAGE_REQUEST for {:?}, making a response with success...",
                                   msg.type_()
@@ -494,11 +494,6 @@ pub async fn pkt_modify_hook(
                                     payload: payload,
                                 };
                                 *pkt = reply;
-
-                                // start EV battery logger if needed
-                                ctx.ev_tx
-                                    .send(EvTaskCommand::Start(path.to_string()))
-                                    .await?;
 
                                 // return true => send own reply without processing
                                 return Ok(PacketAction::SendBack);
@@ -1151,6 +1146,14 @@ pub async fn pkt_modify_hook(
                         .as_mut()
                         .unwrap()
                         .supported_ev_connector_types = connectors;
+                }
+
+                // check if we have some battery logger configured
+                if let Some(path) = &cfg.ev_battery_logger {
+                    // start EV battery logger if needed
+                    ctx.ev_tx
+                        .send(EvTaskCommand::Start(path.to_string()))
+                        .await?;
                 }
             }
 
