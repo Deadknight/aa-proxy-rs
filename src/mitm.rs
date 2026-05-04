@@ -1,10 +1,5 @@
 use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
-use crate::vendor_ext::{
-    add_vendor_extension_service, ensure_vendor_channel_open, handle_vendor_channel_packet,
-    has_vendor_extension_service, is_vendor_channel, is_vendor_service_id, mark_vendor_channel_open,
-    VecChannelState, OUR_VEC_PACKAGE, OUR_VEC_SERVICE_NAME,
-};
 #[cfg(feature = "wasm-scripting")]
 use crate::script_wasm::bindings::aa::packet::types::Decision;
 #[cfg(feature = "wasm-scripting")]
@@ -14,6 +9,12 @@ use crate::script_wasm::{
 };
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
+use crate::vendor_ext::{
+    add_vendor_extension_service, ensure_vendor_channel_open, handle_vendor_channel_packet,
+    handle_vendor_ws_event_tx,
+    has_vendor_extension_service, is_vendor_channel, is_vendor_service_id, mark_vendor_channel_open,
+    VecChannelState, OUR_VEC_PACKAGE, OUR_VEC_SERVICE_NAME,
+};
 use crate::web::ServerEvent;
 use anyhow::Context;
 use log::log_enabled;
@@ -102,7 +103,7 @@ pub struct ModifyContext {
     pub(crate) audio_channels: Vec<u8>,
     ev_tx: Sender<EvTaskCommand>,
     pub(crate) input_channel: Option<u8>,
-    hu_tx: Option<Sender<Packet>>,
+    pub(crate) hu_tx: Option<Sender<Packet>>,
     hu_input_state: HuInputState,
     /// Offset→sink map (keys 0-6). Used only at SDR time to look up which sink
     /// to assign to each real channel. Never used for tapping.
@@ -856,6 +857,8 @@ pub async fn pkt_modify_hook(
                     );
 
                     mark_vendor_channel_open(ctx, pkt.channel);
+
+                    handle_vendor_ws_event_tx(ctx, state);
 
                     info!(
                         "{} accepted injected VEC open channel={:#04x} service_id={}; custom app messages will be handled locally",
