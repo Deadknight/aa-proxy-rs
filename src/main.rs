@@ -89,42 +89,36 @@ struct Args {
     generate_hostapd: bool,
 }
 
-fn init_wifi_config(cfg: &AppConfig) -> WifiConfig {
+fn init_wifi_config(cfg: &AppConfig) -> Result<WifiConfig> {
     let mut ip_addr = String::from(DEFAULT_WLAN_ADDR);
 
     // Get UP interface and IP
-    for ifa in netif::up().unwrap() {
+    for ifa in netif::up()? {
         match ifa.name() {
             val if val == cfg.iface => {
                 debug!("Found interface: {:?}", ifa);
+
                 // IPv4 Address contains None scope_id, while IPv6 contains Some
-                match ifa.scope_id() {
-                    None => {
-                        ip_addr = ifa.address().to_string();
-                        break;
-                    }
-                    _ => (),
+                if ifa.scope_id().is_none() {
+                    ip_addr = ifa.address().to_string();
+                    break;
                 }
             }
             _ => (),
         }
     }
 
-    let bssid = mac_address::mac_address_by_name(&cfg.iface)
-        .expect(&format!("mac_address_by_name for {:?}", cfg.iface))
-        .expect(&format!(
-            "No MAC address found for interface: {:?}",
-            cfg.iface
-        ))
+    let bssid = mac_address::mac_address_by_name(&cfg.iface)?
+        .ok_or("No MAC address found")?
         .to_string();
 
-    WifiConfig {
+    Ok(WifiConfig {
         ip_addr,
         port: TCP_SERVER_PORT,
         ssid: cfg.ssid.clone(),
         bssid,
         wpa_key: cfg.wpa_passphrase.clone(),
-    }
+    })
 }
 
 fn logging_init(debug: bool, disable_console_debug: bool, log_path: &PathBuf) {
@@ -267,7 +261,12 @@ async fn tokio_main(
         }
     }
 
-    let wifi_conf = Some(init_wifi_config(&cfg));
+    let wifi_config = init_wifi_config(&cfg)
+        .map_err(|e| {
+            error!("{} WiFi config init failed: {}", NAME, e);
+            e
+        })
+        .ok();
     let mut usb = None;
     if !cfg.dhu {
         if cfg.legacy {
@@ -335,29 +334,31 @@ async fn tokio_main(
         }
 
         // run only if not handling this in handshake task
-        if !usb_connected.load(Ordering::Relaxed)
-            && (!(cfg.quick_reconnect && profile_connected.load(Ordering::Relaxed))
-                || cfg.action_requested == Some(Action::Stop))
-        {
-            // bluetooth handshake
-            if let Err(e) = bluetooth
-                .aa_handshake(
-                    cfg.connect.clone(),
-                    wifi_conf.clone().unwrap(),
-                    tcp_start.clone(),
-                    Duration::from_secs(cfg.bt_timeout_secs.into()),
-                    cfg.action_requested == Some(Action::Stop),
-                    cfg.quick_reconnect,
-                    cfg.bt_poweroff,
-                    restart_tx.subscribe(),
-                    restart_tx.clone(),
-                    profile_connected.clone(),
-                )
-                .await
+        if let Some(ref wifi_conf) = wifi_config {
+            if !usb_connected.load(Ordering::Relaxed)
+                && (!(cfg.quick_reconnect && profile_connected.load(Ordering::Relaxed))
+                    || cfg.action_requested == Some(Action::Stop))
             {
-                error!("{} bluetooth AA handshake error: {}", NAME, e);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
+                // bluetooth handshake
+                if let Err(e) = bluetooth
+                    .aa_handshake(
+                        cfg.connect.clone(),
+                        wifi_conf.clone(),
+                        tcp_start.clone(),
+                        Duration::from_secs(cfg.bt_timeout_secs.into()),
+                        cfg.action_requested == Some(Action::Stop),
+                        cfg.quick_reconnect,
+                        cfg.bt_poweroff,
+                        restart_tx.subscribe(),
+                        restart_tx.clone(),
+                        profile_connected.clone(),
+                    )
+                    .await
+                {
+                    error!("{} bluetooth AA handshake error: {}", NAME, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
             }
         }
 
