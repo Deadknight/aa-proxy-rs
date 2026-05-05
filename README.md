@@ -28,9 +28,15 @@ The project initially focused on supporting the Raspberry Pi, but has since grow
   - Enable developer mode
   - Detects user-initiated `Disconnect` on phone and prevents auto-reconnect
   - `Waze` workaround for LHT (Left-Hand Traffic) countries
+  - **Media stream inspection** – tap decrypted AA video/audio stream via TCP (`media_dump_base_port`) for use in VLC, mpv, etc.
+  - **Event injection** – key event injection via `/inject_event` and rotary controller support via `/inject_rotary`
+  - **WASM scripting** – write hooks that modify AA packets on the fly via `wasmtime`; scripts can call the local REST API and push events over WebSocket (disabled on ARMv6 / RPi Zero W)
+  - **Speed & odometry** – speed data collection (`/speed` endpoint), odometer injection (`/odometer`), and tire pressure injection (`/tire-pressure`) via REST API
+  - **Media button interception** – short press re-injects a clean click; long press triggers a configurable script (`hu_button_handler`)
 - **[Google Maps EV Routing](#google-maps-ev-routing)** – allows EV-specific navigation features
 - **Wired USB phone mode** – works without the Bluetooth handshake or Wi-Fi pairing
-- **[Support for Google’s Desktop Head Unit (DHU)](#connecting-to-desktop-head-unit-dhu)** – ideal for debugging and development
+- **[Support for Google's Desktop Head Unit (DHU)](#connecting-to-desktop-head-unit-dhu)** – ideal for debugging and development
+- **OTA updates** – SWUpdate over-the-air update support for all Raspberry Pi and AAWireless boards, including TCP reverse bridge for companion app updates
 
 ## Current project status
 After extensive stress testing and continuous development, the project has reached a level of stability that meets its original goals.
