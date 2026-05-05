@@ -840,7 +840,7 @@ pub async fn pkt_modify_hook(
                 let service_id = req.service_id() as u8;
                 let is_our_vendor_service = is_vendor_service_id(ctx, service_id);
 
-                info!(
+                debug!(
                     "{} non-zero CHANNEL_OPEN_REQUEST channel={:#04x} priority={} service_id={} vendor_match={}",
                     get_name(proxy_type),
                     pkt.channel,
