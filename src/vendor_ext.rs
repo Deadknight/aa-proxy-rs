@@ -2,30 +2,49 @@ use crate::mitm::protos::{Service, ServiceDiscoveryResponse, VendorExtensionServ
 use crate::mitm::{
     ModifyContext, Packet, PacketAction, Result, ENCRYPTED, FRAME_TYPE_FIRST, FRAME_TYPE_LAST,
 };
-use crate::web::AppState;
-use log::{info, warn};
-use serde::{Deserialize, Serialize};
+use crate::web::ServerEvent;
+#[cfg(feature = "wasm-scripting")]
+use crate::script_wasm::{LoadedScript, ScriptRegistry};
+#[cfg(not(feature = "wasm-scripting"))]
+type ScriptRegistry = ();
+use log::{debug, info, warn};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc::Sender, RwLock};
+use tokio::task::JoinHandle;
 
 pub(crate) const OUR_VEC_SERVICE_NAME: &str = "aaproxy_companion";
 pub(crate) const OUR_VEC_PACKAGE: &str = "com.github.deadknight.aaproxycompanion";
 
 const VEC_APP_VERSION: u8 = 0x01;
-const VEC_OP_PING: u8 = 0x01;
-const VEC_OP_GET_STATUS: u8 = 0x02;
-const VEC_OP_ECHO: u8 = 0x03;
-const VEC_OP_REST_CALL: u8 = 0x04;
+const VEC_OP_PING: u8 = 0x02;
+const VEC_OP_GET_STATUS: u8 = 0x03;
+const VEC_OP_ECHO: u8 = 0x04;
+const VEC_OP_REST_CALL: u8 = 0x05;
+const VEC_OP_REST_CALL_SYNC: u8 = 0x06;
+const VEC_OP_SUBSCRIBE_TOPIC_EVENT: u8 = 0x07;
+const VEC_OP_UNSUBSCRIBE_TOPIC_EVENT: u8 = 0x08;
+const VEC_OP_ON_SCRIPT_EVENT: u8 = 0x09;
 
 const VEC_OP_PONG: u8 = 0x81;
 const VEC_OP_STATUS: u8 = 0x82;
 const VEC_OP_ECHO_REPLY: u8 = 0x83;
 const VEC_OP_REST_CALL_REPLY: u8 = 0x85;
 const VEC_OP_REST_CALL_RESULT: u8 = 0x86;
+const VEC_OP_ON_TOPIC_EVENT: u8 = 0x87;
 
 const VEC_OP_ERROR: u8 = 0xFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VecChannelState {
     Opened,
+}
+
+#[derive(Clone)]
+pub(crate) struct VecTopicEventRuntime {
+    pub(crate) ws_event_tx: broadcast::Sender<ServerEvent>,
+    pub(crate) script_registry: Option<Arc<ScriptRegistry>>,
 }
 
 pub(crate) fn is_vendor_service_id(ctx: &ModifyContext, service_id: u8) -> bool {
@@ -45,6 +64,132 @@ pub(crate) fn ensure_vendor_channel_open(ctx: &mut ModifyContext, channel: u8) {
     ctx.vendor_channel_states
         .entry(channel)
         .or_insert(VecChannelState::Opened);
+}
+
+pub(crate) struct VecTopicEventBridge {
+    pub(crate) subscriptions: Arc<RwLock<HashSet<String>>>,
+    task: JoinHandle<()>,
+}
+
+impl VecTopicEventBridge {
+    fn new(
+        channel: u8,
+        tx: Sender<Packet>,
+        runtime: VecTopicEventRuntime,
+    ) -> Self {
+        let subscriptions = Arc::new(RwLock::new(HashSet::new()));
+        let task_subscriptions = subscriptions.clone();
+        let mut ws_event_rx = runtime.ws_event_tx.subscribe();
+
+        let task = tokio::spawn(async move {
+            loop {
+                match ws_event_rx.recv().await {
+                    Ok(event) => {
+                        let should_send = {
+                            let subscriptions = task_subscriptions.read().await;
+                            subscriptions.contains(&event.topic)
+                        };
+
+                        if !should_send {
+                            continue;
+                        }
+
+                        let event = match run_wasm_vec_topic_hooks(
+                            event.topic.clone(),
+                            event.payload.clone(),
+                            runtime.clone(),
+                        )
+                        .await
+                        {
+                            Ok(Some(true)) => {
+                                // wasm handled it and already emitted a replacement event.
+                                continue;
+                            }
+                            Ok(Some(false)) | Ok(None) => event,
+                            Err(err) => {
+                                warn!(
+                                    "wasm VEC topic hook failed, forwarding original event: {:#}",
+                                    err
+                                );
+                                event
+                            }
+                        };
+
+                        let payload = VecTopicEvent {
+                            topic: event.topic,
+                            payload: event.payload,
+                        };
+
+                        let payload = match serde_json::to_string(&payload) {
+                            Ok(payload) => payload.into_bytes(),
+                            Err(e) => {
+                                warn!("Failed to serialize VEC topic event: {}", e);
+                                continue;
+                            }
+                        };
+
+                        let reply = build_vendor_app_reply(channel, VEC_OP_ON_TOPIC_EVENT, payload);
+
+                        if let Err(e) = tx.send(reply).await {
+                            warn!("Failed to send VEC topic event to phone: {}", e);
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(
+                            "VEC topic event bridge lagged on channel={:#04x}, skipped {} events",
+                            channel, skipped
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("VEC topic event bus closed for channel={:#04x}", channel);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            subscriptions,
+            task,
+        }
+    }
+}
+
+impl Drop for VecTopicEventBridge {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub(crate) fn ensure_vendor_topic_event_bridge(
+    ctx: &mut ModifyContext,
+    channel: u8,
+    runtime: VecTopicEventRuntime,
+) -> bool {
+    if ctx.vendor_topic_event_bridges.contains_key(&channel) {
+        return true;
+    }
+
+    let Some(tx) = ctx.hu_tx.clone() else {
+        warn!(
+            "Cannot start VEC topic event bridge for channel={:#04x}: hu_tx is missing",
+            channel
+        );
+        return false;
+    };
+
+    info!(
+        "Starting VEC topic event bridge channel={:#04x}",
+        channel
+    );
+
+    ctx.vendor_topic_event_bridges.insert(
+        channel,
+        VecTopicEventBridge::new(channel, tx, runtime),
+    );
+
+    true
 }
 
 pub(crate) fn vendor_extension_service_id(msg: &ServiceDiscoveryResponse) -> Option<u8> {
@@ -130,17 +275,104 @@ struct VecRestCallResult {
     payload: String,
 }
 
-pub(crate) async fn handle_vendor_ws_event_tx(ctx: ModifyContext, state: AppState) {
-    
+#[derive(Debug, Deserialize, Serialize)]
+struct VecTopicSubscription {
+    topic: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct VecTopicEvent {
+    topic: String,
+    payload: String,
+}
+
+fn parse_json_body<T: DeserializeOwned>(body: Vec<u8>, op_name: &str) -> std::result::Result<T, String> {
+    let body_str = String::from_utf8(body)
+        .map_err(|e| format!("{} body is not valid UTF-8: {}", op_name, e))?;
+
+    serde_json::from_str(&body_str)
+        .map_err(|e| format!("Invalid {} JSON: {}; body={}", op_name, e, body_str))
+}
+
+fn build_topic_status_reply(
+    channel: u8,
+    status: &str,
+    topic: String,
+    receiver_count: Option<usize>,
+) -> Packet {
+    let payload = serde_json::json!({
+        "ok": true,
+        "status": status,
+        "topic": topic,
+        "receiver_count": receiver_count,
+    })
+    .to_string();
+
+    build_vendor_app_reply(channel, VEC_OP_STATUS, payload.into_bytes())
+}
+
+
+#[cfg(not(feature = "wasm-scripting"))]
+async fn run_wasm_vec_topic_hooks(
+    _topic: String,
+    _payload: String,
+    _runtime: VecTopicEventRuntime,
+) -> Result<Option<bool>> {
+    Ok(None)
+}
+
+#[cfg(feature = "wasm-scripting")]
+async fn run_wasm_vec_topic_hooks(
+    topic: String,
+    payload: String,
+    runtime: VecTopicEventRuntime,
+) -> Result<Option<bool>> {
+    let Some(registry) = runtime.script_registry else {
+        return Ok(None);
+    };
+
+    let loaded: Vec<LoadedScript> = registry.list_scripts();
+    if loaded.is_empty() {
+        return Ok(None);
+    }
+
+    for script in loaded {
+        match script
+            .engine
+            .ws_script_handler(topic.clone(), payload.clone())
+            .await
+        {
+            Ok((result_payload, _effects)) => {
+                if !result_payload.is_empty() {
+                    let _ = runtime.ws_event_tx.send(ServerEvent {
+                        topic: topic.clone(),
+                        payload: result_payload,
+                    });
+
+                    return Ok(Some(true));
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "wasm VEC topic hook runtime error [{}], forwarding original event: {:#}",
+                    script.path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    Ok(Some(false))
 }
 
 pub(crate) async fn handle_vendor_channel_packet(
     pkt: &mut Packet,
     ctx: &mut ModifyContext,
+    runtime: VecTopicEventRuntime,
 ) -> Result<PacketAction> {
     let state = ctx.vendor_channel_states.get(&pkt.channel).copied();
 
-    info!(
+    debug!(
         "VEC app packet channel={:#04x} state={:?} flags={:#04x} len={} payload={:02X?}",
         pkt.channel,
         state,
@@ -209,6 +441,208 @@ pub(crate) async fn handle_vendor_channel_packet(
             *pkt = build_vendor_app_reply(pkt.channel, VEC_OP_ECHO_REPLY, body);
             Ok(PacketAction::SendBack)
         }
+        VEC_OP_SUBSCRIBE_TOPIC_EVENT => {
+            let subscription: VecTopicSubscription = match parse_json_body(body, "VEC subscribe") {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("{}", e);
+                    *pkt = build_error_reply(pkt.channel, e);
+                    return Ok(PacketAction::SendBack);
+                }
+            };
+
+            let topic = subscription.topic.trim().to_string();
+            if topic.is_empty() {
+                *pkt = build_error_reply(pkt.channel, "VEC subscribe topic is empty");
+                return Ok(PacketAction::SendBack);
+            }
+
+            if !ensure_vendor_topic_event_bridge(ctx, pkt.channel, runtime) {
+                *pkt = build_error_reply(
+                    pkt.channel,
+                    "VEC topic event bridge is not available for this channel",
+                );
+                return Ok(PacketAction::SendBack);
+            }
+
+            let Some(subscriptions) = ctx
+                .vendor_topic_event_bridges
+                .get(&pkt.channel)
+                .map(|bridge| bridge.subscriptions.clone())
+            else {
+                *pkt = build_error_reply(
+                    pkt.channel,
+                    "VEC topic event bridge was not registered for this channel",
+                );
+                return Ok(PacketAction::SendBack);
+            };
+
+            subscriptions.write().await.insert(topic.clone());
+            info!(
+                "VEC subscribed channel={:#04x} topic={}",
+                pkt.channel, topic
+            );
+
+            *pkt = build_topic_status_reply(pkt.channel, "subscribed", topic, None);
+            Ok(PacketAction::SendBack)
+        }
+        VEC_OP_UNSUBSCRIBE_TOPIC_EVENT => {
+            let subscription: VecTopicSubscription = match parse_json_body(body, "VEC unsubscribe") {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("{}", e);
+                    *pkt = build_error_reply(pkt.channel, e);
+                    return Ok(PacketAction::SendBack);
+                }
+            };
+
+            let topic = subscription.topic.trim().to_string();
+            if topic.is_empty() {
+                *pkt = build_error_reply(pkt.channel, "VEC unsubscribe topic is empty");
+                return Ok(PacketAction::SendBack);
+            }
+
+            if let Some(subscriptions) = ctx
+                .vendor_topic_event_bridges
+                .get(&pkt.channel)
+                .map(|bridge| bridge.subscriptions.clone())
+            {
+                subscriptions.write().await.remove(&topic);
+            }
+
+            info!(
+                "VEC unsubscribed channel={:#04x} topic={}",
+                pkt.channel, topic
+            );
+
+            *pkt = build_topic_status_reply(pkt.channel, "unsubscribed", topic, None);
+            Ok(PacketAction::SendBack)
+        }
+        VEC_OP_ON_SCRIPT_EVENT => {
+            let event: VecTopicEvent = match parse_json_body(body, "VEC script event") {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("{}", e);
+                    *pkt = build_error_reply(pkt.channel, e);
+                    return Ok(PacketAction::SendBack);
+                }
+            };
+
+            let topic = event.topic.trim().to_string();
+            if topic.is_empty() {
+                *pkt = build_error_reply(pkt.channel, "VEC script event topic is empty");
+                return Ok(PacketAction::SendBack);
+            }
+
+            let payload = event.payload;
+            let receiver_count = match run_wasm_vec_topic_hooks(
+                topic.clone(),
+                payload.clone(),
+                runtime.clone(),
+            )
+            .await
+            {
+                Ok(Some(true)) => {
+                    // wasm handled it and already emitted a replacement event.
+                    0
+                }
+                Ok(Some(false)) | Ok(None) => {
+                    match runtime.ws_event_tx.send(ServerEvent {
+                        topic: topic.clone(),
+                        payload,
+                    }) {
+                        Ok(receiver_count) => receiver_count,
+                        Err(e) => {
+                            debug!(
+                                "VEC script event had no active receivers channel={:#04x} topic={} error={}",
+                                pkt.channel, topic, e
+                            );
+                            0
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "wasm VEC script event hook failed, forwarding original event: {:#}",
+                        err
+                    );
+
+                    match runtime.ws_event_tx.send(ServerEvent {
+                        topic: topic.clone(),
+                        payload,
+                    }) {
+                        Ok(receiver_count) => receiver_count,
+                        Err(e) => {
+                            debug!(
+                                "VEC script event had no active receivers channel={:#04x} topic={} error={}",
+                                pkt.channel, topic, e
+                            );
+                            0
+                        }
+                    }
+                }
+            };
+
+            info!(
+                "VEC published script event channel={:#04x} topic={} receiver_count={}",
+                pkt.channel, topic, receiver_count
+            );
+
+            *pkt = build_topic_status_reply(
+                pkt.channel,
+                "published",
+                topic,
+                Some(receiver_count),
+            );
+            Ok(PacketAction::SendBack)
+        }
+        VEC_OP_REST_CALL_SYNC => {
+            let body_str = match String::from_utf8(body) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("VEC REST body is not valid UTF-8: {}", e);
+                    *pkt = build_error_reply(
+                        pkt.channel,
+                        format!("VEC REST body is not valid UTF-8: {}", e),
+                    );
+                    return Ok(PacketAction::SendBack);
+                }
+            };
+
+            let rest_call: VecRestCall = match serde_json::from_str(&body_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("Invalid VEC REST call JSON: {}; body={}", e, body_str);
+                    *pkt = build_error_reply(
+                        pkt.channel,
+                        format!("Invalid VEC REST call JSON: {}", e),
+                    );
+                    return Ok(PacketAction::SendBack);
+                }
+            };
+
+            let _ = match ctx.hu_tx.clone() {
+                Some(tx) => tx,
+                None => {
+                    *pkt = build_error_reply(
+                        pkt.channel,
+                        "VEC REST call cannot be processed because hu_tx is missing",
+                    );
+                    return Ok(PacketAction::SendBack);
+                }
+            };
+
+            let channel = pkt.channel;
+            let result_call = rest_call_blocking(rest_call.method, rest_call.path, rest_call.body, false);
+
+            *pkt = build_vendor_app_reply(
+                channel,
+                VEC_OP_REST_CALL_RESULT,
+                result_call.into_bytes(),
+            );
+
+            return Ok(PacketAction::SendBack);
+        }
         VEC_OP_REST_CALL => {
             let body_str = match String::from_utf8(body) {
                 Ok(s) => s,
@@ -251,7 +685,7 @@ pub(crate) async fn handle_vendor_channel_packet(
 
             tokio::spawn(async move {
                 let result_call = match tokio::task::spawn_blocking(move || {
-                    rest_call_blocking(rest_call.method, rest_call.path, rest_call.body)
+                    rest_call_blocking(rest_call.method, rest_call.path, rest_call.body, false)
                 })
                 .await
                 {
@@ -338,26 +772,28 @@ pub(crate) async fn handle_vendor_channel_packet(
     }
 }
 
-pub fn rest_call_blocking(method: String, path: String, body: String) -> String {
+pub fn rest_call_blocking(method: String, path: String, body: String, whitelist: bool) -> String {
     let path = path.trim();
 
-    //Whitelist calls
-    match (method.as_str(), path) {
-        ("POST", "/battery")
-        | ("POST", "/odometer")
-        | ("POST", "/tire-pressure")
-        | ("POST", "/inject_event")
-        | ("POST", "/inject_rotary")
-        | ("GET", "/speed")
-        | ("GET", "/battery-status")
-        | ("GET", "/odometer-status")
-        | ("GET", "/tire-pressure-status") => {}
+    if whitelist {
+        //Whitelist calls
+        match (method.as_str(), path) {
+            ("POST", "/battery")
+            | ("POST", "/odometer")
+            | ("POST", "/tire-pressure")
+            | ("POST", "/inject_event")
+            | ("POST", "/inject_rotary")
+            | ("GET", "/speed")
+            | ("GET", "/battery-status")
+            | ("GET", "/odometer-status")
+            | ("GET", "/tire-pressure-status") => {}
 
-        _ => {
-            return format!(
-                r#"{{"ok":false,"status":403,"error":"route not allowed from script: {} {}"}}"#,
-                method, path
-            );
+            _ => {
+                return format!(
+                    r#"{{"ok":false,"status":403,"error":"route not allowed from script: {} {}"}}"#,
+                    method, path
+                );
+            }
         }
     }
 

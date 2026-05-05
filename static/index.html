@@ -46,41 +46,128 @@
         grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
       }
 
-      .floating-save-btn {
+
+      :root {
+        --floating-actions-right: 1.25rem;
+        --floating-actions-top: 6.25rem;
+        --floating-actions-closed-width: 3.6rem;
+        --floating-actions-open-width: 17rem;
+        --floating-actions-height: 3.6rem;
+        --floating-actions-gap: 0.5rem;
+        --floating-actions-safe-area: calc(
+          var(--floating-actions-right) +
+          var(--floating-actions-closed-width) +
+          1.25rem
+        );
+      }
+
+      /* Desktop mode: hide normal ACTIONS blocks, use floating dock */
+      .actions-panel {
+        display: none;
+      }
+
+      .floating-actions {
         position: fixed;
-        top: 1rem;
-        right: 1rem;
+        top: var(--floating-actions-top);
+        right: var(--floating-actions-right);
         z-index: 9999;
 
-        width: 3.25rem;
-        height: 3.25rem;
-        min-width: 3.25rem;
-        padding: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: var(--floating-actions-gap);
+      }
+
+      .floating-action {
+        width: var(--floating-actions-closed-width);
+        height: var(--floating-actions-height);
+        min-width: var(--floating-actions-closed-width);
+        padding: 0 0.85rem;
         margin: 0;
 
-        border-radius: 50%;
         display: flex;
+        flex-direction: row;
         align-items: center;
-        justify-content: center;
+        justify-content: flex-end;
+        gap: 0.75rem;
 
-        font-size: 1.35rem;
+        overflow: hidden;
+        white-space: nowrap;
+
+        border-radius: 0.95rem;
+        box-shadow: 0 0.35rem 0.9rem rgba(0, 0, 0, 0.35);
+
+        transition:
+          width 160ms ease,
+          box-shadow 160ms ease,
+          transform 160ms ease;
+      }
+
+      .floating-action:hover,
+      .floating-action:focus-visible {
+        width: var(--floating-actions-open-width);
+        transform: translateX(-0.125rem);
+        box-shadow: 0 0.5rem 1.15rem rgba(0, 0, 0, 0.45);
+      }
+
+      .floating-action-label {
+        flex: 1;
+        min-width: 0;
+        opacity: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-align: center;
+
+        transition:
+          opacity 120ms ease,
+          transform 160ms ease;
+
+        transform: translateX(0.5rem);
+      }
+
+      .floating-action:hover .floating-action-label,
+      .floating-action:focus-visible .floating-action-label {
+        opacity: 1;
+        transform: translateX(0);
+      }
+
+      .floating-action-icon {
+        flex: 0 0 1.5rem;
+        width: 1.5rem;
+        text-align: center;
+        font-size: 1.15rem;
         line-height: 1;
-
-        box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.35);
       }
 
-      .floating-save-btn:hover {
-        transform: scale(1.05);
-      }
+      /*
+        Keep equal left/right safe areas. The right side reserves enough room
+        for the closed floating icon rail, so icons never sit on top of config text.
+      */
+      /*main.container {
+        padding-left: var(--floating-actions-safe-area);
+        padding-right: var(--floating-actions-safe-area);
+      }*/
 
-      @media (max-width: 576px) {
-        .floating-save-btn {
-          top: 0.75rem;
-          right: 0.75rem;
-          width: 2.75rem;
-          height: 2.75rem;
-          min-width: 2.75rem;
-          font-size: 1.15rem;
+      /*
+        Fallback:
+        - narrow screens
+        - short screens
+        - touch devices where hover is not reliable
+
+        In these cases, hide the floating menu and show the old ACTIONS blocks.
+      */
+      @media (max-width: 900px), (max-height: 560px), (hover: none), (pointer: coarse) {
+        .floating-actions {
+          display: none;
+        }
+
+        .actions-panel {
+          display: block;
+        }
+
+        main.container {
+          padding-left: var(--pico-spacing);
+          padding-right: var(--pico-spacing);
         }
       }
     </style>
@@ -93,18 +180,96 @@
       <small>build: {BUILD_DATE}, git: {GIT_INFO}</small>
     </header>
 
-    <button
-      type="button"
-      class="floating-save-btn"
-      onclick="saveConfig()"
-      title="Save configuration"
-      aria-label="Save configuration"
-    >
-      💾
-    </button>
+    <nav class="floating-actions" aria-label="Quick actions">
+      <button
+        type="button"
+        class="floating-action"
+        onclick="saveConfig()"
+        title="Save"
+        aria-label="Save"
+      >
+        <span class="floating-action-label">Save</span>
+        <span class="floating-action-icon">💾</span>
+      </button>
+
+      <button
+        type="button"
+        class="floating-action download-btn"
+        title="Download log package"
+        aria-label="Download log package"
+      >
+        <span class="floating-action-label">Download log package (.tar.gz)</span>
+        <span class="floating-action-icon">📜</span>
+      </button>
+
+      <button
+        type="button"
+        class="floating-action"
+        onclick="handleAction('/restart')"
+        title="Apply / restart"
+        aria-label="Apply / restart"
+      >
+        <span class="floating-action-label">Apply / restart</span>
+        <span class="floating-action-icon">🧬</span>
+      </button>
+
+      <button
+        type="button"
+        class="floating-action"
+        onclick="handleAction('/reboot')"
+        title="Reboot device"
+        aria-label="Reboot device"
+      >
+        <span class="floating-action-label">Reboot device</span>
+        <span class="floating-action-icon">🔁</span>
+      </button>
+
+      <button
+        type="button"
+        class="floating-action"
+        data-endpoint="/upload-certs"
+        title="Upload MITM certs"
+        aria-label="Upload MITM certs"
+      >
+        <span class="floating-action-label">Upload MITM certs (.tar.gz)</span>
+        <span class="floating-action-icon">📤</span>
+      </button>
+
+      <button
+        type="button"
+        class="floating-action backup-btn"
+        title="Backup configuration"
+        aria-label="Backup configuration"
+      >
+        <span class="floating-action-label">Backup configuration (.tar.gz)</span>
+        <span class="floating-action-icon">📦</span>
+      </button>
+
+      <button
+        type="button"
+        class="floating-action"
+        onclick="handleAction('/factory-reset', 'Are you sure you want to factory reset?')"
+        title="Factory reset"
+        aria-label="Factory reset"
+      >
+        <span class="floating-action-label">Factory reset</span>
+        <span class="floating-action-icon">♻️</span>
+      </button>
+
+      <button
+        type="button"
+        class="floating-action"
+        data-endpoint="/userdata-restore"
+        title="Restore configuration"
+        aria-label="Restore configuration"
+      >
+        <span class="floating-action-label">Restore configuration (.tar.gz)</span>
+        <span class="floating-action-icon">📤</span>
+      </button>
+    </nav>
 
     <template id="actions-template">
-      <fieldset>
+      <fieldset class="actions-panel">
         <legend class="section-title"><strong>🚀 ACTIONS</strong></legend>
         <div class="grid grid-cols-2 section-body">
           <button type="button" onclick="saveConfig()">💾 Save</button>
@@ -194,7 +359,8 @@
               fileInput.removeEventListener("change", handler); // detach to avoid double upload
             };
 
-            fileInput.addEventListener("change", handler);
+            fileInput.value = "";
+            fileInput.addEventListener("change", handler, { once: true });
             fileInput.click();
           });
         });

@@ -10,10 +10,11 @@ use crate::script_wasm::{
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
 use crate::vendor_ext::{
-    add_vendor_extension_service, ensure_vendor_channel_open, handle_vendor_channel_packet,
-    handle_vendor_ws_event_tx,
-    has_vendor_extension_service, is_vendor_channel, is_vendor_service_id, mark_vendor_channel_open,
-    VecChannelState, OUR_VEC_PACKAGE, OUR_VEC_SERVICE_NAME,
+    add_vendor_extension_service, ensure_vendor_channel_open, ensure_vendor_topic_event_bridge,
+    handle_vendor_channel_packet, has_vendor_extension_service, is_vendor_channel,
+    is_vendor_service_id, mark_vendor_channel_open, VecChannelState, VecTopicEventBridge,
+    VecTopicEventRuntime,
+    OUR_VEC_PACKAGE, OUR_VEC_SERVICE_NAME,
 };
 use crate::web::ServerEvent;
 use anyhow::Context;
@@ -117,6 +118,9 @@ pub struct ModifyContext {
     pub(crate) vendor_service_ids: HashSet<u8>,
     /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
     pub(crate) vendor_channel_states: HashMap<u8, VecChannelState>,
+    /// Per-VEC-channel topic event bridge state. Each VEC channel has its own
+    /// local subscription set, just like each websocket connection does.
+    pub(crate) vendor_topic_event_bridges: HashMap<u8, VecTopicEventBridge>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -433,7 +437,7 @@ pub async fn pkt_modify_hook(
     last_speed: Arc<RwLock<Option<i32>>>,
     cfg: &AppConfig,
     config: &mut SharedConfig,
-    script_registry: Option<&ScriptRegistry>,
+    script_registry: Option<Arc<ScriptRegistry>>,
     ws_event_tx: BroadcastSender<ServerEvent>,
 ) -> Result<PacketAction> {
     // if for some reason we have too small packet, bail out
@@ -441,7 +445,7 @@ pub async fn pkt_modify_hook(
         return Ok(PacketAction::Forward);
     }
 
-    if let Some(handled) = run_wasm_hooks(proxy_type, pkt, ctx, cfg, script_registry).await? {
+    if let Some(handled) = run_wasm_hooks(proxy_type, pkt, ctx, cfg, script_registry.as_deref()).await? {
         match handled {
             true => return Ok(PacketAction::SendBack),
             false => {}
@@ -857,8 +861,11 @@ pub async fn pkt_modify_hook(
                     );
 
                     mark_vendor_channel_open(ctx, pkt.channel);
-
-                    handle_vendor_ws_event_tx(ctx, state);
+                    let vec_event_runtime = VecTopicEventRuntime {
+                        ws_event_tx: ws_event_tx.clone(),
+                        script_registry: script_registry.clone(),
+                    };
+                    ensure_vendor_topic_event_bridge(ctx, pkt.channel, vec_event_runtime);
 
                     info!(
                         "{} accepted injected VEC open channel={:#04x} service_id={}; custom app messages will be handled locally",
@@ -873,7 +880,7 @@ pub async fn pkt_modify_hook(
         }
 
         if is_vendor_channel(ctx, pkt.channel) {
-            info!(
+            debug!(
                 "{} intercepted VEC app-data packet channel=<b>{:#04x}</> len={} proxy_type={:?} state={:?}",
                 get_name(proxy_type),
                 pkt.channel,
@@ -882,7 +889,11 @@ pub async fn pkt_modify_hook(
                 ctx.vendor_channel_states.get(&pkt.channel),
             );
 
-            return handle_vendor_channel_packet(pkt, ctx).await;
+            let vec_event_runtime = VecTopicEventRuntime {
+                ws_event_tx: ws_event_tx.clone(),
+                script_registry: script_registry.clone(),
+            };
+            return handle_vendor_channel_packet(pkt, ctx, vec_event_runtime).await;
         }
 
         return Ok(PacketAction::Forward);
@@ -944,6 +955,11 @@ pub async fn pkt_modify_hook(
                 *pkt = build_control_reply(MESSAGE_CHANNEL_OPEN_RESPONSE, payload);
 
                 ensure_vendor_channel_open(ctx, service_id);
+                let vec_event_runtime = VecTopicEventRuntime {
+                    ws_event_tx: ws_event_tx.clone(),
+                    script_registry: script_registry.clone(),
+                };
+                ensure_vendor_topic_event_bridge(ctx, service_id, vec_event_runtime);
 
                 info!(
                     "{} <yellow>{:?}</>: accepted channel-0 open for injected VEC service_id=<b>{:#04x}</>; replying locally",
@@ -2142,6 +2158,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         media_fragments: HashMap::new(),
         vendor_service_ids: HashSet::new(),
         vendor_channel_states: HashMap::new(),
+        vendor_topic_event_bridges: HashMap::new(),
     };
     loop {
         tokio::select! {
@@ -2158,7 +2175,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 last_speed.clone(),
                 &cfg,
                 &mut config,
-                script_registry.as_deref(),
+                script_registry.clone(),
                 ws_event_tx.clone()
             )
             .await?;
@@ -2179,7 +2196,6 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 PacketAction::SendBack => {
                     trace_packet(proxy_type, "decision/sendback/rx", &pkt, &ctx);
                     tx.send(pkt).await?;
-                    info!("{} SEND_BACK queued successfully", get_name(proxy_type));
                 }
                 PacketAction::Forward => {
                     trace_packet(proxy_type, "decision/forward/rx", &pkt, &ctx);
@@ -2213,7 +2229,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         last_speed.clone(),
                         &cfg,
                         &mut config,
-                        script_registry.as_deref(),
+                        script_registry.clone(),
                         ws_event_tx.clone(),
                     )
                     .await?;
@@ -2267,6 +2283,7 @@ mod tests {
             media_fragments: HashMap::new(),
             vendor_service_ids: HashSet::new(),
             vendor_channel_states: HashMap::new(),
+            vendor_topic_event_bridges: HashMap::new(),
         }
     }
 

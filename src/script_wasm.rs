@@ -179,7 +179,7 @@ impl host::Host for ScriptState {
     }
 
     fn rest_call(&mut self, method: String, path: String, body: String) -> String {
-        rest_call_blocking(method, path, body)
+        rest_call_blocking(method, path, body, true)
     }
 
     fn rest_call_async(&mut self, method: String, path: String, body: String) -> String {
@@ -189,7 +189,7 @@ impl host::Host for ScriptState {
         let request_id_for_task = request_id.clone();
 
         std::thread::spawn(move || {
-            let result_payload = rest_call_blocking(method.clone(), path.clone(), body);
+            let result_payload = rest_call_blocking(method.clone(), path.clone(), body, true);
 
             let payload = serde_json::json!({
                 "requestId": request_id_for_task,
