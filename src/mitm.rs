@@ -2000,7 +2000,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
     ws_event_tx: BroadcastSender<ServerEvent>,
 ) -> Result<()> {
     let cfg = config.read().await.clone();
-    let passthrough = !cfg.mitm;
+    let passthrough = !cfg.mitm || cfg.runtime_mitm_failed;
     let hex_requested = cfg.hexdump_level;
 
     // in full_frames/passthrough mode we only directly pass packets from one endpoint to the other
@@ -2032,7 +2032,13 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         }
     }
 
-    let ssl = ssl_builder(proxy_type).await?;
+    let ssl = match ssl_builder(proxy_type).await {
+        Ok(s) => s,
+        Err(e) => {
+            config.write().await.runtime_mitm_failed = true;
+            return Err(e);
+        }
+    };
 
     let mut mem_buf = SslMemBuf {
         client_stream: Arc::new(Mutex::new(VecDeque::new())),
@@ -2068,7 +2074,10 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
             let pkt = rxr.recv().await.ok_or("reader channel hung up")?;
             let _ = pkt_debug(proxy_type, HexdumpLevel::RawInput, hex_requested, &pkt).await;
             pkt.ssl_decapsulate_write(&mut mem_buf).await?;
-            ssl_check_failure(server.accept())?;
+            if let Err(e) = ssl_check_failure(server.accept()) {
+                config.write().await.runtime_mitm_failed = true;
+                return Err(e);
+            }
             info!(
                 "{} 🔒 stage #{} of {}: SSL handshake: {}",
                 get_name(proxy_type),
@@ -2112,7 +2121,10 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         // doing SSL handshake
         const STEPS: u8 = 3;
         for i in 1..=STEPS {
-            ssl_check_failure(server.do_handshake())?;
+            if let Err(e) = ssl_check_failure(server.do_handshake()) {
+                config.write().await.runtime_mitm_failed = true;
+                return Err(e);
+            }
             info!(
                 "{} 🔒 stage #{} of {}: SSL handshake: {}",
                 get_name(proxy_type),

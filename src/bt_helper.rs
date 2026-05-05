@@ -112,7 +112,7 @@ pub async fn bt_devices_handler() -> impl IntoResponse {
 }
 
 pub async fn bt_paired_devices_handler() -> impl IntoResponse {
-    match run_bluetoothctl(&["paired-devices"]).await {
+    match run_bluetoothctl(&["devices Paired"]).await {
         Ok(result) => {
             let devices = if result.ok {
                 parse_bluetoothctl_devices(&result.stdout, true)

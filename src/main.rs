@@ -215,6 +215,7 @@ async fn tokio_main(
     led_support: bool,
     button_support: bool,
     profile_connected: Arc<AtomicBool>,
+    usb_connected: Arc<AtomicBool>,
     ws_event_tx: broadcast::Sender<ServerEvent>,
     script_registry: Option<Arc<ScriptRegistry>>,
 ) -> Result<()> {
@@ -266,13 +267,7 @@ async fn tokio_main(
         }
     }
 
-    let wifi_conf = {
-        if !cfg.wired.is_some() {
-            Some(init_wifi_config(&cfg))
-        } else {
-            None
-        }
-    };
+    let wifi_conf = Some(init_wifi_config(&cfg));
     let mut usb = None;
     if !cfg.dhu {
         if cfg.legacy {
@@ -340,7 +335,7 @@ async fn tokio_main(
         }
 
         // run only if not handling this in handshake task
-        if cfg.wired.is_none()
+        if !usb_connected.load(Ordering::Relaxed)
             && (!(cfg.quick_reconnect && profile_connected.load(Ordering::Relaxed))
                 || cfg.action_requested == Some(Action::Stop))
         {
@@ -609,6 +604,8 @@ fn main() -> Result<()> {
     let last_speed: Arc<RwLock<Option<i32>>> = Arc::new(RwLock::new(None));
     let last_speed_cloned = last_speed.clone();
     let last_tire_pressure_data = Arc::new(RwLock::new(None));
+    let usb_connected = Arc::new(AtomicBool::new(false));
+    let usb_connected_cloned = usb_connected.clone();
     let (ws_event_tx, _ws_event_rx) = broadcast::channel(256);
     let ws_event_tx_cloned = ws_event_tx.clone();
 
@@ -645,6 +642,7 @@ fn main() -> Result<()> {
             led_support,
             button_support,
             profile_connected_cloned,
+            usb_connected_cloned,
             ws_event_tx_cloned,
             script_registry_cloned,
         )
@@ -661,6 +659,7 @@ fn main() -> Result<()> {
         input_channel,
         last_battery_data,
         last_speed,
+        usb_connected,
         script_registry.clone(),
         ws_event_tx.clone(),
     ));
