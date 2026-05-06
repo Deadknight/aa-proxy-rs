@@ -474,11 +474,29 @@ pub async fn pkt_modify_hook(
                 SENSOR_MESSAGE_REQUEST => {
                     if let Ok(mut msg) = SensorRequest::parse_from_bytes(data) {
                         if msg.type_() == SensorType::SENSOR_VEHICLE_ENERGY_MODEL_DATA {
-                            // check if we have some battery logger configured
-                            if cfg.ev_battery_logger.is_some() {
+                            let has_sensor_fuel = ctx
+                                .sensors
+                                .as_ref()
+                                .map(|sensors| {
+                                    sensors
+                                        .iter()
+                                        .any(|sensor| sensor.sensor_type() == SENSOR_FUEL)
+                                })
+                                .unwrap_or(false);
+
+                            info!(
+                                "{} EV: AA requested SENSOR_VEHICLE_ENERGY_MODEL_DATA; ev_battery_logger={} has_sensor_fuel={}",
+                                get_name(proxy_type),
+                                cfg.ev_battery_logger.is_some(),
+                                has_sensor_fuel
+                            );
+
+                            // check if we have some battery logger configured and the car doesn't
+                            // provide SENSOR_FUEL
+                            if cfg.ev_battery_logger.is_some() || !has_sensor_fuel {
                                 debug!(
-                                  "additional SENSOR_MESSAGE_REQUEST for {:?}, making a response with success...",
-                                  msg.type_()
+                                    "additional SENSOR_MESSAGE_REQUEST for {:?}, making a response with success...",
+                                    msg.type_()
                                 );
                                 let mut response = SensorResponse::new();
                                 response.set_status(MessageStatus::STATUS_SUCCESS);
@@ -491,7 +509,7 @@ pub async fn pkt_modify_hook(
                                     channel: ch,
                                     flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
                                     final_length: None,
-                                    payload: payload,
+                                    payload,
                                 };
                                 *pkt = reply;
 
