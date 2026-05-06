@@ -4,6 +4,7 @@ use crate::config::AppConfig;
 use crate::config::ConfigJson;
 use crate::config::SharedConfig;
 use crate::config::SharedConfigJson;
+use crate::config::BASE_CONFIG_DIR;
 use crate::device_info;
 use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
@@ -65,7 +66,6 @@ const TEMPLATE: &str = include_str!("../static/index.html");
 const PICO_CSS: &str = include_str!("../static/pico.min.css");
 const AA_PROXY_RS_URL: &str = "https://github.com/aa-proxy/aa-proxy-rs";
 const BUILDROOT_URL: &str = "https://github.com/aa-proxy/buildroot";
-pub const CERT_DEST_DIR: &str = concat!(crate::base_config_dir!(), "/");
 const CERT_SHA_FILENAME: &str = "cert-bundle.sha";
 
 // module name for logging engine
@@ -784,7 +784,7 @@ pub async fn upload_cert_bundle_handler(
 
     // Copy valid .pem files to destination
     for (src_path, filename) in valid_files {
-        let dest_path = Path::new(CERT_DEST_DIR).join(filename);
+        let dest_path = Path::new(BASE_CONFIG_DIR).join(filename);
         match fs::copy(&src_path, &dest_path).await {
             Ok(_) => {}
             Err(err) => {
@@ -797,7 +797,7 @@ pub async fn upload_cert_bundle_handler(
     }
 
     // finally: save the hash of the new bundle to sha file
-    let hash_path = Path::new(CERT_DEST_DIR).join(CERT_SHA_FILENAME);
+    let hash_path = Path::new(BASE_CONFIG_DIR).join(CERT_SHA_FILENAME);
     if let Err(err) = fs::write(&hash_path, &hash_hex).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -807,12 +807,12 @@ pub async fn upload_cert_bundle_handler(
 
     (
         StatusCode::OK,
-        format!("Certificates uploaded to {}", CERT_DEST_DIR),
+        format!("Certificates uploaded to {}", BASE_CONFIG_DIR),
     )
 }
 
 async fn certs_info_handler(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    let hash_path = Path::new(CERT_DEST_DIR).join(CERT_SHA_FILENAME);
+    let hash_path = Path::new(BASE_CONFIG_DIR).join(CERT_SHA_FILENAME);
 
     let sha = match fs::read_to_string(hash_path).await {
         Ok(content) => content.trim().to_string(),

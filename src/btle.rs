@@ -1,7 +1,8 @@
 use crate::bluetooth::BTLE_PROFILE_UUID;
+use crate::config::BASE_CONFIG_DIR;
 use crate::config::{Action, AppConfig};
 use crate::ev::{send_ev_data, BatteryData, EV_MODEL_FILE};
-use crate::web::{AppState, CERT_DEST_DIR};
+use crate::web::AppState;
 use bluer::gatt::local::{
     Application, Characteristic, CharacteristicNotify, CharacteristicNotifyMethod,
     CharacteristicWrite, CharacteristicWriteMethod, Service,
@@ -638,7 +639,7 @@ async fn craft_response(req: &Request, state: AppState) -> Response {
 
             // Copy valid .pem files to destination
             for (src_path, filename) in valid_files {
-                let dest_path = Path::new(CERT_DEST_DIR).join(filename);
+                let dest_path = Path::new(BASE_CONFIG_DIR).join(filename);
                 match fs::copy(&src_path, &dest_path).await {
                     Ok(_) => {}
                     Err(_) => {
