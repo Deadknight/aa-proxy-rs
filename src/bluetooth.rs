@@ -42,6 +42,7 @@ pub const AAWG_PROFILE_UUID: Uuid = Uuid::from_u128(0x4de17a0052cb11e6bdf4080020
 pub const BTLE_PROFILE_UUID: Uuid = Uuid::from_u128(0x9b3f6c10a4d2418ea2b90700300de8f4);
 const HSP_HS_UUID: Uuid = Uuid::from_u128(0x0000110800001000800000805f9b34fb);
 const HSP_AG_UUID: Uuid = Uuid::from_u128(0x0000111200001000800000805f9b34fb);
+pub const KNOWN_DEVICES_FILE: &str = concat!(crate::base_config_dir!(), "/known_devices");
 
 #[derive(Debug, Clone, PartialEq)]
 #[repr(u16)]
@@ -131,6 +132,74 @@ pub async fn get_cpu_serial_number_suffix() -> Result<String> {
         serial = trimmed[trimmed.len() - 6..].to_string();
     }
     Ok(serial)
+}
+
+/// Load previously successful AA device addresses from persistent file.
+pub fn load_known_devices() -> Vec<Address> {
+    let path = std::path::Path::new(KNOWN_DEVICES_FILE);
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let addrs: Vec<Address> = contents
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            match trimmed.parse::<Address>() {
+                Ok(addr) if addr != Address::any() => Some(addr),
+                _ => {
+                    warn!("{} known_devices: skipping invalid line: {}", NAME, trimmed);
+                    None
+                }
+            }
+        })
+        .collect();
+    if !addrs.is_empty() {
+        info!(
+            "{} 📋 Loaded {} known device(s) from {}",
+            NAME,
+            addrs.len(),
+            KNOWN_DEVICES_FILE
+        );
+    }
+    addrs
+}
+
+/// Append a device address to the known-good devices file (if not already present).
+fn save_known_device(addr: Address) {
+    if addr == Address::any() {
+        return;
+    }
+    // Read existing entries to avoid duplicates
+    let existing = load_known_devices();
+    if existing.contains(&addr) {
+        debug!("{} known_devices: {} already recorded", NAME, addr);
+        return;
+    }
+    let addr_str = format!("{}\n", addr);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(KNOWN_DEVICES_FILE)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            if let Err(e) = file.write_all(addr_str.as_bytes()) {
+                warn!("{} known_devices: failed to write {}: {}", NAME, addr, e);
+            } else {
+                info!("{} 💾 Saved {} to known devices", NAME, addr);
+            }
+        }
+        Err(e) => {
+            warn!(
+                "{} known_devices: failed to open file for writing: {}",
+                NAME, e
+            );
+        }
+    }
 }
 
 async fn send_message(
@@ -336,8 +405,14 @@ impl Bluetooth {
                     .iter()
                     .any(|addr| *addr == Address::any())
                 {
-                    info!("{} 🥏 Enumerating known bluetooth devices...", NAME);
-                    adapter_cloned.device_addresses().await?
+                    // Only use known-good devices, no fallback to all paired devices
+                    let known = load_known_devices();
+                    if !known.is_empty() {
+                        info!("{} 🥏 Using {} known-good device(s)...", NAME, known.len());
+                    } else {
+                        info!("{} 🥏 No known-good devices, passively waiting for incoming connection...", NAME);
+                    }
+                    known
                 } else {
                     addresses_to_connect
                 };
@@ -591,11 +666,19 @@ impl Bluetooth {
             }
         }
 
+        // Check if we're using wildcard connect before moving ownership
+        let is_wildcard_connect = connect.is_wildcard();
+
         // Use the provided session and adapter instead of creating new ones
         let (address, mut stream) = self
             .get_aa_profile_connection(connect, bt_timeout, stopped)
             .await?;
         Self::send_params(wifi_config.clone(), &mut stream).await?;
+
+        // Record this device as a known-good AA device (only when using wildcard connect)
+        if is_wildcard_connect {
+            save_known_device(address);
+        }
         tcp_start.notify_one();
 
         if quick_reconnect {

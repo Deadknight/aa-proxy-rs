@@ -1,3 +1,4 @@
+use crate::bluetooth::{load_known_devices, KNOWN_DEVICES_FILE};
 use crate::bt_helper;
 use crate::config::Action;
 use crate::config::AppConfig;
@@ -166,6 +167,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route(
             "/bt/devices/:id",
             delete(bt_helper::bt_remove_device_handler),
+        )
+        .route(
+            "/bt/known-devices",
+            get(bt_known_devices_handler).delete(bt_forget_known_devices_handler),
         )
         .with_state(state)
 }
@@ -966,6 +971,38 @@ pub async fn factory_reset_handler(State(state): State<Arc<AppState>>) -> impl I
         StatusCode::OK,
         "Factory reset requested. Device will now reboot.".to_string(),
     )
+}
+
+async fn bt_known_devices_handler() -> impl IntoResponse {
+    let devices: Vec<String> = load_known_devices()
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect();
+    Json(devices).into_response()
+}
+
+async fn bt_forget_known_devices_handler() -> impl IntoResponse {
+    let path = std::path::Path::new(KNOWN_DEVICES_FILE);
+    if !path.exists() {
+        info!(
+            "{} 🗑️ Known devices file already empty or does not exist",
+            NAME
+        );
+        return (
+            StatusCode::OK,
+            "No known devices file to remove".to_string(),
+        );
+    }
+    match fs::remove_file(path).await {
+        Ok(_) => {
+            info!("{} 🗑️ Known devices file deleted", NAME);
+            (StatusCode::OK, "Known devices cleared".to_string())
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete known devices file: {}", e),
+        ),
+    }
 }
 
 async fn speed_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

@@ -11,6 +11,14 @@ use std::{fmt, str::FromStr};
 pub struct BluetoothAddressList(pub Option<Vec<Address>>);
 
 impl BluetoothAddressList {
+    /// Returns true if the list is the default wildcard (00:00:00:00:00:00),
+    /// meaning "connect to any paired device".
+    pub fn is_wildcard(&self) -> bool {
+        self.0.as_ref().map_or(false, |addrs| {
+            addrs.iter().any(|addr| *addr == Address::any())
+        })
+    }
+
     fn to_string_internal(&self) -> String {
         match &self.0 {
             Some(addresses) => addresses

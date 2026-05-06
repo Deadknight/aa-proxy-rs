@@ -302,6 +302,12 @@
           <button type="button" data-endpoint="/userdata-restore">
             📤 Restore configuration (.tar.gz)
           </button>
+          <button
+            type="button"
+            onclick="handleAction('/bt/known-devices', 'Are you sure you want to forget known Bluetooth devices?', 'DELETE')"
+          >
+            🗑️ Forget known BT devices
+          </button>
         </div>
       </fieldset>
     </template>
@@ -445,13 +451,17 @@
         }
       }
 
-      async function handleAction(endpoint, confirmMessage = null) {
+      async function handleAction(
+        endpoint,
+        confirmMessage = null,
+        method = "POST",
+      ) {
         try {
           if (confirmMessage && !confirm(confirmMessage)) {
             return; // User canceled
           }
 
-          const response = await fetch(endpoint, { method: "POST" });
+          const response = await fetch(endpoint, { method: method });
 
           if (!response.ok) {
             throw new Error(`Status: ${response.status}`);
