@@ -163,6 +163,10 @@
           "typ": "integer",
           "description": "Override the `max_unacked` setting for audio channels. This may improve audio performance on some head units, but may worsen it on others. Adjust this value experimentally only if you experience audio stuttering.\n0 = leave unchanged."
         },
+        "add_vendor_channel": {
+          "typ": "boolean",
+          "description": "Add vendor channel for android companion app"
+        },
         "remove_tap_restriction": {
           "typ": "boolean",
           "description": "Remove tap restrictions. This affects situations where tapping too frequently while driving triggers a temporary lockout warning. Might not work, depending on phone and Android version."
@@ -211,7 +215,7 @@
           "typ": "boolean",
           "description": "Enable to disable driving restrictions."
         },
-	"hu_button_handler": {
+        "hu_button_handler": {
           "typ": "string",
           "description": "Path to a script or executable invoked on HU media-key long press.\nTwo arguments are always appended by aa-proxy-rs:\n  1. keycode (u32) — Android key code of the long-pressed key\n  2. elapsed_ms — how long the key was held, in milliseconds\nAdditional arguments embedded in the path are supported (shell-word splitting).\nWhen empty or absent, HU media-key interception is fully disabled.\nRequires `mitm = true`."
         },
