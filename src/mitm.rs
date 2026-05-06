@@ -9,6 +9,12 @@ use crate::script_wasm::{
 };
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
+use crate::vendor_ext::{
+    add_vendor_extension_service, ensure_vendor_channel_open, ensure_vendor_topic_event_bridge,
+    handle_vendor_channel_packet, has_vendor_extension_service, is_vendor_channel,
+    is_vendor_service_id, mark_vendor_channel_open, VecChannelState, VecTopicEventBridge,
+    VecTopicEventRuntime, OUR_VEC_PACKAGE, OUR_VEC_SERVICE_NAME,
+};
 use crate::web::ServerEvent;
 use anyhow::Context;
 use log::log_enabled;
@@ -16,6 +22,7 @@ use openssl::ssl::{ErrorCode, Ssl, SslContextBuilder, SslFiletype, SslMethod};
 use serde::{Deserialize, Serialize};
 use simplelog::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Read, Write};
@@ -96,8 +103,8 @@ pub struct ModifyContext {
     pub(crate) nav_channel: Option<u8>,
     pub(crate) audio_channels: Vec<u8>,
     ev_tx: Sender<EvTaskCommand>,
-    input_channel: Option<u8>,
-    hu_tx: Option<Sender<Packet>>,
+    pub(crate) input_channel: Option<u8>,
+    pub(crate) hu_tx: Option<Sender<Packet>>,
     hu_input_state: HuInputState,
     /// Offset→sink map (keys 0-6). Used only at SDR time to look up which sink
     /// to assign to each real channel. Never used for tapping.
@@ -107,6 +114,13 @@ pub struct ModifyContext {
     /// Per-channel reassembly state for tapped media messages that span multiple
     /// AA transport frames.
     media_fragments: HashMap<u8, MediaFrameBuffer>,
+    /// VEC service ids injected by aa-proxy-rs into the service discovery response.
+    pub(crate) vendor_service_ids: HashSet<u8>,
+    /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
+    pub(crate) vendor_channel_states: HashMap<u8, VecChannelState>,
+    /// Per-VEC-channel topic event bridge state. Each VEC channel has its own
+    /// local subscription set, just like each websocket connection does.
+    pub(crate) vendor_topic_event_bridges: HashMap<u8, VecTopicEventBridge>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -423,7 +437,7 @@ pub async fn pkt_modify_hook(
     last_speed: Arc<RwLock<Option<i32>>>,
     cfg: &AppConfig,
     config: &mut SharedConfig,
-    script_registry: Option<&ScriptRegistry>,
+    script_registry: Option<Arc<ScriptRegistry>>,
     ws_event_tx: BroadcastSender<ServerEvent>,
 ) -> Result<PacketAction> {
     // if for some reason we have too small packet, bail out
@@ -431,7 +445,9 @@ pub async fn pkt_modify_hook(
         return Ok(PacketAction::Forward);
     }
 
-    if let Some(handled) = run_wasm_hooks(proxy_type, pkt, ctx, cfg, script_registry).await? {
+    if let Some(handled) =
+        run_wasm_hooks(proxy_type, pkt, ctx, cfg, script_registry.as_deref()).await?
+    {
         match handled {
             true => return Ok(PacketAction::SendBack),
             false => {}
@@ -795,6 +811,85 @@ pub async fn pkt_modify_hook(
     }
 
     if pkt.channel != 0 {
+        // Non-zero channel AAP lifecycle/control frame.
+        // Keep this separate from our custom vendor app-data parser.
+        // The custom parser below does not inspect CONTROL flags or AAP control message ids.
+        if pkt.payload.len() >= 2 && (pkt.flags & _CONTROL) == _CONTROL {
+            let control_msg_id = u16::from_be_bytes([pkt.payload[0], pkt.payload[1]]);
+
+            if control_msg_id == MESSAGE_CHANNEL_OPEN_REQUEST as u16 {
+                let req = match ChannelOpenRequest::parse_from_bytes(&pkt.payload[2..]) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        error!(
+                            "{} failed to parse non-zero CHANNEL_OPEN_REQUEST on channel {:#04x}: {}",
+                            get_name(proxy_type),
+                            pkt.channel,
+                            e
+                        );
+                        return Ok(PacketAction::Forward);
+                    }
+                };
+
+                let service_id = req.service_id() as u8;
+                let is_our_vendor_service = is_vendor_service_id(ctx, service_id);
+
+                debug!(
+                    "{} non-zero CHANNEL_OPEN_REQUEST channel={:#04x} priority={} service_id={} vendor_match={}",
+                    get_name(proxy_type),
+                    pkt.channel,
+                    req.priority(),
+                    service_id,
+                    is_our_vendor_service,
+                );
+
+                if is_our_vendor_service {
+                    let mut resp = ChannelOpenResponse::new();
+                    resp.set_status(MessageStatus::STATUS_SUCCESS);
+
+                    let payload = resp.write_to_bytes()?;
+                    *pkt = build_control_reply_on_channel(
+                        pkt.channel,
+                        MESSAGE_CHANNEL_OPEN_RESPONSE,
+                        payload,
+                    );
+
+                    mark_vendor_channel_open(ctx, pkt.channel);
+                    let vec_event_runtime = VecTopicEventRuntime {
+                        ws_event_tx: ws_event_tx.clone(),
+                        script_registry: script_registry.clone(),
+                    };
+                    ensure_vendor_topic_event_bridge(ctx, pkt.channel, vec_event_runtime);
+
+                    info!(
+                        "{} accepted injected VEC open channel={:#04x} service_id={}; custom app messages will be handled locally",
+                        get_name(proxy_type),
+                        pkt.channel,
+                        service_id,
+                    );
+
+                    return Ok(PacketAction::SendBack);
+                }
+            }
+        }
+
+        if is_vendor_channel(ctx, pkt.channel) {
+            debug!(
+                "{} intercepted VEC app-data packet channel=<b>{:#04x}</> len={} proxy_type={:?} state={:?}",
+                get_name(proxy_type),
+                pkt.channel,
+                pkt.payload.len(),
+                proxy_type,
+                ctx.vendor_channel_states.get(&pkt.channel),
+            );
+
+            let vec_event_runtime = VecTopicEventRuntime {
+                ws_event_tx: ws_event_tx.clone(),
+                script_registry: script_registry.clone(),
+            };
+            return handle_vendor_channel_packet(pkt, ctx, vec_event_runtime).await;
+        }
+
         return Ok(PacketAction::Forward);
     }
     // trying to obtain an Enum from message_id
@@ -817,6 +912,57 @@ pub async fn pkt_modify_hook(
                         config.write().await.action_requested = Some(Stop);
                     }
                 }
+            }
+        }
+        MESSAGE_CHANNEL_OPEN_REQUEST => {
+            let msg = match ChannelOpenRequest::parse_from_bytes(data) {
+                Err(e) => {
+                    error!(
+                        "{} error parsing ChannelOpenRequest: {}, ignored!",
+                        get_name(proxy_type),
+                        e
+                    );
+                    return Ok(PacketAction::Forward);
+                }
+                Ok(msg) => msg,
+            };
+
+            let service_id = msg.service_id() as u8;
+
+            info!(
+                "{} <yellow>{:?}</>: received CHANNEL_OPEN_REQUEST for service_id=<b>{:#04x}</> vendor_match={}",
+                get_name(proxy_type),
+                control.unwrap(),
+                service_id,
+                is_vendor_service_id(ctx, service_id),
+            );
+
+            // If the phone sends the synthetic vendor open as a normal channel-0
+            // CHANNEL_OPEN_REQUEST, catch it in the proxy context that owns
+            // vendor_service_ids. In current DHU traces the phone uses channel 0x08,
+            // but real phones/HUs may use channel 0 for this control message.
+            if is_vendor_service_id(ctx, service_id) {
+                let mut response = ChannelOpenResponse::new();
+                response.set_status(MessageStatus::STATUS_SUCCESS);
+
+                let payload: Vec<u8> = response.write_to_bytes()?;
+                *pkt = build_control_reply(MESSAGE_CHANNEL_OPEN_RESPONSE, payload);
+
+                ensure_vendor_channel_open(ctx, service_id);
+                let vec_event_runtime = VecTopicEventRuntime {
+                    ws_event_tx: ws_event_tx.clone(),
+                    script_registry: script_registry.clone(),
+                };
+                ensure_vendor_topic_event_bridge(ctx, service_id, vec_event_runtime);
+
+                info!(
+                    "{} <yellow>{:?}</>: accepted channel-0 open for injected VEC service_id=<b>{:#04x}</>; replying locally",
+                    get_name(proxy_type),
+                    control.unwrap(),
+                    service_id,
+                );
+
+                return Ok(PacketAction::SendBack);
             }
         }
         MESSAGE_SERVICE_DISCOVERY_RESPONSE => {
@@ -1228,6 +1374,42 @@ pub async fn pkt_modify_hook(
                 }
             }
 
+            // add vendor channel as extra, do not touch existing HU channels
+            // this must be last entry do not replace
+            if cfg.add_vendor_channel {
+                let already_present = has_vendor_extension_service(&msg);
+
+                info!(
+                    "{} SDR_TRACE add_vendor_channel requested; already_present={} current_ids={:?}",
+                    get_name(proxy_type),
+                    already_present,
+                    msg.services.iter().map(|svc| svc.id()).collect::<Vec<_>>()
+                );
+
+                if let Some(service_id) = add_vendor_extension_service(&mut msg, ctx) {
+                    info!(
+                        "{} <yellow>{:?}</>: added extra <blue>vendor_extension_service</> id=<b>{:#04x}</> name=<b>{}</> package=<b>{}</>",
+                        get_name(proxy_type),
+                        control.unwrap(),
+                        service_id,
+                        OUR_VEC_SERVICE_NAME,
+                        OUR_VEC_PACKAGE,
+                    );
+                }
+            }
+
+            info!(
+                "{} vendor_service_ids now = {:?}",
+                get_name(proxy_type),
+                ctx.vendor_service_ids
+            );
+
+            info!(
+                "{} final SDR service ids: {:?}",
+                get_name(proxy_type),
+                msg.services.iter().map(|s| s.id()).collect::<Vec<_>>()
+            );
+
             debug!(
                 "{} SDR after changes: {}",
                 get_name(proxy_type),
@@ -1620,6 +1802,39 @@ fn ssl_check_failure<T>(res: std::result::Result<T, openssl::ssl::Error>) -> Res
     }
 }
 
+fn build_control_reply(message_id: ControlMessageType, payload: Vec<u8>) -> Packet {
+    let mut payload = payload;
+    payload.insert(0, ((message_id as u16) >> 8) as u8);
+    payload.insert(1, ((message_id as u16) & 0xff) as u8);
+
+    Packet {
+        channel: 0,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    }
+}
+
+fn build_control_reply_on_channel(
+    channel: u8,
+    message_id: ControlMessageType,
+    payload: Vec<u8>,
+) -> Packet {
+    let mut payload = payload;
+    payload.insert(0, ((message_id as u16) >> 8) as u8);
+    payload.insert(1, ((message_id as u16) & 0xff) as u8);
+
+    Packet {
+        channel,
+        // Non-zero service-channel control frames observed from real HU/DHU use 0x0f:
+        // ENCRYPTED | CONTROL | FIRST | LAST. Without CONTROL (0x04), Android may
+        // not treat our synthetic CHANNEL_OPEN_RESPONSE as a channel-control frame.
+        flags: ENCRYPTED | _CONTROL | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    }
+}
+
 /// main thread doing all packet processing of an endpoint/device
 pub async fn proxy<A: Endpoint<A> + 'static>(
     proxy_type: ProxyType,
@@ -1808,6 +2023,9 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         media_sinks,
         media_channels: HashMap::new(),
         media_fragments: HashMap::new(),
+        vendor_service_ids: HashSet::new(),
+        vendor_channel_states: HashMap::new(),
+        vendor_topic_event_bridges: HashMap::new(),
     };
     loop {
         tokio::select! {
@@ -1824,7 +2042,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 last_speed.clone(),
                 &cfg,
                 &mut config,
-                script_registry.as_deref(),
+                script_registry.clone(),
                 ws_event_tx.clone()
             )
             .await?;
@@ -1878,7 +2096,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         last_speed.clone(),
                         &cfg,
                         &mut config,
-                        script_registry.as_deref(),
+                        script_registry.clone(),
                         ws_event_tx.clone(),
                     )
                     .await?;
@@ -1922,6 +2140,9 @@ mod tests {
             media_sinks: HashMap::new(),
             media_channels: HashMap::new(),
             media_fragments: HashMap::new(),
+            vendor_service_ids: HashSet::new(),
+            vendor_channel_states: HashMap::new(),
+            vendor_topic_event_bridges: HashMap::new(),
         }
     }
 
