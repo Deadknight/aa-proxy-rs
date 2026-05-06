@@ -530,7 +530,6 @@ pub async fn pkt_modify_hook(
                                 };
                                 *pkt = reply;
 
-                                // return true => send own reply without processing
                                 return Ok(PacketAction::SendBack);
                             } else {
                                 // MD requests the energy model sensor from the HU. Since we do not
@@ -2060,9 +2059,9 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 }
                 PacketAction::SendBack => {
                     debug!(
-                    "{} pkt_modify_hook: message has been handled, sending reply packet only...",
-                    get_name(proxy_type)
-                );
+                        "{} pkt_modify_hook: message has been handled, sending reply packet only...",
+                        get_name(proxy_type)
+                    );
                     tx.send(pkt).await?;
                 }
                 PacketAction::Forward => {
