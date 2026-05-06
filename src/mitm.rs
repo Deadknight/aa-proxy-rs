@@ -91,7 +91,7 @@ const _CONTROL: u8 = 1 << 2;
 pub const ENCRYPTED: u8 = 1 << 3;
 
 // location for hu_/md_ private keys and certificates:
-const KEYS_PATH: &str = "/etc/aa-proxy-rs";
+const KEYS_PATH: &str = crate::base_config_dir!();
 
 // DHU string consts for developer mode
 pub const DHU_MAKE: &str = "Google";

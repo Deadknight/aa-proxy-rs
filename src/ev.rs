@@ -21,7 +21,7 @@ use protobuf::Message;
 use serde::{Deserialize, Serialize};
 
 pub static FORD_EV_MODEL: &[u8] = include_bytes!("protos/ford_ev_model.bin");
-pub const EV_MODEL_FILE: &str = "/etc/aa-proxy-rs/ev_model.bin";
+pub const EV_MODEL_FILE: &str = concat!(crate::base_config_dir!(), "/ev_model.bin");
 
 // module name for logging engine
 const NAME: &str = "<i><bright-black> ev: </>";

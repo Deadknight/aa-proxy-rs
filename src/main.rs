@@ -77,7 +77,7 @@ struct Args {
         short,
         long,
         value_parser,
-        default_value = "/etc/aa-proxy-rs/config.toml"
+        default_value = concat!(aa_proxy_rs::base_config_dir!(), "/config.toml")
     )]
     config: PathBuf,
 
