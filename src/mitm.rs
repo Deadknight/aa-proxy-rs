@@ -92,6 +92,7 @@ pub const DHU_MODEL: &str = "Desktop Head Unit";
 
 pub struct ModifyContext {
     pub(crate) sensor_channel: Option<u8>,
+    pub(crate) sensors: Option<Vec<Sensor>>,
     pub(crate) nav_channel: Option<u8>,
     pub(crate) audio_channels: Vec<u8>,
     ev_tx: Sender<EvTaskCommand>,
@@ -830,6 +831,14 @@ pub async fn pkt_modify_hook(
                 }
                 Ok(msg) => msg,
             };
+
+            if let Some(svc) = msg
+                .services
+                .iter()
+                .find(|svc| !svc.sensor_source_service.sensors.is_empty())
+            {
+                ctx.sensors = Some(svc.sensor_source_service.sensors.clone());
+            }
 
             // Populate media_channels (channel_id→sink) from the offset→sink map.
             // Must run in MobileDevice context where the sinks are held —
@@ -1789,6 +1798,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
     // main data processing/transfer loop
     let mut ctx = ModifyContext {
         sensor_channel: None,
+        sensors: None,
         input_channel: None,
         nav_channel: None,
         audio_channels: vec![],
@@ -1902,6 +1912,7 @@ mod tests {
         let (ev_tx, _) = mpsc::channel(1);
         ModifyContext {
             sensor_channel: None,
+            sensors: None,
             nav_channel: None,
             audio_channels: vec![],
             ev_tx,
