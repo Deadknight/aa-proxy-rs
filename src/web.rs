@@ -93,7 +93,7 @@ pub struct UpdateConfigEntry {
     pub value: serde_json::Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServerEvent {
     pub topic: String,
     pub payload: String,
@@ -159,6 +159,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/speed", get(speed_handler))
         .route("/version", get(version_handler))
         .route("/ws", get(ws_handler))
+        .route("/raw-topic-data", post(raw_topic_data_handler))
         .route("/bt/devices", get(bt_helper::bt_devices_handler))
         .route(
             "/bt/devices/paired",
@@ -1195,6 +1196,17 @@ async fn set_config(
         cfg.save((&state.config_file).to_path_buf());
     }
     Json(new_cfg)
+}
+
+pub async fn raw_topic_data_handler(
+    State(state): State<Arc<AppState>>,
+    Json(data): Json<ServerEvent>,
+) -> impl IntoResponse {
+    info!("{} Received raw event data: {:?}", NAME, data);
+
+    let _ = state.ws_event_tx.send(data);
+
+    (StatusCode::OK, "OK").into_response()
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
