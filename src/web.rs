@@ -41,7 +41,7 @@ use glob::glob;
 use hyper::body::to_bytes;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use simplelog::*;
 use std::collections::HashMap;
@@ -295,9 +295,19 @@ pub fn render_config_ids(config: &ConfigJson) -> String {
     format!("{}", all_keys.join(", "))
 }
 
+async fn merged_config_json(state: &Arc<AppState>) -> ConfigJson {
+    let mut cfg = state.config_json.read().await.clone();
+
+    #[cfg(feature = "wasm-scripting")]
+    if let Some(registry) = &state.script_registry {
+        registry.append_custom_config_sections(&mut cfg).await;
+    }
+
+    cfg
+}
+
 async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let config_json_guard = state.config_json.read().await;
-    let config_json = &*config_json_guard;
+    let config_json = merged_config_json(&state).await;
 
     let html = TEMPLATE
         .replace("{BUILD_DATE}", env!("BUILD_DATE"))
@@ -306,8 +316,8 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             &linkify_git_info(env!("GIT_DATE"), env!("GIT_HASH")),
         )
         .replace("{PICO_CSS}", PICO_CSS)
-        .replace("{CONFIG_VALUES}", &render_config_values(config_json))
-        .replace("{CONFIG_IDS}", &render_config_ids(config_json));
+        .replace("{CONFIG_VALUES}", &render_config_values(&config_json))
+        .replace("{CONFIG_IDS}", &render_config_ids(&config_json));
     Html(html)
 }
 
@@ -1025,11 +1035,18 @@ pub async fn version_handler() -> impl IntoResponse {
 
 async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cfg = state.config.read().await.clone();
-    Json(cfg)
+    let mut cfg_json: Value = serde_json::to_value(cfg).unwrap_or_else(|_| json!({}));
+
+    #[cfg(feature = "wasm-scripting")]
+    if let Some(registry) = &state.script_registry {
+        registry.append_custom_config_values(&mut cfg_json).await;
+    }
+
+    Json(cfg_json)
 }
 
 async fn get_config_data(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cfg = state.config_json.read().await.clone();
+    let cfg = merged_config_json(&state).await;
     Json(cfg)
 }
 
@@ -1086,6 +1103,54 @@ async fn update_config_entry(
     State(state): State<Arc<AppState>>,
     Json(entry): Json<UpdateConfigEntry>,
 ) -> impl IntoResponse {
+    #[cfg(feature = "wasm-scripting")]
+    if entry
+        .key
+        .starts_with(crate::wasm_config::WASM_CONFIG_KEY_PREFIX)
+    {
+        let Some(registry) = state.script_registry.clone() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": "error",
+                    "key": entry.key,
+                    "message": "WASM scripting is not initialized"
+                })),
+            )
+                .into_response();
+        };
+
+        return match registry
+            .update_custom_config_entry(&entry.key, entry.value.clone())
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    "{} WASM config entry updated: {} = {}",
+                    NAME, entry.key, entry.value
+                );
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "success",
+                        "key": entry.key,
+                        "value": entry.value
+                    })),
+                )
+                    .into_response()
+            }
+            Err(err) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": "error",
+                    "key": entry.key,
+                    "message": format!("{}", err)
+                })),
+            )
+                .into_response(),
+        };
+    }
+
     let mut cfg = state.config.write().await;
 
     let config_path = state.config_file.to_path_buf();
@@ -1186,16 +1251,91 @@ async fn update_config_entry(
     }
 }
 
+#[cfg(feature = "wasm-scripting")]
+async fn apply_wasm_config_values_from_root(
+    state: &Arc<AppState>,
+    root: &mut Value,
+) -> std::result::Result<(), String> {
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(());
+    };
+
+    let wasm_keys: Vec<String> = obj
+        .keys()
+        .filter(|key| key.starts_with(crate::wasm_config::WASM_CONFIG_KEY_PREFIX))
+        .cloned()
+        .collect();
+
+    if wasm_keys.is_empty() {
+        return Ok(());
+    }
+
+    let Some(registry) = state.script_registry.clone() else {
+        return Err("WASM scripting is not initialized".to_string());
+    };
+
+    for key in wasm_keys {
+        let Some(value) = obj.remove(&key) else {
+            continue;
+        };
+
+        registry
+            .update_custom_config_entry(&key, value.clone())
+            .await
+            .map_err(|err| format!("failed to update {key}: {err}"))?;
+
+        info!("{} WASM config entry updated: {} = {}", NAME, key, value);
+    }
+
+    Ok(())
+}
+
 async fn set_config(
     State(state): State<Arc<AppState>>,
-    Json(new_cfg): Json<AppConfig>,
+    Json(mut raw_cfg): Json<Value>,
 ) -> impl IntoResponse {
+    #[cfg(feature = "wasm-scripting")]
+    if let Err(err) = apply_wasm_config_values_from_root(&state, &mut raw_cfg).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "message": err
+            })),
+        )
+            .into_response();
+    }
+
+    let new_cfg: AppConfig = match serde_json::from_value(raw_cfg) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("Invalid config payload: {}", err)
+                })),
+            )
+                .into_response();
+        }
+    };
+
     {
         let mut cfg = state.config.write().await;
         *cfg = new_cfg.clone();
         cfg.save((&state.config_file).to_path_buf());
     }
-    Json(new_cfg)
+
+    let mut response_json = serde_json::to_value(new_cfg).unwrap_or_else(|_| json!({}));
+
+    #[cfg(feature = "wasm-scripting")]
+    if let Some(registry) = &state.script_registry {
+        registry
+            .append_custom_config_values(&mut response_json)
+            .await;
+    }
+
+    Json(response_json).into_response()
 }
 
 pub async fn raw_topic_data_handler(

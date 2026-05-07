@@ -18,4 +18,6 @@ pub mod script_wasm;
 pub mod usb_gadget;
 pub mod usb_stream;
 pub mod vendor_ext;
+#[cfg(feature = "wasm-scripting")]
+pub mod wasm_config;
 pub mod web;

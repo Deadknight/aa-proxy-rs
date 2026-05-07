@@ -1,7 +1,16 @@
+use crate::config::{AppConfig, ConfigJson, ConfigValue, ConfigValues};
+use crate::mitm::ModifyContext;
+use crate::mitm::Packet;
 use crate::vendor_ext::rest_call_blocking;
+use crate::wasm_config::{
+    json_value_to_string, parse_config_value, parse_wasm_config_key, script_id_from_path,
+    wasm_config_key, WasmConfigStore,
+};
 use crate::web::ServerEvent;
 use anyhow::{Context, Result};
+use indexmap::IndexMap;
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
+use serde_json::Value;
 use simplelog::*;
 use std::collections::HashMap;
 use std::fs;
@@ -11,12 +20,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::{broadcast::Sender as BroadcastSender, mpsc, Mutex};
-use wasmtime::component::{Component, HasSelf, Linker};
+use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
-
-use crate::config::AppConfig;
-use crate::mitm::ModifyContext;
-use crate::mitm::Packet;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 pub mod bindings {
     wasmtime::component::bindgen!({
@@ -27,7 +33,8 @@ pub mod bindings {
 
 use self::bindings::aa::packet::host;
 use self::bindings::aa::packet::types::{
-    ConfigView, Decision, ModifyContext as WasmModifyContext, Packet as WasmPacket, ProxyType,
+    ConfigView, CustomConfigSection, Decision, ModifyContext as WasmModifyContext,
+    Packet as WasmPacket, ProxyType,
 };
 use self::bindings::PacketHook;
 
@@ -37,8 +44,9 @@ pub fn start_wasm_engine(
     script_parameters: ScriptParameters,
 ) -> Result<Arc<ScriptRegistry>> {
     let script_registry = Arc::new(ScriptRegistry::new(script_parameters));
+
     let old_scripts = script_registry.reload_dir(&hook_dir);
-    destroy_loaded_scripts(old_scripts).await;
+    runtime.block_on(destroy_loaded_scripts(old_scripts));
 
     let errs: Vec<(std::path::PathBuf, String)> = script_registry.list_errors();
     for (path, err) in errs {
@@ -121,24 +129,17 @@ impl ScriptEffects {
         }
     }
 }
+
 pub struct ScriptState {
     pub effects: ScriptEffects,
     pub limits: StoreLimits,
+    pub script_id: String,
+    pub wasi_ctx: WasiCtx,
+    pub resource_table: ResourceTable,
 }
 
 impl ScriptState {
-    fn reset_effects(&mut self) {
-        self.effects = ScriptEffects::new(self.effects.script_parameters.clone());
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ScriptParameters {
-    pub ws_event_tx: BroadcastSender<ServerEvent>,
-}
-
-impl ScriptState {
-    fn new(script_parameters: ScriptParameters) -> Self {
+    fn new(script_parameters: ScriptParameters, script_id: String) -> Self {
         let limits = StoreLimitsBuilder::new()
             .memory_size(5 * 1024 * 1024)
             .instances(16)
@@ -150,6 +151,28 @@ impl ScriptState {
         Self {
             effects: ScriptEffects::new(script_parameters),
             limits,
+            script_id,
+            wasi_ctx: WasiCtxBuilder::new().build(),
+            resource_table: ResourceTable::new(),
+        }
+    }
+
+    fn reset_effects(&mut self) {
+        self.effects = ScriptEffects::new(self.effects.script_parameters.clone());
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ScriptParameters {
+    pub ws_event_tx: BroadcastSender<ServerEvent>,
+    pub wasm_config_store: Arc<WasmConfigStore>,
+}
+
+impl WasiView for ScriptState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.resource_table,
         }
     }
 }
@@ -219,6 +242,13 @@ impl host::Host for ScriptState {
     fn rest_result_topic(&mut self) -> String {
         SCRIPT_REST_RESULT_TOPIC.to_string()
     }
+
+    fn get_config(&mut self, name: String) -> Option<String> {
+        self.effects
+            .script_parameters
+            .wasm_config_store
+            .get_raw(&self.script_id, &name)
+    }
 }
 
 struct LiveScript {
@@ -231,6 +261,7 @@ pub struct WasmScriptEngine {
     component: Component,
     linker: Linker<ScriptState>,
     pub path: PathBuf,
+    script_id: String,
     script_parameters: ScriptParameters,
     live: Mutex<Option<LiveScript>>,
     closed: AtomicBool,
@@ -248,7 +279,7 @@ impl WasmScriptEngine {
         if live.is_none() {
             let mut store = Store::new(
                 &self.engine,
-                ScriptState::new(self.script_parameters.clone()),
+                ScriptState::new(self.script_parameters.clone(), self.script_id.clone()),
             );
 
             store.limiter(|state| &mut state.limits);
@@ -278,11 +309,13 @@ impl WasmScriptEngine {
 
         let engine = Engine::new(&cfg)?;
         let path = component_path.as_ref().to_path_buf();
+        let script_id = script_id_from_path(&path);
 
         let component = Component::from_file(&engine, &path)
             .with_context(|| format!("[wasm] loading wasm component {}", path.display()))?;
 
         let mut linker = Linker::<ScriptState>::new(&engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
         bindings::aa::packet::host::add_to_linker::<ScriptState, HasSelf<ScriptState>>(
             &mut linker,
             |s| s,
@@ -293,10 +326,62 @@ impl WasmScriptEngine {
             component,
             linker,
             path,
+            script_id,
             script_parameters,
             live: Mutex::new(None),
             closed: AtomicBool::new(false),
         })
+    }
+
+    pub fn script_id(&self) -> &str {
+        &self.script_id
+    }
+
+    pub async fn custom_configs(&self) -> Result<Vec<CustomConfigSection>> {
+        let mut live_guard = self.live.lock().await;
+        let live = self.ensure_live(&mut live_guard).await?;
+
+        live.store.data_mut().reset_effects();
+        live.store.set_epoch_deadline(1000);
+
+        let sections = live
+            .bindings
+            .call_custom_configs(&mut live.store)
+            .with_context(|| format!("[wasm] running custom-configs {}", self.path.display()))?;
+
+        for section in &sections {
+            for entry in &section.values {
+                let default_value = parse_config_value(&entry.typ, &entry.default_value);
+                if let Err(err) = self.script_parameters.wasm_config_store.ensure_default(
+                    &self.script_id,
+                    &entry.name,
+                    default_value,
+                ) {
+                    log::warn!(
+                        "[wasm] failed to persist default config {}.{}: {err:#}",
+                        self.script_id,
+                        entry.name
+                    );
+                }
+            }
+        }
+
+        Ok(sections)
+    }
+
+    pub async fn on_config_changed(&self, name: String, value: Value) -> Result<()> {
+        let mut live_guard = self.live.lock().await;
+        let live = self.ensure_live(&mut live_guard).await?;
+
+        live.store.data_mut().reset_effects();
+        live.store.set_epoch_deadline(1000);
+
+        let value = json_value_to_string(&value);
+        live.bindings
+            .call_on_config_changed(&mut live.store, &name, &value)
+            .with_context(|| format!("[wasm] running on-config-changed {}", self.path.display()))?;
+
+        Ok(())
     }
 
     pub async fn modify_packet(
@@ -493,6 +578,99 @@ impl ScriptRegistry {
         for script in self.list_scripts() {
             script.engine.tick_epoch();
         }
+    }
+
+    pub async fn append_custom_config_sections(&self, config_json: &mut ConfigJson) {
+        for script in self.list_scripts() {
+            let script_id = script.engine.script_id().to_string();
+            let sections = match script.engine.custom_configs().await {
+                Ok(sections) => sections,
+                Err(err) => {
+                    log::warn!(
+                        "[wasm] custom-configs failed [{}]: {err:#}",
+                        script.path.display()
+                    );
+                    continue;
+                }
+            };
+
+            for section in sections {
+                let mut values = IndexMap::new();
+
+                for entry in section.values {
+                    values.insert(
+                        wasm_config_key(&script_id, &entry.name),
+                        ConfigValue {
+                            typ: entry.typ,
+                            description: entry.description,
+                            values: entry.values,
+                        },
+                    );
+                }
+
+                if !values.is_empty() {
+                    config_json.titles.push(ConfigValues {
+                        title: format!("WASM: {}", section.title),
+                        values,
+                    });
+                }
+            }
+        }
+    }
+
+    pub async fn append_custom_config_values(&self, root: &mut Value) {
+        let Some(obj) = root.as_object_mut() else {
+            return;
+        };
+
+        for script in self.list_scripts() {
+            let script_id = script.engine.script_id().to_string();
+            let sections = match script.engine.custom_configs().await {
+                Ok(sections) => sections,
+                Err(err) => {
+                    log::warn!(
+                        "[wasm] custom-configs failed [{}]: {err:#}",
+                        script.path.display()
+                    );
+                    continue;
+                }
+            };
+
+            for section in sections {
+                for entry in section.values {
+                    let full_key = wasm_config_key(&script_id, &entry.name);
+                    let value = script
+                        .engine
+                        .script_parameters
+                        .wasm_config_store
+                        .get_json(&script_id, &entry.name)
+                        .unwrap_or_else(|| parse_config_value(&entry.typ, &entry.default_value));
+
+                    obj.insert(full_key, value);
+                }
+            }
+        }
+    }
+
+    pub async fn update_custom_config_entry(&self, full_key: &str, value: Value) -> Result<()> {
+        let (script_id, name) = parse_wasm_config_key(full_key)
+            .with_context(|| format!("invalid wasm config key: {full_key}"))?;
+        let script_id = script_id.to_string();
+        let name = name.to_string();
+
+        let script = self
+            .list_scripts()
+            .into_iter()
+            .find(|script| script.engine.script_id() == script_id.as_str())
+            .with_context(|| format!("unknown wasm script config namespace: {script_id}"))?;
+
+        script.engine.script_parameters.wasm_config_store.set_json(
+            &script_id,
+            &name,
+            value.clone(),
+        )?;
+
+        script.engine.on_config_changed(name, value).await
     }
 }
 
