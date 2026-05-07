@@ -6,11 +6,11 @@ use simplelog::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Runtime;
-use tokio::sync::broadcast::Sender as BroadcastSender;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast::Sender as BroadcastSender, mpsc, Mutex};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
@@ -37,7 +37,8 @@ pub fn start_wasm_engine(
     script_parameters: ScriptParameters,
 ) -> Result<Arc<ScriptRegistry>> {
     let script_registry = Arc::new(ScriptRegistry::new(script_parameters));
-    script_registry.reload_dir(&hook_dir);
+    let old_scripts = script_registry.reload_dir(&hook_dir);
+    destroy_loaded_scripts(old_scripts).await;
 
     let errs: Vec<(std::path::PathBuf, String)> = script_registry.list_errors();
     for (path, err) in errs {
@@ -69,7 +70,8 @@ pub fn start_wasm_engine(
             match res {
                 Ok(event) => match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        script_registry_for_watch.reload_dir(&hook_dir);
+                        let old_scripts = script_registry_for_watch.reload_dir(&hook_dir);
+                        destroy_loaded_scripts(old_scripts).await;
 
                         let errs: Vec<(std::path::PathBuf, String)> =
                             script_registry_for_watch.list_errors();
@@ -122,6 +124,12 @@ impl ScriptEffects {
 pub struct ScriptState {
     pub effects: ScriptEffects,
     pub limits: StoreLimits,
+}
+
+impl ScriptState {
+    fn reset_effects(&mut self) {
+        self.effects = ScriptEffects::new(self.effects.script_parameters.clone());
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -213,15 +221,52 @@ impl host::Host for ScriptState {
     }
 }
 
+struct LiveScript {
+    store: Store<ScriptState>,
+    bindings: PacketHook,
+}
+
 pub struct WasmScriptEngine {
     engine: Engine,
     component: Component,
     linker: Linker<ScriptState>,
     pub path: PathBuf,
     script_parameters: ScriptParameters,
+    live: Mutex<Option<LiveScript>>,
+    closed: AtomicBool,
 }
 
 impl WasmScriptEngine {
+    async fn ensure_live<'a>(
+        &'a self,
+        live: &'a mut Option<LiveScript>,
+    ) -> Result<&'a mut LiveScript> {
+        if self.closed.load(Ordering::Acquire) {
+            anyhow::bail!("[wasm] script is destroyed: {}", self.path.display());
+        }
+
+        if live.is_none() {
+            let mut store = Store::new(
+                &self.engine,
+                ScriptState::new(self.script_parameters.clone()),
+            );
+
+            store.limiter(|state| &mut state.limits);
+            store.set_epoch_deadline(1000);
+
+            let bindings =
+                PacketHook::instantiate_async(&mut store, &self.component, &self.linker).await?;
+
+            bindings
+                .call_on_create(&mut store)
+                .with_context(|| format!("[wasm] running on-create {}", self.path.display()))?;
+
+            *live = Some(LiveScript { store, bindings });
+        }
+
+        Ok(live.as_mut().unwrap())
+    }
+
     pub fn load(
         component_path: impl AsRef<Path>,
         script_parameters: ScriptParameters,
@@ -249,6 +294,8 @@ impl WasmScriptEngine {
             linker,
             path,
             script_parameters,
+            live: Mutex::new(None),
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -258,21 +305,18 @@ impl WasmScriptEngine {
         pkt: WasmPacket,
         cfg: ConfigView,
     ) -> Result<(Decision, ScriptEffects)> {
-        let mut store = Store::new(
-            &self.engine,
-            ScriptState::new(self.script_parameters.clone()),
-        );
-        store.limiter(|state| &mut state.limits);
-        store.set_epoch_deadline(100);
+        let mut live_guard = self.live.lock().await;
+        let live = self.ensure_live(&mut live_guard).await?;
 
-        let bindings =
-            PacketHook::instantiate_async(&mut store, &self.component, &self.linker).await?;
+        live.store.data_mut().reset_effects();
+        live.store.set_epoch_deadline(100);
 
-        let decision = bindings
-            .call_modify_packet(&mut store, &ctx, &pkt, cfg)
+        let decision = live
+            .bindings
+            .call_modify_packet(&mut live.store, &ctx, &pkt, cfg)
             .with_context(|| format!("[wasm] running wasm script {}", self.path.display()))?;
 
-        Ok((decision, store.data().effects.clone()))
+        Ok((decision, live.store.data().effects.clone()))
     }
 
     pub async fn ws_script_handler(
@@ -280,25 +324,52 @@ impl WasmScriptEngine {
         topic: String,
         payload: String,
     ) -> Result<(String, ScriptEffects)> {
-        let mut store = Store::new(
-            &self.engine,
-            ScriptState::new(self.script_parameters.clone()),
-        );
-        store.limiter(|state: &mut ScriptState| &mut state.limits);
-        store.set_epoch_deadline(1000);
+        let mut live_guard = self.live.lock().await;
+        let live = self.ensure_live(&mut live_guard).await?;
 
-        let bindings =
-            PacketHook::instantiate_async(&mut store, &self.component, &self.linker).await?;
+        live.store.data_mut().reset_effects();
+        live.store.set_epoch_deadline(1000);
 
-        let payload = bindings
-            .call_ws_script_handler(&mut store, &topic, &payload)
+        let payload = live
+            .bindings
+            .call_ws_script_handler(&mut live.store, &topic, &payload)
             .with_context(|| format!("[wasm] running wasm script {}", self.path.display()))?;
 
-        Ok((payload, store.data().effects.clone()))
+        Ok((payload, live.store.data().effects.clone()))
+    }
+
+    pub async fn destroy(&self) -> Result<()> {
+        self.closed.store(true, Ordering::Release);
+
+        let mut live_guard = self.live.lock().await;
+
+        if let Some(mut live) = live_guard.take() {
+            live.store.data_mut().reset_effects();
+            live.store.set_epoch_deadline(1000);
+
+            live.bindings
+                .call_on_destroy(&mut live.store)
+                .with_context(|| format!("[wasm] running on-destroy {}", self.path.display()))?;
+        }
+
+        Ok(())
     }
 
     pub fn tick_epoch(&self) {
         self.engine.increment_epoch();
+    }
+}
+
+async fn destroy_loaded_scripts(scripts: Vec<LoadedScript>) {
+    for script in scripts {
+        if let Err(err) = script.engine.destroy().await {
+            error!(
+                "[wasm] script destroy error [{}]: {err:#}",
+                script.path.display()
+            );
+        } else {
+            info!("[wasm] destroyed wasm script: {}", script.path.display());
+        }
     }
 }
 
@@ -336,7 +407,16 @@ impl ScriptRegistry {
         }
     }
 
-    pub fn reload_dir(&self, dir: impl AsRef<Path>) {
+    pub async fn destroy_all(&self) {
+        let old_scripts = {
+            let mut g = self.inner.write().unwrap();
+            std::mem::take(&mut g.scripts)
+        };
+
+        destroy_loaded_scripts(old_scripts).await;
+    }
+
+    pub fn reload_dir(&self, dir: impl AsRef<Path>) -> Vec<LoadedScript> {
         let script_parameters = {
             let g = self.inner.read().unwrap();
             g.script_parameters.clone()
@@ -350,10 +430,12 @@ impl ScriptRegistry {
             Ok(v) => v,
             Err(e) => {
                 errors.insert(dir.to_path_buf(), format!("[wasm] read_dir failed: {e}"));
+
                 let mut g = self.inner.write().unwrap();
-                g.scripts.clear();
+                let old_scripts = std::mem::take(&mut g.scripts);
                 g.errors = errors;
-                return;
+
+                return old_scripts;
             }
         };
 
@@ -387,8 +469,10 @@ impl ScriptRegistry {
         scripts.sort_by(|a, b| a.path.cmp(&b.path));
 
         let mut g = self.inner.write().unwrap();
-        g.scripts = scripts;
+        let old_scripts = std::mem::replace(&mut g.scripts, scripts);
         g.errors = errors;
+
+        old_scripts
     }
 
     pub fn list_scripts(&self) -> Vec<LoadedScript> {
