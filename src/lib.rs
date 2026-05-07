@@ -15,6 +15,8 @@ pub mod mitm;
 pub mod mpegts;
 #[cfg(feature = "wasm-scripting")]
 pub mod script_wasm;
+#[cfg(feature = "wasm-scripting")]
+pub mod wasm_config;
 pub mod usb_gadget;
 pub mod usb_stream;
 pub mod vendor_ext;

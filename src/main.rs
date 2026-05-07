@@ -16,6 +16,8 @@ use aa_proxy_rs::mitm::TirePressureData;
 use aa_proxy_rs::script_wasm::start_wasm_engine;
 #[cfg(feature = "wasm-scripting")]
 use aa_proxy_rs::script_wasm::{ScriptParameters, ScriptRegistry};
+#[cfg(feature = "wasm-scripting")]
+use aa_proxy_rs::wasm_config::WasmConfigStore;
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
 use aa_proxy_rs::usb_gadget::uevent_listener;
@@ -616,8 +618,12 @@ fn main() -> Result<()> {
     let profile_connected_cloned = profile_connected.clone();
 
     #[cfg(feature = "wasm-scripting")]
+    let wasm_config_store = Arc::new(WasmConfigStore::load_default());
+
+    #[cfg(feature = "wasm-scripting")]
     let script_parameters = ScriptParameters {
         ws_event_tx: ws_event_tx.clone(),
+        wasm_config_store,
     };
     #[cfg(feature = "wasm-scripting")]
     let script_registry =
