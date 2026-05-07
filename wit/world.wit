@@ -53,6 +53,9 @@ world packet-hook {
   use types.{modify-context, packet, config-view, decision};
 
   import host;
+  export on-create: func();
+  export on-destroy: func();
+
   export modify-packet: func(ctx: modify-context, pkt: packet, cfg: config-view) -> decision;
   export ws-script-handler: func(topic: string, payload: string) -> string;
 }
