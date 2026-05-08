@@ -170,6 +170,21 @@ pub struct AppConfig {
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub hu_button_handler: Option<String>,
 
+    /// Maximum linear memory size, in MiB, allowed for each live WASM script instance.
+    pub wasm_script_memory_limit_mb: u32,
+    /// Maximum number of component/core instances allowed inside each WASM script store.
+    pub wasm_script_instance_limit: u32,
+    /// Maximum number of memories allowed inside each WASM script store.
+    pub wasm_script_memory_count_limit: u32,
+    /// Maximum number of tables allowed inside each WASM script store.
+    pub wasm_script_table_limit: u32,
+    /// Maximum number of table elements allowed inside each WASM script store.
+    pub wasm_script_table_elements_limit: u32,
+    /// Epoch deadline used for modify-packet calls. Epochs are incremented every 10 ms.
+    pub wasm_script_packet_epoch_deadline: u64,
+    /// Epoch deadline used for lifecycle/config/websocket calls. Epochs are incremented every 10 ms.
+    pub wasm_script_lifecycle_epoch_deadline: u64,
+
     #[serde(skip)]
     pub action_requested: Option<Action>,
 
@@ -331,8 +346,86 @@ impl Default for AppConfig {
             collect_speed: false,
             disable_driving_status: false,
             hu_button_handler: None,
+            wasm_script_memory_limit_mb: 5,
+            wasm_script_instance_limit: 16,
+            wasm_script_memory_count_limit: 4,
+            wasm_script_table_limit: 8,
+            wasm_script_table_elements_limit: 512,
+            wasm_script_packet_epoch_deadline: 100,
+            wasm_script_lifecycle_epoch_deadline: 1000,
             runtime_mitm_failed: false,
         }
+    }
+}
+
+#[cfg(feature = "wasm-scripting")]
+pub fn wasm_script_limits_config_section() -> ConfigValues {
+    let mut values = IndexMap::new();
+
+    values.insert(
+        "wasm_script_memory_limit_mb".to_string(),
+        ConfigValue {
+            typ: "integer".to_string(),
+            description: "Maximum linear memory size, in MiB, allowed for each live WASM script instance. Default: 5.".to_string(),
+            values: None,
+        },
+    );
+    values.insert(
+        "wasm_script_instance_limit".to_string(),
+        ConfigValue {
+            typ: "integer".to_string(),
+            description: "Maximum number of component/core instances allowed inside each WASM script store. Default: 16.".to_string(),
+            values: None,
+        },
+    );
+    values.insert(
+        "wasm_script_memory_count_limit".to_string(),
+        ConfigValue {
+            typ: "integer".to_string(),
+            description:
+                "Maximum number of memories allowed inside each WASM script store. Default: 4."
+                    .to_string(),
+            values: None,
+        },
+    );
+    values.insert(
+        "wasm_script_table_limit".to_string(),
+        ConfigValue {
+            typ: "integer".to_string(),
+            description:
+                "Maximum number of tables allowed inside each WASM script store. Default: 8."
+                    .to_string(),
+            values: None,
+        },
+    );
+    values.insert(
+        "wasm_script_table_elements_limit".to_string(),
+        ConfigValue {
+            typ: "integer".to_string(),
+            description: "Maximum number of table elements allowed inside each WASM script store. Default: 512.".to_string(),
+            values: None,
+        },
+    );
+    values.insert(
+        "wasm_script_packet_epoch_deadline".to_string(),
+        ConfigValue {
+            typ: "integer".to_string(),
+            description: "Epoch deadline for modify-packet calls. The host increments epochs every 10 ms, so 100 is roughly 1 second. Default: 100.".to_string(),
+            values: None,
+        },
+    );
+    values.insert(
+        "wasm_script_lifecycle_epoch_deadline".to_string(),
+        ConfigValue {
+            typ: "integer".to_string(),
+            description: "Epoch deadline for on-create, on-destroy, custom-configs, on-config-changed, and websocket calls. The host increments epochs every 10 ms, so 1000 is roughly 10 seconds. Default: 1000.".to_string(),
+            values: None,
+        },
+    );
+
+    ConfigValues {
+        title: "WASM script limits".to_string(),
+        values,
     }
 }
 
@@ -430,6 +523,16 @@ impl AppConfig {
         if let Some(cmd) = &self.hu_button_handler {
             doc["hu_button_handler"] = value(cmd);
         }
+        doc["wasm_script_memory_limit_mb"] = value(self.wasm_script_memory_limit_mb as i64);
+        doc["wasm_script_instance_limit"] = value(self.wasm_script_instance_limit as i64);
+        doc["wasm_script_memory_count_limit"] = value(self.wasm_script_memory_count_limit as i64);
+        doc["wasm_script_table_limit"] = value(self.wasm_script_table_limit as i64);
+        doc["wasm_script_table_elements_limit"] =
+            value(self.wasm_script_table_elements_limit as i64);
+        doc["wasm_script_packet_epoch_deadline"] =
+            value(self.wasm_script_packet_epoch_deadline as i64);
+        doc["wasm_script_lifecycle_epoch_deadline"] =
+            value(self.wasm_script_lifecycle_epoch_deadline as i64);
 
         let _ = fs::write(config_file, doc.to_string());
     }

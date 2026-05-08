@@ -1,5 +1,7 @@
 use crate::bluetooth::{load_known_devices, KNOWN_DEVICES_FILE};
 use crate::bt_helper;
+#[cfg(feature = "wasm-scripting")]
+use crate::config::wasm_script_limits_config_section;
 use crate::config::Action;
 use crate::config::AppConfig;
 use crate::config::ConfigJson;
@@ -299,8 +301,12 @@ async fn merged_config_json(state: &Arc<AppState>) -> ConfigJson {
     let mut cfg = state.config_json.read().await.clone();
 
     #[cfg(feature = "wasm-scripting")]
-    if let Some(registry) = &state.script_registry {
-        registry.append_custom_config_sections(&mut cfg).await;
+    {
+        cfg.titles.push(wasm_script_limits_config_section());
+
+        if let Some(registry) = &state.script_registry {
+            registry.append_custom_config_sections(&mut cfg).await;
+        }
     }
 
     cfg
