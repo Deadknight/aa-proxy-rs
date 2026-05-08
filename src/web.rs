@@ -1,3 +1,4 @@
+use crate::bluetooth::{load_known_devices, KNOWN_DEVICES_FILE};
 use crate::bt_helper;
 use crate::config::Action;
 use crate::config::AppConfig;
@@ -94,7 +95,7 @@ pub struct UpdateConfigEntry {
     pub value: serde_json::Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServerEvent {
     pub topic: String,
     pub payload: String,
@@ -160,6 +161,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/speed", get(speed_handler))
         .route("/version", get(version_handler))
         .route("/ws", get(ws_handler))
+        .route("/raw-topic-data", post(raw_topic_data_handler))
         .route("/bt/devices", get(bt_helper::bt_devices_handler))
         .route(
             "/bt/devices/paired",
@@ -168,6 +170,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route(
             "/bt/devices/:id",
             delete(bt_helper::bt_remove_device_handler),
+        )
+        .route(
+            "/bt/known-devices",
+            get(bt_known_devices_handler).delete(bt_forget_known_devices_handler),
         )
         .with_state(state)
 }
@@ -984,6 +990,38 @@ pub async fn factory_reset_handler(State(state): State<Arc<AppState>>) -> impl I
     )
 }
 
+async fn bt_known_devices_handler() -> impl IntoResponse {
+    let devices: Vec<String> = load_known_devices()
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect();
+    Json(devices).into_response()
+}
+
+async fn bt_forget_known_devices_handler() -> impl IntoResponse {
+    let path = std::path::Path::new(KNOWN_DEVICES_FILE);
+    if !path.exists() {
+        info!(
+            "{} 🗑️ Known devices file already empty or does not exist",
+            NAME
+        );
+        return (
+            StatusCode::OK,
+            "No known devices file to remove".to_string(),
+        );
+    }
+    match fs::remove_file(path).await {
+        Ok(_) => {
+            info!("{} 🗑️ Known devices file deleted", NAME);
+            (StatusCode::OK, "Known devices cleared".to_string())
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete known devices file: {}", e),
+        ),
+    }
+}
+
 async fn speed_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let data = state.last_speed.read().await;
     if let Some(d) = *data {
@@ -1299,6 +1337,17 @@ async fn set_config(
     }
 
     Json(response_json).into_response()
+}
+
+pub async fn raw_topic_data_handler(
+    State(state): State<Arc<AppState>>,
+    Json(data): Json<ServerEvent>,
+) -> impl IntoResponse {
+    info!("{} Received raw event data: {:?}", NAME, data);
+
+    let _ = state.ws_event_tx.send(data);
+
+    (StatusCode::OK, "OK").into_response()
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
