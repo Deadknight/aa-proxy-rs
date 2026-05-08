@@ -590,6 +590,8 @@ fn main() -> Result<()> {
     let (restart_tx, _) = broadcast::channel(1);
     let tcp_start = Arc::new(Notify::new());
     let tcp_start_cloned = tcp_start.clone();
+    #[cfg(feature = "wasm-scripting")]
+    let wasm_hooks_dir = config.wasm_hooks_dir.clone();
     let config = Arc::new(RwLock::new(config));
     let config_json = Arc::new(RwLock::new(config_json));
     let config_cloned = config.clone();
@@ -628,7 +630,7 @@ fn main() -> Result<()> {
     #[cfg(feature = "wasm-scripting")]
     let script_registry = start_wasm_engine(
         &mut runtime,
-        aa_proxy_rs::script_wasm::WASM_HOOKS_DIR.to_string(),
+        wasm_hooks_dir.to_string_lossy().into_owned(),
         script_parameters,
     )
     .ok();

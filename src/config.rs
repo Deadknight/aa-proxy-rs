@@ -23,6 +23,8 @@ pub const DEFAULT_WLAN_ADDR: &str = "10.0.0.1";
 pub const TCP_SERVER_PORT: i32 = 5288;
 pub const TCP_DHU_PORT: i32 = 5277;
 
+pub const DEFAULT_WASM_HOOKS_DIR: &str = "/data/wasm-hooks";
+
 pub type SharedConfig = Arc<RwLock<AppConfig>>;
 pub type SharedConfigJson = Arc<RwLock<ConfigJson>>;
 
@@ -170,6 +172,10 @@ pub struct AppConfig {
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub hu_button_handler: Option<String>,
 
+    /// Directory where `.wasm` hook files are loaded from.
+    /// Each script gets read-only WASI access only to a private subfolder named
+    /// after the .wasm file stem.
+    pub wasm_hooks_dir: PathBuf,
     /// Maximum linear memory size, in MiB, allowed for each live WASM script instance.
     pub wasm_script_memory_limit_mb: u32,
     /// Maximum number of component/core instances allowed inside each WASM script store.
@@ -346,6 +352,7 @@ impl Default for AppConfig {
             collect_speed: false,
             disable_driving_status: false,
             hu_button_handler: None,
+            wasm_hooks_dir: DEFAULT_WASM_HOOKS_DIR.into(),
             wasm_script_memory_limit_mb: 5,
             wasm_script_instance_limit: 16,
             wasm_script_memory_count_limit: 4,
@@ -361,6 +368,15 @@ impl Default for AppConfig {
 #[cfg(feature = "wasm-scripting")]
 pub fn wasm_script_limits_config_section() -> ConfigValues {
     let mut values = IndexMap::new();
+
+    values.insert(
+        "wasm_hooks_dir".to_string(),
+        ConfigValue {
+            typ: "string".to_string(),
+            description: "Directory where WASM hook files are loaded from. Each script gets read-only access only to a private subfolder named after the .wasm file stem. Default: /data/wasm-hooks.".to_string(),
+            values: None,
+        },
+    );
 
     values.insert(
         "wasm_script_memory_limit_mb".to_string(),
@@ -523,6 +539,7 @@ impl AppConfig {
         if let Some(cmd) = &self.hu_button_handler {
             doc["hu_button_handler"] = value(cmd);
         }
+        doc["wasm_hooks_dir"] = value(self.wasm_hooks_dir.display().to_string());
         doc["wasm_script_memory_limit_mb"] = value(self.wasm_script_memory_limit_mb as i64);
         doc["wasm_script_instance_limit"] = value(self.wasm_script_instance_limit as i64);
         doc["wasm_script_memory_count_limit"] = value(self.wasm_script_memory_count_limit as i64);
