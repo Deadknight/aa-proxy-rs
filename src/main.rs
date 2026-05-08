@@ -624,6 +624,7 @@ fn main() -> Result<()> {
     let script_parameters = ScriptParameters {
         ws_event_tx: ws_event_tx.clone(),
         wasm_config_store,
+        config: config.clone(),
     };
     #[cfg(feature = "wasm-scripting")]
     let script_registry =

@@ -4,6 +4,8 @@ use crate::config::AppConfig;
 use crate::config::ConfigJson;
 use crate::config::SharedConfig;
 use crate::config::SharedConfigJson;
+#[cfg(feature = "wasm-scripting")]
+use crate::config::wasm_script_limits_config_section;
 use crate::config::BASE_CONFIG_DIR;
 use crate::device_info;
 use crate::ev::send_ev_data;
@@ -293,8 +295,12 @@ async fn merged_config_json(state: &Arc<AppState>) -> ConfigJson {
     let mut cfg = state.config_json.read().await.clone();
 
     #[cfg(feature = "wasm-scripting")]
-    if let Some(registry) = &state.script_registry {
-        registry.append_custom_config_sections(&mut cfg).await;
+    {
+        cfg.titles.push(wasm_script_limits_config_section());
+
+        if let Some(registry) = &state.script_registry {
+            registry.append_custom_config_sections(&mut cfg).await;
+        }
     }
 
     cfg

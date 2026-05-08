@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, ConfigJson, ConfigValue, ConfigValues};
+use crate::config::{AppConfig, ConfigJson, ConfigValue, ConfigValues, SharedConfig};
 use crate::mitm::ModifyContext;
 use crate::mitm::Packet;
 use crate::vendor_ext::rest_call_blocking;
@@ -103,7 +103,7 @@ pub fn start_wasm_engine(
 
     let script_registry_for_tick = script_registry.clone();
     runtime.spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        let mut interval = tokio::time::interval(Duration::from_millis(WASM_EPOCH_TICK_INTERVAL_MS));
         loop {
             interval.tick().await;
             script_registry_for_tick.tick_all();
@@ -130,6 +130,49 @@ impl ScriptEffects {
     }
 }
 
+
+const WASM_EPOCH_TICK_INTERVAL_MS: u64 = 10;
+
+#[derive(Clone, Copy, Debug)]
+struct EffectiveScriptLimits {
+    memory_limit_mb: u32,
+    instance_limit: u32,
+    memory_count_limit: u32,
+    table_limit: u32,
+    table_elements_limit: u32,
+    packet_epoch_deadline: u64,
+    lifecycle_epoch_deadline: u64,
+}
+
+impl EffectiveScriptLimits {
+    fn from_config(cfg: &AppConfig) -> Self {
+        Self {
+            memory_limit_mb: cfg.wasm_script_memory_limit_mb.max(1),
+            instance_limit: cfg.wasm_script_instance_limit.max(1),
+            memory_count_limit: cfg.wasm_script_memory_count_limit.max(1),
+            table_limit: cfg.wasm_script_table_limit.max(1),
+            table_elements_limit: cfg.wasm_script_table_elements_limit.max(1),
+            packet_epoch_deadline: cfg.wasm_script_packet_epoch_deadline.max(1),
+            lifecycle_epoch_deadline: cfg.wasm_script_lifecycle_epoch_deadline.max(1),
+        }
+    }
+
+    async fn read(config: &SharedConfig) -> Self {
+        let cfg = config.read().await;
+        Self::from_config(&cfg)
+    }
+
+    fn to_store_limits(self) -> StoreLimits {
+        StoreLimitsBuilder::new()
+            .memory_size((self.memory_limit_mb as usize).saturating_mul(1024 * 1024))
+            .instances(self.instance_limit as usize)
+            .memories(self.memory_count_limit as usize)
+            .tables(self.table_limit as usize)
+            .table_elements(self.table_elements_limit as usize)
+            .build()
+    }
+}
+
 pub struct ScriptState {
     pub effects: ScriptEffects,
     pub limits: StoreLimits,
@@ -139,18 +182,14 @@ pub struct ScriptState {
 }
 
 impl ScriptState {
-    fn new(script_parameters: ScriptParameters, script_id: String) -> Self {
-        let limits = StoreLimitsBuilder::new()
-            .memory_size(5 * 1024 * 1024)
-            .instances(16)
-            .memories(4)
-            .tables(8)
-            .table_elements(512)
-            .build();
-
+    fn new(
+        script_parameters: ScriptParameters,
+        script_id: String,
+        limits: EffectiveScriptLimits,
+    ) -> Self {
         Self {
             effects: ScriptEffects::new(script_parameters),
-            limits,
+            limits: limits.to_store_limits(),
             script_id,
             wasi_ctx: WasiCtxBuilder::new().build(),
             resource_table: ResourceTable::new(),
@@ -166,6 +205,7 @@ impl ScriptState {
 pub struct ScriptParameters {
     pub ws_event_tx: BroadcastSender<ServerEvent>,
     pub wasm_config_store: Arc<WasmConfigStore>,
+    pub config: SharedConfig,
 }
 
 impl WasiView for ScriptState {
@@ -271,6 +311,7 @@ impl WasmScriptEngine {
     async fn ensure_live<'a>(
         &'a self,
         live: &'a mut Option<LiveScript>,
+        limits: EffectiveScriptLimits,
     ) -> Result<&'a mut LiveScript> {
         if self.closed.load(Ordering::Acquire) {
             anyhow::bail!("[wasm] script is destroyed: {}", self.path.display());
@@ -279,11 +320,15 @@ impl WasmScriptEngine {
         if live.is_none() {
             let mut store = Store::new(
                 &self.engine,
-                ScriptState::new(self.script_parameters.clone(), self.script_id.clone()),
+                ScriptState::new(
+                    self.script_parameters.clone(),
+                    self.script_id.clone(),
+                    limits,
+                ),
             );
 
             store.limiter(|state| &mut state.limits);
-            store.set_epoch_deadline(1000);
+            store.set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
             let bindings =
                 PacketHook::instantiate_async(&mut store, &self.component, &self.linker).await?;
@@ -337,12 +382,22 @@ impl WasmScriptEngine {
         &self.script_id
     }
 
-    pub async fn custom_configs(&self) -> Result<Vec<CustomConfigSection>> {
-        let mut live_guard = self.live.lock().await;
-        let live = self.ensure_live(&mut live_guard).await?;
+    async fn effective_limits(&self) -> EffectiveScriptLimits {
+        EffectiveScriptLimits::read(&self.script_parameters.config).await
+    }
 
+    fn apply_store_limits(live: &mut LiveScript, limits: EffectiveScriptLimits) {
+        live.store.data_mut().limits = limits.to_store_limits();
+    }
+
+    pub async fn custom_configs(&self) -> Result<Vec<CustomConfigSection>> {
+        let limits = self.effective_limits().await;
+        let mut live_guard = self.live.lock().await;
+        let live = self.ensure_live(&mut live_guard, limits).await?;
+
+        Self::apply_store_limits(live, limits);
         live.store.data_mut().reset_effects();
-        live.store.set_epoch_deadline(1000);
+        live.store.set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
         let sections = live
             .bindings
@@ -370,11 +425,13 @@ impl WasmScriptEngine {
     }
 
     pub async fn on_config_changed(&self, name: String, value: Value) -> Result<()> {
+        let limits = self.effective_limits().await;
         let mut live_guard = self.live.lock().await;
-        let live = self.ensure_live(&mut live_guard).await?;
+        let live = self.ensure_live(&mut live_guard, limits).await?;
 
+        Self::apply_store_limits(live, limits);
         live.store.data_mut().reset_effects();
-        live.store.set_epoch_deadline(1000);
+        live.store.set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
         let value = json_value_to_string(&value);
         live.bindings
@@ -390,11 +447,13 @@ impl WasmScriptEngine {
         pkt: WasmPacket,
         cfg: ConfigView,
     ) -> Result<(Decision, ScriptEffects)> {
+        let limits = self.effective_limits().await;
         let mut live_guard = self.live.lock().await;
-        let live = self.ensure_live(&mut live_guard).await?;
+        let live = self.ensure_live(&mut live_guard, limits).await?;
 
+        Self::apply_store_limits(live, limits);
         live.store.data_mut().reset_effects();
-        live.store.set_epoch_deadline(100);
+        live.store.set_epoch_deadline(limits.packet_epoch_deadline);
 
         let decision = live
             .bindings
@@ -409,11 +468,13 @@ impl WasmScriptEngine {
         topic: String,
         payload: String,
     ) -> Result<(String, ScriptEffects)> {
+        let limits = self.effective_limits().await;
         let mut live_guard = self.live.lock().await;
-        let live = self.ensure_live(&mut live_guard).await?;
+        let live = self.ensure_live(&mut live_guard, limits).await?;
 
+        Self::apply_store_limits(live, limits);
         live.store.data_mut().reset_effects();
-        live.store.set_epoch_deadline(1000);
+        live.store.set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
         let payload = live
             .bindings
@@ -426,11 +487,13 @@ impl WasmScriptEngine {
     pub async fn destroy(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
 
+        let limits = self.effective_limits().await;
         let mut live_guard = self.live.lock().await;
 
         if let Some(mut live) = live_guard.take() {
+            Self::apply_store_limits(&mut live, limits);
             live.store.data_mut().reset_effects();
-            live.store.set_epoch_deadline(1000);
+            live.store.set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
             live.bindings
                 .call_on_destroy(&mut live.store)
