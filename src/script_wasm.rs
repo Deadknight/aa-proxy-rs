@@ -24,7 +24,11 @@ use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-pub const WASM_HOOKS_DIR: &str = "/data/wasm-hooks";
+/// Default host-side WASM hooks root. The active value comes from AppConfig::wasm_hooks_dir.
+pub const WASM_HOOKS_DIR: &str = crate::config::DEFAULT_WASM_HOOKS_DIR;
+
+/// Stable guest-visible mount path. Each script sees only its own private host folder here.
+const GUEST_WASM_HOOKS_DIR: &str = ".";
 
 pub mod bindings {
     wasmtime::component::bindgen!({
@@ -45,6 +49,10 @@ pub fn start_wasm_engine(
     hook_dir: String,
     script_parameters: ScriptParameters,
 ) -> Result<Arc<ScriptRegistry>> {
+    let hook_dir = PathBuf::from(hook_dir);
+    fs::create_dir_all(&hook_dir)
+        .with_context(|| format!("[wasm] failed to create hooks dir {}", hook_dir.display()))?;
+
     let script_registry = Arc::new(ScriptRegistry::new(script_parameters));
 
     let old_scripts = script_registry.reload_dir(&hook_dir);
@@ -71,16 +79,17 @@ pub fn start_wasm_engine(
     })?;
 
     wasm_watcher
-        .watch(std::path::Path::new(&hook_dir), RecursiveMode::NonRecursive)
-        .map_err(|e| anyhow::anyhow!("[wasm] failed to watch {}: {}", hook_dir, e))?;
+        .watch(&hook_dir, RecursiveMode::NonRecursive)
+        .map_err(|e| anyhow::anyhow!("[wasm] failed to watch {}: {}", hook_dir.display(), e))?;
 
     let script_registry_for_watch = script_registry.clone();
+    let hook_dir_for_watch = hook_dir.clone();
     runtime.spawn(async move {
         while let Some(res) = watch_rx.recv().await {
             match res {
                 Ok(event) => match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        let old_scripts = script_registry_for_watch.reload_dir(&hook_dir);
+                        let old_scripts = script_registry_for_watch.reload_dir(&hook_dir_for_watch);
                         destroy_loaded_scripts(old_scripts).await;
 
                         let errs: Vec<(std::path::PathBuf, String)> =
@@ -188,24 +197,25 @@ impl ScriptState {
         script_parameters: ScriptParameters,
         script_id: String,
         limits: EffectiveScriptLimits,
+        hooks_dir: &Path,
     ) -> Self {
         let mut wasi_builder = WasiCtxBuilder::new();
 
-        let real_script_hooks_dir = script_private_hooks_dir(&script_id)
-            .unwrap_or_else(|| Path::new(WASM_HOOKS_DIR).join("unknown"));
+        let real_script_hooks_dir = script_private_hooks_dir(hooks_dir, &script_id)
+            .unwrap_or_else(|| hooks_dir.join("unknown"));
 
         match fs::create_dir_all(&real_script_hooks_dir) {
             Ok(_) => {
                 if let Err(err) = wasi_builder.preopened_dir(
                     &real_script_hooks_dir,
-                    WASM_HOOKS_DIR,
+                    GUEST_WASM_HOOKS_DIR,
                     DirPerms::READ,
                     FilePerms::READ,
                 ) {
                     log::warn!(
                         "[wasm] failed to preopen real dir {} as guest dir {} for script {}: {}",
                         real_script_hooks_dir.display(),
-                        WASM_HOOKS_DIR,
+                        GUEST_WASM_HOOKS_DIR,
                         script_id,
                         err
                     );
@@ -338,7 +348,7 @@ fn run_sync_wasm_call<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-fn script_private_hooks_dir(script_id: &str) -> Option<PathBuf> {
+fn script_private_hooks_dir(hooks_dir: &Path, script_id: &str) -> Option<PathBuf> {
     let stem = Path::new(script_id)
         .file_stem()
         .and_then(|s| s.to_str())?;
@@ -351,7 +361,7 @@ fn script_private_hooks_dir(script_id: &str) -> Option<PathBuf> {
     if safe_stem.is_empty() {
         None
     } else {
-        Some(Path::new(WASM_HOOKS_DIR).join(safe_stem))
+        Some(hooks_dir.join(safe_stem))
     }
 }
 
@@ -361,6 +371,7 @@ pub struct WasmScriptEngine {
     linker: Linker<ScriptState>,
     pub path: PathBuf,
     script_id: String,
+    hooks_dir: PathBuf,
     script_parameters: ScriptParameters,
     live: Mutex<Option<LiveScript>>,
     closed: AtomicBool,
@@ -383,6 +394,7 @@ impl WasmScriptEngine {
                     self.script_parameters.clone(),
                     self.script_id.clone(),
                     limits,
+                    &self.hooks_dir,
                 ),
             );
 
@@ -407,6 +419,7 @@ impl WasmScriptEngine {
     pub fn load(
         component_path: impl AsRef<Path>,
         script_parameters: ScriptParameters,
+        hooks_dir: impl AsRef<Path>,
     ) -> Result<Self> {
         let mut cfg = Config::new();
         cfg.async_support(false);
@@ -416,6 +429,7 @@ impl WasmScriptEngine {
         let engine = Engine::new(&cfg)?;
         let path = component_path.as_ref().to_path_buf();
         let script_id = script_id_from_path(&path);
+        let hooks_dir = hooks_dir.as_ref().to_path_buf();
 
         let component = Component::from_file(&engine, &path)
             .with_context(|| format!("[wasm] loading wasm component {}", path.display()))?;
@@ -433,6 +447,7 @@ impl WasmScriptEngine {
             linker,
             path,
             script_id,
+            hooks_dir,
             script_parameters,
             live: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -662,7 +677,7 @@ impl ScriptRegistry {
                 continue;
             }
 
-            match WasmScriptEngine::load(&path, script_parameters.clone()) {
+            match WasmScriptEngine::load(&path, script_parameters.clone(), dir) {
                 Ok(engine) => {
                     log::info!("[wasm] loaded wasm script: {}", path.display());
                     scripts.push(LoadedScript {
