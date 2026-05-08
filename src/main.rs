@@ -63,7 +63,6 @@ const UMTPRD_CONF_OUT: &str = "/var/run/umtprd.conf";
 const GADGET_INIT_IN: &str = "/etc/S92usb_gadget.in";
 const GADGET_INIT_OUT: &str = "/var/run/S92usb_gadget";
 const REBOOT_CMD: &str = "/sbin/reboot";
-const WASM_HOOKS_DIR: &str = "/data/wasm-hooks";
 
 /// AndroidAuto wired/wireless proxy
 #[derive(Parser, Debug)]
@@ -627,8 +626,12 @@ fn main() -> Result<()> {
         config: config.clone(),
     };
     #[cfg(feature = "wasm-scripting")]
-    let script_registry =
-        start_wasm_engine(&mut runtime, WASM_HOOKS_DIR.to_string(), script_parameters).ok();
+    let script_registry = start_wasm_engine(
+        &mut runtime,
+        aa_proxy_rs::script_wasm::WASM_HOOKS_DIR.to_string(),
+        script_parameters,
+    )
+    .ok();
     #[cfg(not(feature = "wasm-scripting"))]
     let script_registry = None;
     let script_registry_cloned = script_registry.clone();

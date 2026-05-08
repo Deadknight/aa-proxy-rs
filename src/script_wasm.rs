@@ -22,7 +22,9 @@ use tokio::runtime::Runtime;
 use tokio::sync::{broadcast::Sender as BroadcastSender, mpsc, Mutex};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+pub const WASM_HOOKS_DIR: &str = "/data/wasm-hooks";
 
 pub mod bindings {
     wasmtime::component::bindgen!({
@@ -187,11 +189,43 @@ impl ScriptState {
         script_id: String,
         limits: EffectiveScriptLimits,
     ) -> Self {
+        let mut wasi_builder = WasiCtxBuilder::new();
+
+        let real_script_hooks_dir = script_private_hooks_dir(&script_id)
+            .unwrap_or_else(|| Path::new(WASM_HOOKS_DIR).join("unknown"));
+
+        match fs::create_dir_all(&real_script_hooks_dir) {
+            Ok(_) => {
+                if let Err(err) = wasi_builder.preopened_dir(
+                    &real_script_hooks_dir,
+                    WASM_HOOKS_DIR,
+                    DirPerms::READ,
+                    FilePerms::READ,
+                ) {
+                    log::warn!(
+                        "[wasm] failed to preopen real dir {} as guest dir {} for script {}: {}",
+                        real_script_hooks_dir.display(),
+                        WASM_HOOKS_DIR,
+                        script_id,
+                        err
+                    );
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "[wasm] failed to create script hooks dir {}; hot reload file access disabled for script {}: {}",
+                    real_script_hooks_dir.display(),
+                    script_id,
+                    err
+                );
+            }
+        }
+
         Self {
             effects: ScriptEffects::new(script_parameters),
             limits: limits.to_store_limits(),
             script_id,
-            wasi_ctx: WasiCtxBuilder::new().build(),
+            wasi_ctx: wasi_builder.build(),
             resource_table: ResourceTable::new(),
         }
     }
@@ -296,6 +330,29 @@ struct LiveScript {
     bindings: PacketHook,
 }
 
+fn run_sync_wasm_call<R>(f: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+fn script_private_hooks_dir(script_id: &str) -> Option<PathBuf> {
+    let stem = Path::new(script_id).file_stem().and_then(|s| s.to_str())?;
+
+    let safe_stem: String = stem
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+        .collect();
+
+    if safe_stem.is_empty() {
+        None
+    } else {
+        Some(Path::new(WASM_HOOKS_DIR).join(safe_stem))
+    }
+}
+
 pub struct WasmScriptEngine {
     engine: Engine,
     component: Component,
@@ -333,9 +390,11 @@ impl WasmScriptEngine {
             let bindings =
                 PacketHook::instantiate_async(&mut store, &self.component, &self.linker).await?;
 
-            bindings
-                .call_on_create(&mut store)
-                .with_context(|| format!("[wasm] running on-create {}", self.path.display()))?;
+            run_sync_wasm_call(|| {
+                bindings
+                    .call_on_create(&mut store)
+                    .with_context(|| format!("[wasm] running on-create {}", self.path.display()))
+            })?;
 
             *live = Some(LiveScript { store, bindings });
         }
@@ -400,10 +459,11 @@ impl WasmScriptEngine {
         live.store
             .set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
-        let sections = live
-            .bindings
-            .call_custom_configs(&mut live.store)
-            .with_context(|| format!("[wasm] running custom-configs {}", self.path.display()))?;
+        let sections = run_sync_wasm_call(|| {
+            live.bindings
+                .call_custom_configs(&mut live.store)
+                .with_context(|| format!("[wasm] running custom-configs {}", self.path.display()))
+        })?;
 
         for section in &sections {
             for entry in &section.values {
@@ -436,9 +496,13 @@ impl WasmScriptEngine {
             .set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
         let value = json_value_to_string(&value);
-        live.bindings
-            .call_on_config_changed(&mut live.store, &name, &value)
-            .with_context(|| format!("[wasm] running on-config-changed {}", self.path.display()))?;
+        run_sync_wasm_call(|| {
+            live.bindings
+                .call_on_config_changed(&mut live.store, &name, &value)
+                .with_context(|| {
+                    format!("[wasm] running on-config-changed {}", self.path.display())
+                })
+        })?;
 
         Ok(())
     }
@@ -457,10 +521,11 @@ impl WasmScriptEngine {
         live.store.data_mut().reset_effects();
         live.store.set_epoch_deadline(limits.packet_epoch_deadline);
 
-        let decision = live
-            .bindings
-            .call_modify_packet(&mut live.store, &ctx, &pkt, cfg)
-            .with_context(|| format!("[wasm] running wasm script {}", self.path.display()))?;
+        let decision = run_sync_wasm_call(|| {
+            live.bindings
+                .call_modify_packet(&mut live.store, &ctx, &pkt, cfg)
+                .with_context(|| format!("[wasm] running wasm script {}", self.path.display()))
+        })?;
 
         Ok((decision, live.store.data().effects.clone()))
     }
@@ -479,10 +544,11 @@ impl WasmScriptEngine {
         live.store
             .set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
-        let payload = live
-            .bindings
-            .call_ws_script_handler(&mut live.store, &topic, &payload)
-            .with_context(|| format!("[wasm] running wasm script {}", self.path.display()))?;
+        let payload = run_sync_wasm_call(|| {
+            live.bindings
+                .call_ws_script_handler(&mut live.store, &topic, &payload)
+                .with_context(|| format!("[wasm] running wasm script {}", self.path.display()))
+        })?;
 
         Ok((payload, live.store.data().effects.clone()))
     }
@@ -499,9 +565,11 @@ impl WasmScriptEngine {
             live.store
                 .set_epoch_deadline(limits.lifecycle_epoch_deadline);
 
-            live.bindings
-                .call_on_destroy(&mut live.store)
-                .with_context(|| format!("[wasm] running on-destroy {}", self.path.display()))?;
+            run_sync_wasm_call(|| {
+                live.bindings
+                    .call_on_destroy(&mut live.store)
+                    .with_context(|| format!("[wasm] running on-destroy {}", self.path.display()))
+            })?;
         }
 
         Ok(())
