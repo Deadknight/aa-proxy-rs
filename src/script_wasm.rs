@@ -341,10 +341,11 @@ struct LiveScript {
 }
 
 fn run_sync_wasm_call<R>(f: impl FnOnce() -> R) -> R {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
