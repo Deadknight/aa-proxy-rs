@@ -172,6 +172,45 @@ pub struct AppConfig {
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub hu_button_handler: Option<String>,
 
+    /// Master switch for the experimental Bluetooth SCO/eSCO call-audio bridge/listener.
+    ///
+    /// When enabled, the SCO listener can stay active and, if configured, bridge
+    /// call downlink/uplink audio.
+    pub bt_sco: bool,
+    /// Keep the Android Auto Bluetooth profile/RFCOMM connection alive after Wi-Fi
+    /// bootstrap while the SCO bridge is enabled. This is required when the phone
+    /// should keep routing call audio to aa-proxy-rs instead of dropping BT after
+    /// the AA Wi-Fi setup phase.
+    pub bt_sco_keep_bluetooth_alive: bool,
+    /// Experimental downlink bridge: SCO call audio -> AA PCM media sink.
+    /// Disabled by default. Requires `mitm = true`.
+    pub bt_sco_media_bridge: bool,
+    /// Preferred AA PCM sink type for SCO downlink.
+    /// Values: `guidance`, `media`, or `auto`. For phone calls, `guidance` is
+    /// often more audible because AA/HU may mute the normal media stream while a
+    /// call and microphone session are active.
+    pub bt_sco_media_bridge_audio_type: String,
+    /// Output gain for SCO downlink after conversion, as percent. 100 means no gain.
+    /// Useful because the raw SCO downlink can be quiet on some phones/HUs.
+    pub bt_sco_media_bridge_gain_percent: u32,
+    /// Converted AA PCM chunk ring capacity for the SCO media bridge.
+    /// Higher values tolerate stalls; lower values reduce latency. 128 is safe.
+    pub bt_sco_media_bridge_ring_capacity: usize,
+    /// Send MEDIA_MESSAGE_START on the selected, already-configured AA PCM sink
+    /// when SCO connects. This is useful for DHU/HUs that discard DATA until the
+    /// existing stream is explicitly started. CHANNEL_OPEN/SETUP are still not sent.
+    pub bt_sco_media_bridge_start_existing: bool,
+    /// Send MEDIA_MESSAGE_STOP on the selected existing AA PCM sink when SCO disconnects.
+    pub bt_sco_media_bridge_stop_existing_on_disconnect: bool,
+    /// Experimental uplink bridge: AA HU microphone/source PCM -> Bluetooth SCO uplink.
+    /// Disabled by default. Requires `mitm = true`.
+    pub bt_sco_mic_bridge: bool,
+    /// Send AA MEDIA_MESSAGE_MICROPHONE_REQUEST open/close while SCO is connected.
+    /// Keep enabled for the first mic test; disable to observe/passively log mic frames only.
+    pub bt_sco_mic_request: bool,
+    /// Maximum 60-byte SCO uplink packets buffered for the mic bridge.
+    pub bt_sco_mic_uplink_ring_capacity: usize,
+
     /// Directory where `.wasm` hook files are loaded from.
     /// Each script gets read-only WASI access only to a private subfolder named
     /// after the .wasm file stem.
@@ -352,6 +391,17 @@ impl Default for AppConfig {
             collect_speed: false,
             disable_driving_status: false,
             hu_button_handler: None,
+            bt_sco: false,
+            bt_sco_keep_bluetooth_alive: false,
+            bt_sco_media_bridge: true,
+            bt_sco_media_bridge_audio_type: "media".into(),
+            bt_sco_media_bridge_gain_percent: 200,
+            bt_sco_media_bridge_ring_capacity: 128,
+            bt_sco_media_bridge_start_existing: true,
+            bt_sco_media_bridge_stop_existing_on_disconnect: true,
+            bt_sco_mic_bridge: true,
+            bt_sco_mic_request: true,
+            bt_sco_mic_uplink_ring_capacity: 256,
             wasm_hooks_dir: DEFAULT_WASM_HOOKS_DIR.into(),
             wasm_script_memory_limit_mb: 5,
             wasm_script_instance_limit: 16,

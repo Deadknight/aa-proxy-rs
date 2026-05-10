@@ -612,6 +612,8 @@ impl Bluetooth {
         stopped: bool,
         quick_reconnect: bool,
         bt_poweroff: bool,
+        bt_sco: bool,
+        bt_sco_keep_bluetooth_alive: bool,
         mut need_restart: BroadcastReceiver<Option<Action>>,
         restart_tx: BroadcastSender<Option<Action>>,
         profile_connected: Arc<AtomicBool>,
@@ -638,19 +640,57 @@ impl Bluetooth {
                 Ok(handle) => {
                     info!("{} 🎧 Headset Profile (HSP): registered", NAME);
 
-                    // Move ownership of handle into task
+                    // Move ownership of handle into task. Keep the old safe behavior:
+                    // accept and immediately drop the HSP control stream so Android Auto
+                    // Bluetooth handshakes are not affected. The SCO/eSCO audio socket is
+                    // handled separately by the bt_sco listener.
                     tokio::spawn(async move {
                         let mut h = handle;
                         loop {
-                            let req = h.next().await.expect("received no HSP connect request");
+                            let req = match h.next().await {
+                                Some(req) => req,
+                                None => {
+                                    warn!(
+                                        "{} 🎧 Headset Profile (HSP): no more connect requests",
+                                        NAME
+                                    );
+                                    break;
+                                }
+                            };
 
+                            let device = req.device().clone();
                             info!(
                                 "{} 🎧 Headset Profile (HSP): connect from <b>{}</>",
                                 NAME,
-                                req.device()
+                                device
                             );
 
-                            let _ = req.accept();
+                            match req.accept() {
+                                Ok(stream) => {
+                                    // IMPORTANT: Do not keep the HSP RFCOMM control stream open yet.
+                                    // Keeping it open without a proper HSP/HFP AT-command state machine can
+                                    // make Android route the call to this Bluetooth device and then wait forever
+                                    // for headset-side responses. The independent SCO/eSCO listener remains
+                                    // active; the HSP control stream is accepted and immediately dropped,
+                                    // preserving the old Android Auto Bluetooth behavior.
+                                    if bt_sco {
+                                        info!(
+                                            "{} 🎧 Headset Profile (HSP): accepted from <b>{}</>, dropping control stream in SCO mode",
+                                            NAME,
+                                            device
+                                        );
+                                    }
+                                    drop(stream);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "{} 🎧 Headset Profile (HSP): accept error from <b>{}</>: {}",
+                                        NAME,
+                                        device,
+                                        e
+                                    );
+                                }
+                            }
                         }
                     });
 
@@ -766,6 +806,74 @@ impl Bluetooth {
                 Self::unregister_hsp(hsp_session).await;
                 // main loop could now wait so send an event to restart
                 let _ = restart_tx.send(None);
+            }));
+        } else if bt_sco && bt_sco_keep_bluetooth_alive {
+            // The SCO call-audio bridge needs the phone to keep routing calls to
+            // aa-proxy-rs over Bluetooth after the AA Wi-Fi bootstrap completes.
+            // Normal aa-proxy-rs behavior disconnects BT here so the phone can use
+            // the real HU for calls; for the bridge we instead keep the accepted
+            // AA RFCOMM stream and the HSP registration alive until the AA session
+            // restarts/stops.
+            info!(
+                "{} 🎧 bt_sco_keep_bluetooth_alive enabled; keeping Bluetooth RFCOMM/HSP alive after Wi-Fi bootstrap",
+                NAME
+            );
+
+            let hsp_session = hsp_handle.take();
+            let adapter_cloned = self.adapter.clone();
+            let device_address = bluer::Address(*address);
+            let mut keepalive_restart_rx = need_restart;
+
+            let _ = Some(tokio::spawn(async move {
+                profile_connected.store(true, Ordering::Relaxed);
+
+                // Hold `stream` and `hsp_session` by moving them into this task.
+                // We intentionally do not send any more AA Wireless frames here;
+                // this is not quick_reconnect. The task only keeps BT alive while
+                // the current AA session is alive, then cleans up on restart/stop.
+                let mut held_stream = stream;
+                let _held_hsp_session = hsp_session;
+
+                match keepalive_restart_rx.recv().await {
+                    Ok(action) => {
+                        info!(
+                            "{} 🎧 bt_sco keepalive ending after restart notification: {:?}",
+                            NAME, action
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            "{} 🎧 bt_sco keepalive ending because restart channel closed: {}",
+                            NAME, e
+                        );
+                    }
+                }
+
+                match held_stream.shutdown().await {
+                    Ok(_) => debug!("{} bt_sco keepalive RFCOMM shutdown succeeded", NAME),
+                    Err(e) => warn!("{} bt_sco keepalive RFCOMM shutdown error: {}", NAME, e),
+                }
+
+                tokio::time::sleep(Duration::from_millis(150)).await;
+
+                if let Ok(device) = adapter_cloned.device(device_address) {
+                    if let Err(e) = device.disconnect().await {
+                        warn!("{} bt_sco keepalive device.disconnect error: {}", NAME, e);
+                    }
+                }
+
+                if let Some(sess) = _held_hsp_session {
+                    info!("{} 🎧 Headset Profile (HSP): unregistering ...", NAME);
+                    drop(sess);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    info!("{} 🎧 Headset Profile (HSP): unregistered", NAME);
+                }
+
+                if bt_poweroff {
+                    let _ = adapter_cloned.set_powered(false).await;
+                }
+
+                profile_connected.store(false, Ordering::Relaxed);
             }));
         } else {
             // attempt graceful shutdown of the RFCOMM stream before disconnect

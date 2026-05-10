@@ -145,6 +145,50 @@
         "external_antenna": {
           "typ": "boolean",
           "description": "Only for Radxa: enable if you want to use (and have connected) an external antenna"
+        },
+        "bt_sco": {
+          "typ": "boolean",
+          "description": "Enable the experimental Bluetooth SCO/eSCO call-audio bridge/listener. Don't forget to enable `remove_bluetooth` and `remove_wireless`"
+        },
+        "bt_sco_keep_bluetooth_alive": {
+          "typ": "boolean",
+          "description": "When bt_sco is enabled, keep the Android Auto Bluetooth profile/RFCOMM connection alive after Wi-Fi bootstrap so the phone continues routing call audio to aa-proxy-rs. Default: true."
+        },
+        "bt_sco_media_bridge": {
+          "typ": "boolean",
+          "description": "Experimental: bridge Bluetooth SCO call downlink into a selected Android Auto PCM sink. Requires MITM and bt_sco listener. Disabled by default."
+        },
+        "bt_sco_media_bridge_audio_type": {
+          "typ": "string",
+          "description": "Preferred AA PCM sink for SCO downlink: guidance, media, or auto. For calls, guidance is recommended because MEDIA may be muted while mic/call state is active."
+        },
+        "bt_sco_media_bridge_gain_percent": {
+          "typ": "integer",
+          "description": "SCO downlink output gain percent after conversion. 100 means no gain. Start with 300 if call audio is quiet."
+        },
+        "bt_sco_media_bridge_ring_capacity": {
+          "typ": "integer",
+          "description": "Maximum converted AA PCM chunks buffered for SCO media bridge. 128 is a safe default; lower values reduce latency."
+        },
+        "bt_sco_media_bridge_start_existing": {
+          "typ": "boolean",
+          "description": "When SCO connects, send MEDIA_MESSAGE_START on the selected existing/configured PCM sink before piggyback DATA. Does not send CHANNEL_OPEN or SETUP. Recommended for DHU testing."
+        },
+        "bt_sco_media_bridge_stop_existing_on_disconnect": {
+          "typ": "boolean",
+          "description": "When SCO disconnects, send MEDIA_MESSAGE_STOP on the selected existing PCM sink. Useful to reset DHU/HU audio renderer state between calls."
+        },
+        "bt_sco_mic_bridge": {
+          "typ": "boolean",
+          "description": "Experimental: bridge Android Auto HU microphone/source PCM into Bluetooth SCO call uplink. Requires MITM and bt_sco listener. Disabled by default."
+        },
+        "bt_sco_mic_request": {
+          "typ": "boolean",
+          "description": "Send MEDIA_MESSAGE_MICROPHONE_REQUEST open/close when SCO connects/disconnects. Disable for passive mic logging only."
+        },
+        "bt_sco_mic_uplink_ring_capacity": {
+          "typ": "integer",
+          "description": "Maximum 60-byte SCO uplink packets buffered for microphone bridge. 256 is a safe default."
         }
       }
     },

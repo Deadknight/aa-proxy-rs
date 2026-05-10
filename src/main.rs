@@ -1,4 +1,5 @@
 use aa_proxy_rs::bluetooth;
+use aa_proxy_rs::bt_sco::{self, BtScoOptions};
 use aa_proxy_rs::button::button_handler;
 use aa_proxy_rs::config::SharedConfig;
 use aa_proxy_rs::config::SharedConfigJson;
@@ -239,6 +240,29 @@ async fn tokio_main(
     };
 
     let mut cfg = config.read().await.clone();
+    let bt_sco_enabled = cfg.bt_sco || cfg.bt_sco_media_bridge || cfg.bt_sco_mic_bridge;
+
+    if bt_sco_enabled {
+        match bt_sco::spawn(BtScoOptions {
+            bridge_aa_media_pcm: cfg.bt_sco_media_bridge,
+            bridge_ring_capacity: cfg.bt_sco_media_bridge_ring_capacity,
+            bridge_sco_uplink_pcm: cfg.bt_sco_mic_bridge,
+            sco_uplink_ring_capacity: cfg.bt_sco_mic_uplink_ring_capacity,
+        }) {
+            Ok(_) => {
+                info!(
+                    "{} Bluetooth SCO listener started, media_bridge={}, mic_bridge={}",
+                    NAME,
+                    cfg.bt_sco_media_bridge,
+                    cfg.bt_sco_mic_bridge
+                );
+            }
+            Err(e) => {
+                warn!("{} Bluetooth SCO listener failed to start: {}", NAME, e);
+            }
+        }
+    }
+
     if let Some(ref bindaddr) = cfg.webserver {
         // preparing AppState and starting webserver
         let app = web::app(state.clone().into());
@@ -350,6 +374,8 @@ async fn tokio_main(
                         cfg.action_requested == Some(Action::Stop),
                         cfg.quick_reconnect,
                         cfg.bt_poweroff,
+                        cfg.bt_sco || cfg.bt_sco_media_bridge || cfg.bt_sco_mic_bridge,
+                        cfg.bt_sco_keep_bluetooth_alive,
                         restart_tx.subscribe(),
                         restart_tx.clone(),
                         profile_connected.clone(),
