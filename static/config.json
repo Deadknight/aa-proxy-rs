@@ -152,11 +152,11 @@
         },
         "bt_sco_keep_bluetooth_alive": {
           "typ": "boolean",
-          "description": "When bt_sco is enabled, keep the Android Auto Bluetooth profile/RFCOMM connection alive after Wi-Fi bootstrap so the phone continues routing call audio to aa-proxy-rs. Default: true."
+          "description": "When bt_sco is enabled, keep the Android Auto Bluetooth profile/RFCOMM connection alive after Wi-Fi bootstrap so the phone continues routing call audio to aa-proxy-rs."
         },
         "bt_sco_media_bridge": {
           "typ": "boolean",
-          "description": "Experimental: bridge Bluetooth SCO call downlink into a selected Android Auto PCM sink. Requires MITM and bt_sco listener. Disabled by default."
+          "description": "Experimental: bridge Bluetooth SCO call downlink into a selected Android Auto PCM sink. Requires MITM and bt_sco listener."
         },
         "bt_sco_media_bridge_audio_type": {
           "typ": "string",
@@ -180,7 +180,7 @@
         },
         "bt_sco_mic_bridge": {
           "typ": "boolean",
-          "description": "Experimental: bridge Android Auto HU microphone/source PCM into Bluetooth SCO call uplink. Requires MITM and bt_sco listener. Disabled by default."
+          "description": "Experimental: bridge Android Auto HU microphone/source PCM into Bluetooth SCO call uplink. Requires MITM and bt_sco listener."
         },
         "bt_sco_mic_request": {
           "typ": "boolean",
