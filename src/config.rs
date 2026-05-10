@@ -589,6 +589,17 @@ impl AppConfig {
         if let Some(cmd) = &self.hu_button_handler {
             doc["hu_button_handler"] = value(cmd);
         }
+        doc["bt_sco"] = value(self.bt_sco);
+        doc["bt_sco_keep_bluetooth_alive"] = value(self.bt_sco_keep_bluetooth_alive);
+        doc["bt_sco_media_bridge"] = value(self.bt_sco_media_bridge);
+        doc["bt_sco_media_bridge_audio_type"] = value(self.bt_sco_media_bridge_audio_type.clone());
+        doc["bt_sco_media_bridge_gain_percent"] = value(self.bt_sco_media_bridge_gain_percent as i64);
+        doc["bt_sco_media_bridge_ring_capacity"] = value(self.bt_sco_media_bridge_ring_capacity as i64);
+        doc["bt_sco_media_bridge_start_existing"] = value(self.bt_sco_media_bridge_start_existing);
+        doc["bt_sco_media_bridge_stop_existing_on_disconnect"] = value(self.bt_sco_media_bridge_stop_existing_on_disconnect);
+        doc["bt_sco_mic_bridge"] = value(self.bt_sco_mic_bridge);
+        doc["bt_sco_mic_request"] = value(self.bt_sco_mic_request);
+        doc["bt_sco_mic_uplink_ring_capacity"] = value(self.bt_sco_mic_uplink_ring_capacity as i64);
         doc["wasm_hooks_dir"] = value(self.wasm_hooks_dir.display().to_string());
         doc["wasm_script_memory_limit_mb"] = value(self.wasm_script_memory_limit_mb as i64);
         doc["wasm_script_instance_limit"] = value(self.wasm_script_instance_limit as i64);
