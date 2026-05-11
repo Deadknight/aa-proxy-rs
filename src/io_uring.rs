@@ -639,7 +639,7 @@ pub async fn io_loop(
             ev_tx.clone(),
             Some(tx_hu.clone()),
             script_registry.clone(),
-            HashMap::new(),
+            persistent_media_sinks.clone(),
             ws_event_tx.clone(),
         ));
         from_stream = tokio_uring::spawn(proxy(
