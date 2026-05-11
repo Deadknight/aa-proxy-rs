@@ -306,20 +306,28 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
 
     // this is creating a reverse tcp bridge for Android
     // direct connection to the device side is not allowed
-    tokio::spawn(async move {
-        info!(
-            "{} starting TCP reverse connection, Android IP: {}",
-            NAME,
-            addr.ip()
+    // Note: this is only meaningful for MD/phone connections, not DHU emulator clients.
+    if !addr.ip().is_loopback() {
+        tokio::spawn(async move {
+            info!(
+                "{} starting TCP reverse connection, Android IP: {}",
+                NAME,
+                addr.ip()
+            );
+            // FIXME use port configured by user for webserver
+            // or ignore when webserver disabled...
+            tcp_bridge(
+                &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
+                "127.0.0.1:80",
+            )
+            .await;
+        });
+    } else {
+        debug!(
+            "{} skipping reverse tcp_bridge for localhost client ({})",
+            NAME, addr
         );
-        // FIXME use port configured by user for webserver
-        // or ignore when webserver disabled...
-        tcp_bridge(
-            &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
-            "127.0.0.1:80",
-        )
-        .await;
-    });
+    }
 
     tokio::spawn(async move {
         info!(
