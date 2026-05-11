@@ -13,6 +13,7 @@ use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
 use crate::ev::EV_MODEL_FILE;
 use crate::mitm::protos::KeyCode;
+use crate::mitm::send_byebye;
 use crate::mitm::send_input_key;
 use crate::mitm::send_key_event;
 use crate::mitm::send_rotary_event;
@@ -180,6 +181,7 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/bt/known-devices",
             get(bt_known_devices_handler).delete(bt_forget_known_devices_handler),
         )
+        .route("/disconnect", post(disconnect_handler))
         .with_state(state)
 }
 
@@ -644,6 +646,22 @@ fn generate_filename(kind: &str) -> String {
     let now = Local::now();
     now.format(&format!("%Y%m%d%H%M%S_aa-proxy-rs_{}.tar.gz", kind))
         .to_string()
+}
+
+async fn disconnect_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(tx) = state.tx.lock().await.clone() {
+        if let Err(e) = send_byebye(tx).await {
+            error!("{} ByeBye send error: {}", NAME, e);
+        }
+    } else {
+        warn!("{} disconnect requested but no active session", NAME);
+    }
+    state.config.write().await.action_requested = Some(Action::Reconnect);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from("Disconnect has been requested"))
+        .unwrap()
 }
 
 async fn restart_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
