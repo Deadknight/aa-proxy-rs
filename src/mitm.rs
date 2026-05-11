@@ -1771,7 +1771,7 @@ async fn read_input_data<A: Endpoint<A>>(
     rbuf: &mut VecDeque<u8>,
     obj: &mut IoDevice<A>,
     incremental_read: bool,
-) -> Result<()> {
+) -> Result<usize> {
     let mut newdata = vec![0u8; BUFFER_LEN];
     let mut n;
     let mut len;
@@ -1818,13 +1818,17 @@ async fn read_input_data<A: Endpoint<A>>(
                 .await
                 .context("read_input_data: TcpStreamIo timeout")?;
             len = n.context("read_input_data: TcpStreamIo read error")?;
+            if len == 0 {
+                // TCP EOF means the peer closed the connection; propagate as disconnect.
+                return Err("read_input_data: TcpStreamIo EOF".into());
+            }
         }
         _ => todo!(),
     }
     if len > 0 {
         rbuf.write(&newdata.slice(..len))?;
     }
-    Ok(())
+    Ok(len)
 }
 
 /// runtime musl detection
