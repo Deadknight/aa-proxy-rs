@@ -9,6 +9,10 @@ use crate::script_wasm::{
 };
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
+use crate::display::add_display_services;
+use crate::display::emulate_injected_media_packet;
+use crate::display::maybe_emit_pending_injected_focus;
+use crate::display::InjectedMediaState;
 use crate::vendor_ext::{
     add_vendor_extension_service, ensure_vendor_channel_open, ensure_vendor_topic_event_bridge,
     handle_vendor_channel_packet, has_vendor_extension_service, is_vendor_channel,
@@ -70,7 +74,7 @@ pub use crate::media_tap::{
 use crate::media_tap::{reassemble_media_packet, tap_media_message, MediaFrameBuffer};
 
 // module name for logging engine
-fn get_name(proxy_type: ProxyType) -> String {
+pub fn get_name(proxy_type: ProxyType) -> String {
     let proxy = match proxy_type {
         ProxyType::HeadUnit => "HU",
         ProxyType::MobileDevice => "MD",
