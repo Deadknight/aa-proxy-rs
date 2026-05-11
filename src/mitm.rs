@@ -157,6 +157,14 @@ pub enum PacketAction {
     SendBack,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketFlow {
+    /// Packet observed on endpoint reader path (device -> proxy).
+    FromEndpoint,
+    /// Packet observed on forwarding path (proxy -> endpoint).
+    ToEndpoint,
+}
+
 /// rust-openssl doesn't support BIO_s_mem
 /// This SslMemBuf is about to provide `Read` and `Write` implementations
 /// to be used with `openssl::ssl::SslStream`
@@ -429,6 +437,7 @@ async fn run_wasm_hooks(
 /// packet modification hook
 pub async fn pkt_modify_hook(
     proxy_type: ProxyType,
+    flow: PacketFlow,
     pkt: &mut Packet,
     ctx: &mut ModifyContext,
     tap_media: bool,
@@ -900,10 +909,11 @@ pub async fn pkt_modify_hook(
             return handle_vendor_channel_packet(pkt, ctx, vec_event_runtime).await;
         }
     }
+
     // trying to obtain an Enum from message_id
     debug!(
-        "message_id = {:04X}, {:?}, proxy_type: {:?}",
-        message_id, control, proxy_type
+        "message_id = {:04X}, {:?}, proxy_type: {:?}, flow: {:?}",
+        message_id, control, proxy_type, flow
     );
 
     // parsing data
@@ -2151,6 +2161,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         Some(mut pkt) = rx.recv() => {
             let action = pkt_modify_hook(
                 proxy_type,
+                PacketFlow::ToEndpoint,
                 &mut pkt,
                 &mut ctx,
                 false,
@@ -2205,6 +2216,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 Ok(_) => {
                     let action = pkt_modify_hook(
                         proxy_type,
+                        PacketFlow::FromEndpoint,
                         &mut pkt,
                         &mut ctx,
                         proxy_type == ProxyType::MobileDevice,
