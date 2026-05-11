@@ -1520,6 +1520,49 @@ pub async fn send_rotary_event(tx: Sender<Packet>, input_ch: u8, delta: i32) -> 
     Ok(())
 }
 
+/// Inject a key input event on AA input channel.
+/// FIXME: make single function from this and send_key_event above
+pub async fn send_input_key(
+    tx: Sender<Packet>,
+    input_ch: u8,
+    keycode: u32,
+    down: bool,
+    longpress: bool,
+) -> Result<()> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+
+    let mut key = key_event::Key::new();
+    key.set_keycode(keycode);
+    key.set_down(down);
+    key.set_metastate(0);
+    key.set_longpress(longpress);
+
+    let mut key_event = KeyEvent::new();
+    key_event.keys.push(key);
+
+    let mut input = InputReport::new();
+    input.set_timestamp(ts);
+    input.key_event = Some(key_event).into();
+
+    let mut payload: Vec<u8> = input.write_to_bytes()?;
+    payload.insert(0, ((INPUT_MESSAGE_INPUT_REPORT as u16) >> 8) as u8);
+    payload.insert(1, ((INPUT_MESSAGE_INPUT_REPORT as u16) & 0xff) as u8);
+
+    let pkt = Packet {
+        channel: input_ch,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    };
+    tx.send(pkt).await?;
+    info!(
+        "mitm/web: injecting INPUT_REPORT key packet (keycode={}, down={}, longpress={})...",
+        keycode, down, longpress
+    );
+
+    Ok(())
+}
+
 pub async fn send_odometer_data(
     tx: Sender<Packet>,
     sensor_ch: u8,

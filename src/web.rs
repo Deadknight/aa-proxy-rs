@@ -13,6 +13,7 @@ use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
 use crate::ev::EV_MODEL_FILE;
 use crate::mitm::protos::KeyCode;
+use crate::mitm::send_input_key;
 use crate::mitm::send_key_event;
 use crate::mitm::send_rotary_event;
 use crate::mitm::Packet;
@@ -154,6 +155,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tire-pressure-status", get(tire_pressure_status_handler))
         .route("/inject_event", post(inject_event_handler))
         .route("/inject_rotary", post(inject_rotary_handler))
+        .route("/input/key", post(input_key_handler))
         .route("/userdata-backup", get(userdata_backup_handler))
         .route("/userdata-restore", post(userdata_restore_handler))
         .route("/factory-reset", post(factory_reset_handler))
@@ -535,6 +537,64 @@ pub async fn inject_rotary_handler(
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "No input channel available yet",
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, "OK").into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InputKeyRequest {
+    pub keycode: u32,
+    pub down: Option<bool>,
+    pub longpress: Option<bool>,
+}
+
+pub async fn input_key_handler(
+    State(state): State<Arc<AppState>>,
+    Json(data): Json<InputKeyRequest>,
+) -> impl IntoResponse {
+    let Some(input_ch) = *state.input_channel.lock().await else {
+        warn!(
+            "{} Not sending key packet because no input channel yet",
+            NAME
+        );
+        return (StatusCode::SERVICE_UNAVAILABLE, "No input channel yet").into_response();
+    };
+
+    let Some(tx) = state.tx.lock().await.clone() else {
+        warn!("{} Not sending key packet because tx is unavailable", NAME);
+        return (StatusCode::SERVICE_UNAVAILABLE, "No active session tx").into_response();
+    };
+
+    let down = data.down.unwrap_or(true);
+    let longpress = data.longpress.unwrap_or(false);
+
+    if data.down.is_none() {
+        // Default behavior is a tap: press and release.
+        if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, true, longpress).await {
+            error!("{} Input key send (down) error: {}", NAME, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to send key event",
+            )
+                .into_response();
+        }
+        if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, false, longpress).await {
+            error!("{} Input key send (up) error: {}", NAME, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to send key event",
+            )
+                .into_response();
+        }
+    } else if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, down, longpress).await
+    {
+        error!("{} Input key send error: {}", NAME, e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to send key event",
         )
             .into_response();
     }
