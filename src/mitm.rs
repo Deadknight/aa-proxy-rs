@@ -114,6 +114,20 @@ pub struct ModifyContext {
     /// Per-channel reassembly state for tapped media messages that span multiple
     /// AA transport frames.
     pub(crate) media_fragments: HashMap<u8, MediaFrameBuffer>,
+    /// Original HU-advertised services from ServiceDiscoveryResponse.
+    pub(crate) hu_service_ids: HashSet<i32>,
+    /// Services synthesized by aa-proxy-rs and exposed only to the phone side.
+    pub(crate) injected_service_ids: HashSet<i32>,
+    /// Channels corresponding to injected services that must never be forwarded to HU.
+    pub(crate) injected_channels: HashSet<u8>,
+    /// Injected media service_id/channel -> display type.
+    pub(crate) injected_media_display: HashMap<u8, DisplayType>,
+    /// Per-channel media state for injected virtual sinks (hidden from HU).
+    pub(crate) injected_media_state: HashMap<u8, InjectedMediaState>,
+    /// Last observed tap client connection generation by media channel.
+    pub(crate) injected_media_connect_gen: HashMap<u8, u64>,
+    /// Last observed tap-consumer presence by media channel.
+    pub(crate) injected_media_had_tap_client: HashMap<u8, bool>,
     /// VEC service ids injected by aa-proxy-rs into the service discovery response.
     pub(crate) vendor_service_ids: HashSet<u8>,
     /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
@@ -2151,6 +2165,13 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         media_sinks,
         media_channels: HashMap::new(),
         media_fragments: HashMap::new(),
+        hu_service_ids: HashSet::new(),
+        injected_service_ids: HashSet::new(),
+        injected_channels: HashSet::new(),
+        injected_media_display: HashMap::new(),
+        injected_media_state: HashMap::new(),
+        injected_media_connect_gen: HashMap::new(),
+        injected_media_had_tap_client: HashMap::new(),
         vendor_service_ids: HashSet::new(),
         vendor_channel_states: HashMap::new(),
         vendor_topic_event_bridges: HashMap::new(),
@@ -2270,6 +2291,13 @@ mod tests {
             media_sinks: HashMap::new(),
             media_channels: HashMap::new(),
             media_fragments: HashMap::new(),
+            hu_service_ids: HashSet::new(),
+            injected_service_ids: HashSet::new(),
+            injected_channels: HashSet::new(),
+            injected_media_display: HashMap::new(),
+            injected_media_state: HashMap::new(),
+            injected_media_connect_gen: HashMap::new(),
+            injected_media_had_tap_client: HashMap::new(),
             vendor_service_ids: HashSet::new(),
             vendor_channel_states: HashMap::new(),
             vendor_topic_event_bridges: HashMap::new(),
