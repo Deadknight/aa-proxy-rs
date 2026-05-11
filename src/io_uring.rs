@@ -214,14 +214,38 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
             "{} tcp_bridge: before connect, local={} remote={}",
             NAME, local_addr, remote_addr
         );
-        match TokioTcpStream::connect(remote_addr).await {
-            Ok(mut remote) => {
+        match timeout(Duration::from_secs(3), TokioTcpStream::connect(remote_addr)).await {
+            Err(_) => {
+                warn!(
+                    "{} tcp_bridge: timeout connecting to remote server {}",
+                    NAME, remote_addr
+                );
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    "{} tcp_bridge: failed to connect to remote server {}: {}",
+                    NAME, remote_addr, e
+                );
+            }
+            Ok(Ok(mut remote)) => {
                 debug!(
                     "{} tcp_bridge: remote side connected: ({})",
                     NAME, remote_addr
                 );
-                match TokioTcpStream::connect(local_addr).await {
-                    Ok(mut local) => {
+                match timeout(Duration::from_secs(3), TokioTcpStream::connect(local_addr)).await {
+                    Err(_) => {
+                        warn!(
+                            "{} tcp_bridge: timeout connecting to local server {}",
+                            NAME, local_addr
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        debug!(
+                            "{} tcp_bridge: failed to connect to local server {}: {}",
+                            NAME, local_addr, e
+                        );
+                    }
+                    Ok(Ok(mut local)) => {
                         debug!(
                             "{} tcp_bridge: local side connected: ({})",
                             NAME, local_addr
@@ -239,19 +263,7 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
                             }
                         }
                     }
-                    Err(e) => {
-                        debug!(
-                            "{} tcp_bridge: Failed to connect to local server {}: {}",
-                            NAME, local_addr, e
-                        );
-                    }
                 }
-            }
-            Err(e) => {
-                debug!(
-                    "{} tcp_bridge: Failed to connect to remote server {}: {}",
-                    NAME, remote_addr, e
-                );
             }
         }
 
