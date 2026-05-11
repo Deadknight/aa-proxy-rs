@@ -739,6 +739,8 @@ pub async fn io_loop(
         *tx_lock = None;
         let mut sc_lock = sensor_channel.lock().await;
         *sc_lock = None;
+        let mut ic_lock = input_channel.lock().await;
+        *ic_lock = None;
         // stop EV battery logger if neded
         if config.ev_battery_logger.is_some() {
             ev_tx.send(EvTaskCommand::Stop).await?;
