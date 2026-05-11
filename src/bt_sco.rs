@@ -1,3 +1,4 @@
+use crate::config::BtScoMediaBridgeResampler;
 use simplelog::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
@@ -30,8 +31,15 @@ pub const AA_MEDIA_PCM_TARGET_CHUNK_BYTES: usize = 48_000 * 2 * 2 / 50;
 const DEFAULT_AA_PCM_RING_CAPACITY: usize = 128;
 pub const SCO_UPLINK_PACKET_BYTES: usize = 60;
 const DEFAULT_SCO_UPLINK_RING_CAPACITY: usize = 256;
+const SCO_DOWNLINK_AUDIO_LOG_PEAK_THRESHOLD: i16 = 64;
 
-static AA_PCM_RING: OnceLock<Arc<Mutex<VecDeque<Vec<u8>>>>> = OnceLock::new();
+#[derive(Debug, Clone)]
+pub struct AaPcmFrame {
+    pub generation: u64,
+    pub pcm: Vec<u8>,
+}
+
+static AA_PCM_RING: OnceLock<Arc<Mutex<VecDeque<AaPcmFrame>>>> = OnceLock::new();
 static SCO_UPLINK_RING: OnceLock<Arc<Mutex<VecDeque<Vec<u8>>>>> = OnceLock::new();
 static SCO_UPLINK_PENDING: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
 static SCO_CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -46,6 +54,10 @@ pub struct BtScoOptions {
     /// Maximum number of converted AA PCM chunks held in the bridge ring.
     /// Old chunks are dropped first to keep latency bounded.
     pub bridge_ring_capacity: usize,
+    /// SCO 8 kHz -> AA 48 kHz resampler used for downlink conversion.
+    /// `Repeat` preserves the original proven behavior; `Linear` smooths the
+    /// integer 6x upsampling and can reduce roughness/crackle.
+    pub media_resampler: BtScoMediaBridgeResampler,
     /// Write HU microphone PCM frames back to the SCO/eSCO socket as uplink.
     /// When enabled, silence is written if no mic frame is available yet, so the
     /// phone keeps receiving a steady SCO uplink stream.
@@ -229,7 +241,7 @@ pub fn spawn(options: BtScoOptions) -> io::Result<thread::JoinHandle<()>> {
 fn run(options: BtScoOptions) -> io::Result<()> {
     let listener = create_sco_listener()?;
 
-    debug!(
+    info!(
         "{} listening for incoming SCO/eSCO audio, bridge_aa_media_pcm={}, media_ring_capacity={}, bridge_sco_uplink_pcm={}, uplink_ring_capacity={}",
         NAME,
         options.bridge_aa_media_pcm,
@@ -262,10 +274,11 @@ fn run(options: BtScoOptions) -> io::Result<()> {
         }
 
         let generation = SCO_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        clear_aa_pcm_queue();
         SCO_CONNECTED.store(true, Ordering::SeqCst);
         clear_sco_uplink_queue();
 
-        debug!(
+        info!(
             "{} SCO/eSCO connected from {}, generation={}",
             NAME,
             format_bdaddr(peer.sco_bdaddr),
@@ -273,9 +286,10 @@ fn run(options: BtScoOptions) -> io::Result<()> {
         );
         log_sco_socket_info(fd);
 
-        handle_sco_connection(fd, &options);
+        handle_sco_connection(fd, &options, generation);
 
         SCO_CONNECTED.store(false, Ordering::SeqCst);
+        clear_aa_pcm_queue();
         clear_sco_uplink_queue();
     }
 }
@@ -321,13 +335,21 @@ fn create_sco_listener() -> io::Result<RawFd> {
     Ok(fd)
 }
 
-fn handle_sco_connection(fd: RawFd, options: &BtScoOptions) {
+fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
     let started = Instant::now();
 
     let mut buf = [0u8; 2048];
     let mut stats = ScoStats::default();
     let mut last_log = Instant::now();
     let mut aa_pcm_chunk: Vec<u8> = Vec::with_capacity(AA_MEDIA_PCM_TARGET_CHUNK_BYTES * 2);
+    let mut downlink_resampler_state = DownlinkResamplerState::default();
+    let mut audio_window_peak = 0i16;
+    let mut audio_window_energy = 0u128;
+    let mut audio_window_samples = 0u64;
+    let mut audio_window_silent_packets = 0u64;
+    let mut audio_window_non_silent_packets = 0u64;
+    let mut first_non_silent_at: Option<Instant> = None;
+    let mut first_non_silent_packet = 0u64;
 
     loop {
         let n = unsafe {
@@ -346,12 +368,34 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions) {
         }
 
         if n == 0 {
-            debug!("{} SCO EOF", NAME);
+            info!("{} SCO EOF", NAME);
             break;
         }
 
         let n = n as usize;
         stats.observe(n, now);
+        let (packet_peak, packet_energy, packet_samples, packet_rms) = audio_metrics_s16le(&buf[..n]);
+        audio_window_peak = audio_window_peak.max(packet_peak);
+        audio_window_energy = audio_window_energy.saturating_add(packet_energy);
+        audio_window_samples = audio_window_samples.saturating_add(packet_samples);
+        if packet_peak >= SCO_DOWNLINK_AUDIO_LOG_PEAK_THRESHOLD {
+            audio_window_non_silent_packets += 1;
+            if first_non_silent_at.is_none() {
+                first_non_silent_at = Some(now);
+                first_non_silent_packet = stats.packets;
+                info!(
+                    "{} first non-silent SCO downlink packet: packet={}, after={}ms, peak={}, rms={:.1}, threshold={}",
+                    NAME,
+                    first_non_silent_packet,
+                    now.duration_since(started).as_millis(),
+                    packet_peak,
+                    packet_rms,
+                    SCO_DOWNLINK_AUDIO_LOG_PEAK_THRESHOLD
+                );
+            }
+        } else {
+            audio_window_silent_packets += 1;
+        }
 
         if stats.packets <= 10 {
             debug!(
@@ -364,9 +408,18 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions) {
         }
 
         if options.bridge_aa_media_pcm {
-            sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(&buf[..n], &mut aa_pcm_chunk);
+            sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(
+                &buf[..n],
+                &mut aa_pcm_chunk,
+                options.media_resampler,
+                &mut downlink_resampler_state,
+            );
             if aa_pcm_chunk.len() >= AA_MEDIA_PCM_TARGET_CHUNK_BYTES {
-                push_aa_pcm_frame(std::mem::take(&mut aa_pcm_chunk), options.bridge_ring_capacity);
+                push_aa_pcm_frame(
+                    std::mem::take(&mut aa_pcm_chunk),
+                    options.bridge_ring_capacity,
+                    generation,
+                );
             }
         }
 
@@ -390,25 +443,45 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions) {
         }
 
         if last_log.elapsed() >= Duration::from_secs(5) {
-            debug!(
-                "{} SCO active: {}, elapsed={}s",
+            let window_rms = rms_from_energy(audio_window_energy, audio_window_samples);
+            let first_audio_ms = first_non_silent_at
+                .map(|t| t.duration_since(started).as_millis().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            info!(
+                "{} SCO active: {}, audio_window[peak={}, rms={:.1}, non_silent_packets={}, silent_packets={}, first_audio_ms={}, first_audio_packet={}], elapsed={}s",
                 NAME,
                 stats.summary(started),
+                audio_window_peak,
+                window_rms,
+                audio_window_non_silent_packets,
+                audio_window_silent_packets,
+                first_audio_ms,
+                first_non_silent_packet,
                 started.elapsed().as_secs()
             );
+            audio_window_peak = 0;
+            audio_window_energy = 0;
+            audio_window_samples = 0;
+            audio_window_silent_packets = 0;
+            audio_window_non_silent_packets = 0;
             last_log = Instant::now();
         }
     }
 
     if options.bridge_aa_media_pcm && !aa_pcm_chunk.is_empty() {
-        push_aa_pcm_frame(std::mem::take(&mut aa_pcm_chunk), options.bridge_ring_capacity);
+        debug!(
+            "{} dropping trailing partial AA PCM chunk on SCO disconnect: generation={}, bytes={}",
+            NAME,
+            generation,
+            aa_pcm_chunk.len()
+        );
     }
 
     unsafe {
         libc::close(fd);
     }
 
-    debug!(
+    info!(
         "{} SCO disconnected: {}, elapsed={}s",
         NAME,
         stats.summary(started),
@@ -416,7 +489,7 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions) {
     );
 }
 
-fn enable_aa_pcm_ring() -> Arc<Mutex<VecDeque<Vec<u8>>>> {
+fn enable_aa_pcm_ring() -> Arc<Mutex<VecDeque<AaPcmFrame>>> {
     AA_PCM_RING
         .get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
         .clone()
@@ -430,8 +503,8 @@ fn effective_ring_capacity(capacity: usize) -> usize {
     }
 }
 
-fn push_aa_pcm_frame(frame: Vec<u8>, capacity: usize) {
-    if frame.is_empty() {
+fn push_aa_pcm_frame(frame: Vec<u8>, capacity: usize, generation: u64) {
+    if frame.is_empty() || generation == 0 {
         return;
     }
 
@@ -441,12 +514,58 @@ fn push_aa_pcm_frame(frame: Vec<u8>, capacity: usize) {
     while q.len() >= capacity {
         q.pop_front();
     }
-    q.push_back(frame);
+    q.push_back(AaPcmFrame { generation, pcm: frame });
 }
 
-pub fn pop_aa_pcm_frame() -> Option<Vec<u8>> {
+pub fn pop_aa_pcm_frame() -> Option<AaPcmFrame> {
     let ring = AA_PCM_RING.get()?;
     ring.lock().unwrap().pop_front()
+}
+
+pub fn pop_aa_pcm_frame_for_generation(generation: u64) -> Option<AaPcmFrame> {
+    let ring = AA_PCM_RING.get()?;
+    let mut q = ring.lock().unwrap();
+
+    while let Some(frame) = q.pop_front() {
+        if frame.generation == generation {
+            return Some(frame);
+        }
+        debug!(
+            "{} discarding stale AA PCM frame: frame_generation={}, active_generation={}, bytes={}",
+            NAME,
+            frame.generation,
+            generation,
+            frame.pcm.len()
+        );
+    }
+
+    None
+}
+
+pub fn aa_pcm_frame_count() -> usize {
+    AA_PCM_RING
+        .get()
+        .map(|ring| ring.lock().unwrap().len())
+        .unwrap_or(0)
+}
+
+pub fn aa_pcm_frame_count_for_generation(generation: u64) -> usize {
+    AA_PCM_RING
+        .get()
+        .map(|ring| {
+            ring.lock()
+                .unwrap()
+                .iter()
+                .filter(|frame| frame.generation == generation)
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+pub fn clear_aa_pcm_queue() {
+    if let Some(ring) = AA_PCM_RING.get() {
+        ring.lock().unwrap().clear();
+    }
 }
 
 fn enable_sco_uplink_ring() -> Arc<Mutex<VecDeque<Vec<u8>>>> {
@@ -575,14 +694,39 @@ pub fn push_sco_uplink_pcm_from_aa_mic(
     }
 }
 
+
+fn audio_metrics_s16le(input: &[u8]) -> (i16, u128, u64, f64) {
+    let mut peak = 0i16;
+    let mut energy = 0u128;
+    let mut samples = 0u64;
+
+    for chunk in input.chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+        let abs = sample.unsigned_abs().min(i16::MAX as u32) as i16;
+        peak = peak.max(abs);
+        energy = energy.saturating_add((sample as i128 * sample as i128) as u128);
+        samples += 1;
+    }
+
+    (peak, energy, samples, rms_from_energy(energy, samples))
+}
+
+fn rms_from_energy(energy: u128, samples: u64) -> f64 {
+    if samples == 0 {
+        0.0
+    } else {
+        ((energy as f64) / samples as f64).sqrt()
+    }
+}
+
 fn log_sco_socket_info(fd: RawFd) {
     match getsockopt_value::<ScoOptions>(fd, SOL_SCO, SCO_OPTIONS) {
-        Ok(v) => debug!("{} SCO_OPTIONS mtu={}", NAME, v.mtu),
+        Ok(v) => info!("{} SCO_OPTIONS mtu={}", NAME, v.mtu),
         Err(e) => debug!("{} SCO_OPTIONS unavailable: {}", NAME, e),
     }
 
     match getsockopt_value::<ScoConnInfo>(fd, SOL_SCO, SCO_CONNINFO) {
-        Ok(v) => debug!(
+        Ok(v) => info!(
             "{} SCO_CONNINFO hci_handle=0x{:04x} dev_class={:02x}:{:02x}:{:02x}",
             NAME,
             v.hci_handle,
@@ -594,7 +738,7 @@ fn log_sco_socket_info(fd: RawFd) {
     }
 
     match getsockopt_value::<BtVoice>(fd, SOL_BLUETOOTH, BT_VOICE) {
-        Ok(v) => debug!(
+        Ok(v) => info!(
             "{} BT_VOICE setting=0x{:04x} ({})",
             NAME,
             v.setting,
@@ -604,12 +748,12 @@ fn log_sco_socket_info(fd: RawFd) {
     }
 
     match getsockopt_int(fd, SOL_BLUETOOTH, BT_RCVMTU) {
-        Ok(v) => debug!("{} BT_RCVMTU={}", NAME, v),
+        Ok(v) => info!("{} BT_RCVMTU={}", NAME, v),
         Err(e) => debug!("{} BT_RCVMTU unavailable: {}", NAME, e),
     }
 
     match getsockopt_int(fd, SOL_BLUETOOTH, BT_SNDMTU) {
-        Ok(v) => debug!("{} BT_SNDMTU={}", NAME, v),
+        Ok(v) => info!("{} BT_SNDMTU={}", NAME, v),
         Err(e) => debug!("{} BT_SNDMTU unavailable: {}", NAME, e),
     }
 }
@@ -667,14 +811,24 @@ pub const AA_MEDIA_PCM_SAMPLE_RATE_HZ: u32 = 48_000;
 pub const AA_MEDIA_PCM_CHANNELS: u16 = 2;
 pub const AA_MEDIA_PCM_BITS_PER_SAMPLE: u16 = 16;
 
+#[derive(Debug, Default)]
+pub struct DownlinkResamplerState {
+    last_sample: Option<i16>,
+}
+
 /// Convert one chunk of SCO linear PCM (`s16le`, mono, 8 kHz) into the
 /// simplest AA media PCM shape (`s16le`, stereo, 48 kHz).
 ///
-/// This intentionally uses a dependency-free 6x nearest-neighbour upsampler.
-/// It is good enough for the first bridge test because 8 kHz -> 48 kHz is an
-/// exact integer ratio. We can replace it with a proper speech resampler later
-/// after the AA media channel injection is proven.
-pub fn sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(input: &[u8], output: &mut Vec<u8>) {
+/// The default `Repeat` mode preserves the proven first implementation: each
+/// 8 kHz sample becomes six identical 48 kHz stereo frames. `Linear` keeps the
+/// same output size/timing but interpolates between adjacent samples, which can
+/// reduce rough edges without pulling in a resampler dependency.
+pub fn sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    resampler: BtScoMediaBridgeResampler,
+    state: &mut DownlinkResamplerState,
+) {
     let even_len = input.len() & !1;
 
     // Each input i16 sample becomes 6 stereo frames.
@@ -682,12 +836,41 @@ pub fn sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(input: &[u8], output: &mut V
     output.reserve((even_len / 2) * 24);
 
     for sample in input[..even_len].chunks_exact(2) {
-        for _ in 0..6 {
-            // Left
-            output.extend_from_slice(sample);
-            // Right
-            output.extend_from_slice(sample);
+        let current = i16::from_le_bytes([sample[0], sample[1]]);
+        match resampler {
+            BtScoMediaBridgeResampler::Repeat => {
+                push_stereo_repeated_sample(output, current);
+            }
+            BtScoMediaBridgeResampler::Linear => {
+                let previous = state.last_sample.unwrap_or(current);
+                push_stereo_linear_6x(output, previous, current);
+            }
         }
+        state.last_sample = Some(current);
+    }
+}
+
+fn push_stereo_repeated_sample(output: &mut Vec<u8>, sample: i16) {
+    let bytes = sample.to_le_bytes();
+    for _ in 0..6 {
+        output.extend_from_slice(&bytes);
+        output.extend_from_slice(&bytes);
+    }
+}
+
+fn push_stereo_linear_6x(output: &mut Vec<u8>, previous: i16, current: i16) {
+    let previous = previous as i32;
+    let current = current as i32;
+    let delta = current - previous;
+
+    // Six output frames bridge the previous sample to the current sample.
+    // step=6 lands exactly on `current`, preserving timing and chunk size.
+    for step in 1..=6 {
+        let interpolated = previous + (delta * step) / 6;
+        let sample = interpolated.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let bytes = sample.to_le_bytes();
+        output.extend_from_slice(&bytes);
+        output.extend_from_slice(&bytes);
     }
 }
 
@@ -710,7 +893,12 @@ mod tests {
         let input = [0x01, 0x00, 0x02, 0x00];
         let mut output = Vec::new();
 
-        sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(&input, &mut output);
+        sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(
+            &input,
+            &mut output,
+            BtScoMediaBridgeResampler::Repeat,
+            &mut DownlinkResamplerState::default(),
+        );
 
         // 2 mono samples * 6x upsample * 2 stereo channels * 2 bytes.
         assert_eq!(output.len(), 48);
@@ -731,7 +919,12 @@ mod tests {
         let input = [0x01, 0x00, 0xff];
         let mut output = Vec::new();
 
-        sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(&input, &mut output);
+        sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(
+            &input,
+            &mut output,
+            BtScoMediaBridgeResampler::Repeat,
+            &mut DownlinkResamplerState::default(),
+        );
 
         assert_eq!(output.len(), 24);
     }

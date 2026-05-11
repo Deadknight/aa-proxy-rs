@@ -246,6 +246,7 @@ async fn tokio_main(
         match bt_sco::spawn(BtScoOptions {
             bridge_aa_media_pcm: cfg.bt_sco_media_bridge,
             bridge_ring_capacity: cfg.bt_sco_media_bridge_ring_capacity,
+            media_resampler: cfg.bt_sco_media_bridge_resampler,
             bridge_sco_uplink_pcm: cfg.bt_sco_mic_bridge,
             sco_uplink_ring_capacity: cfg.bt_sco_mic_uplink_ring_capacity,
         }) {
