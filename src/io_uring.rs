@@ -47,6 +47,8 @@ const TCP_CLIENT_TIMEOUT: Duration = Duration::new(30, 0);
 const COMP_APP_TCP_PORT: u16 = 9999;
 const COMP_APP_TCP_PORT_WS: u16 = 9998;
 const COMP_APP_TCP_PORT_SWUPDATE: u16 = 9997;
+// Original queue depth was 10. Keep this small to avoid queue-induced latency.
+const MITM_QUEUE_CAPACITY: usize = 10;
 
 use crate::config::{Action, SharedConfig};
 use crate::config::{TCP_DHU_PORT, TCP_SERVER_PORT};
@@ -546,10 +548,14 @@ pub async fn io_loop(
         let mut hu_tcp_stream = None;
 
         // MITM/proxy mpsc channels:
-        let (tx_hu, rx_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (tx_md, rx_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (txr_hu, rxr_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (txr_md, rxr_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
+        // Keep enough in-flight capacity so reader tasks do not stall under bursty
+        // media traffic and starve control-channel forwarding.
+        let (tx_hu, rx_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (tx_md, rx_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (txr_hu, rxr_md): (Sender<Packet>, Receiver<Packet>) =
+            mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (txr_md, rxr_hu): (Sender<Packet>, Receiver<Packet>) =
+            mpsc::channel(MITM_QUEUE_CAPACITY);
 
         // selecting I/O device for reading and writing
         // and creating desired objects for proxy functions
