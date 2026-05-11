@@ -889,8 +889,6 @@ pub async fn pkt_modify_hook(
             };
             return handle_vendor_channel_packet(pkt, ctx, vec_event_runtime).await;
         }
-
-        return Ok(PacketAction::Forward);
     }
     // trying to obtain an Enum from message_id
     let control = protos::ControlMessageType::from_i32(message_id);
