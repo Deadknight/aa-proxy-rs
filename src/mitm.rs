@@ -335,6 +335,7 @@ pub async fn pkt_debug(
         MESSAGE_AUTH_COMPLETE => &AuthResponse::parse_from_bytes(data)?,
         MESSAGE_SERVICE_DISCOVERY_REQUEST => &ServiceDiscoveryRequest::parse_from_bytes(data)?,
         MESSAGE_SERVICE_DISCOVERY_RESPONSE => &ServiceDiscoveryResponse::parse_from_bytes(data)?,
+        MESSAGE_SERVICE_DISCOVERY_UPDATE => &ServiceDiscoveryUpdate::parse_from_bytes(data)?,
         MESSAGE_PING_REQUEST => &PingRequest::parse_from_bytes(data)?,
         MESSAGE_PING_RESPONSE => &PingResponse::parse_from_bytes(data)?,
         MESSAGE_NAV_FOCUS_REQUEST => &NavFocusRequestNotification::parse_from_bytes(data)?,
