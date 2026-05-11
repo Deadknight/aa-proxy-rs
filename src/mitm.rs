@@ -810,6 +810,16 @@ pub async fn pkt_modify_hook(
         }
     }
 
+    let control = protos::ControlMessageType::from_i32(message_id);
+    let control_allowed_on_service_channel = matches!(
+        control,
+        Some(MESSAGE_CHANNEL_OPEN_REQUEST | MESSAGE_CHANNEL_OPEN_RESPONSE)
+    );
+
+    if pkt.channel != 0 && !control_allowed_on_service_channel {
+        return Ok(PacketAction::Forward);
+    }
+
     if pkt.channel != 0 {
         // Non-zero channel AAP lifecycle/control frame.
         // Keep this separate from our custom vendor app-data parser.
@@ -891,7 +901,6 @@ pub async fn pkt_modify_hook(
         }
     }
     // trying to obtain an Enum from message_id
-    let control = protos::ControlMessageType::from_i32(message_id);
     debug!(
         "message_id = {:04X}, {:?}, proxy_type: {:?}",
         message_id, control, proxy_type
