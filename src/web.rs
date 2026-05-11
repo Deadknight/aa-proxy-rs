@@ -16,6 +16,7 @@ use crate::mitm::protos::KeyCode;
 use crate::mitm::send_input_key;
 use crate::mitm::send_key_event;
 use crate::mitm::send_rotary_event;
+use crate::mitm::send_toll_card;
 use crate::mitm::Packet;
 use crate::mitm::Result;
 use crate::mitm::{send_odometer_data, OdometerData};
@@ -155,6 +156,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tire-pressure-status", get(tire_pressure_status_handler))
         .route("/inject_event", post(inject_event_handler))
         .route("/inject_rotary", post(inject_rotary_handler))
+        .route("/toll-card/add", post(toll_card_add_handler))
+        .route("/toll-card/remove", post(toll_card_remove_handler))
         .route("/input/key", post(input_key_handler))
         .route("/userdata-backup", get(userdata_backup_handler))
         .route("/userdata-restore", post(userdata_restore_handler))
@@ -542,6 +545,41 @@ pub async fn inject_rotary_handler(
     }
 
     (StatusCode::OK, "OK").into_response()
+}
+
+async fn send_toll_card_from_web(state: Arc<AppState>, is_card_present: bool) -> impl IntoResponse {
+    if let Some(ch) = *state.sensor_channel.lock().await {
+        if let Some(tx) = state.tx.lock().await.clone() {
+            if let Err(e) = send_toll_card(tx.clone(), ch, is_card_present).await {
+                error!("{} Toll card send error: {}", NAME, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to send toll card data",
+                )
+                    .into_response();
+            }
+            return (StatusCode::OK, "OK").into_response();
+        }
+        warn!(
+            "{} Not sending toll card packet because tx is unavailable",
+            NAME
+        );
+        return (StatusCode::SERVICE_UNAVAILABLE, "No active session tx").into_response();
+    }
+
+    warn!(
+        "{} Not sending toll card packet because no sensor channel yet",
+        NAME
+    );
+    (StatusCode::SERVICE_UNAVAILABLE, "No sensor channel yet").into_response()
+}
+
+pub async fn toll_card_add_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    send_toll_card_from_web(state, true).await
+}
+
+pub async fn toll_card_remove_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    send_toll_card_from_web(state, false).await
 }
 
 #[derive(Debug, Deserialize)]

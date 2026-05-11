@@ -1563,6 +1563,38 @@ pub async fn send_input_key(
     Ok(())
 }
 
+/// Inject toll card presence data via sensor batch.
+pub async fn send_toll_card(
+    tx: Sender<Packet>,
+    sensor_ch: u8,
+    is_card_present: bool,
+) -> Result<()> {
+    let mut msg = SensorBatch::new();
+    let mut toll = TollCardData::new();
+    toll.set_is_card_present(is_card_present);
+    msg.toll_card_data.push(toll);
+
+    // creating back binary data for sending
+    let mut payload: Vec<u8> = msg.write_to_bytes()?;
+    // add SENSOR header
+    payload.insert(0, ((SENSOR_MESSAGE_BATCH as u16) >> 8) as u8);
+    payload.insert(1, ((SENSOR_MESSAGE_BATCH as u16) & 0xff) as u8);
+
+    let pkt = Packet {
+        channel: sensor_ch,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    };
+    tx.send(pkt).await?;
+    info!(
+        "mitm/web: injecting TOLL_CARD_DATA packet (is_card_present={})...",
+        is_card_present
+    );
+
+    Ok(())
+}
+
 pub async fn send_odometer_data(
     tx: Sender<Packet>,
     sensor_ch: u8,
