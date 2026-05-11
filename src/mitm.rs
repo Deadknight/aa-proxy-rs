@@ -1848,13 +1848,22 @@ pub async fn endpoint_reader<A: Endpoint<A>>(
         read_input_data(&mut rbuf, &mut device, incremental_read).await?;
         // check if we have complete packet available
         loop {
-            if rbuf.len() > HEADER_LENGTH {
+            // Accept packets as soon as we have the complete fixed header.
+            // Using >= is required for valid zero-payload frames (frame_size == HEADER_LENGTH).
+            if rbuf.len() >= HEADER_LENGTH {
                 let channel = rbuf[0];
                 let flags = rbuf[1];
+
+                // FIRST frames carry an extended 8-byte header. If only 4 bytes
+                // are buffered, wait for the remaining header bytes before parsing.
+                if (flags & FRAME_TYPE_MASK) == FRAME_TYPE_FIRST && rbuf.len() < 8 {
+                    break;
+                }
+
                 let mut header_size = HEADER_LENGTH;
                 let mut final_length = None;
                 let payload_size = (rbuf[3] as u16 + ((rbuf[2] as u16) << 8)) as usize;
-                if rbuf.len() > 8 && (flags & FRAME_TYPE_MASK) == FRAME_TYPE_FIRST {
+                if rbuf.len() >= 8 && (flags & FRAME_TYPE_MASK) == FRAME_TYPE_FIRST {
                     header_size += 4;
                     final_length = Some(
                         ((rbuf[4] as u32) << 24)
