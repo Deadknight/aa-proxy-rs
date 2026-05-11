@@ -1,6 +1,7 @@
 use protobuf::Enum;
 use simplelog::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
@@ -47,6 +48,8 @@ pub struct MediaSink {
     codec_cfg: Arc<tokio::sync::Mutex<Option<Arc<Vec<u8>>>>>,
     /// Stream metadata learned from ServiceDiscovery.
     stream_info: Arc<tokio::sync::Mutex<Option<MediaStreamInfo>>>,
+    /// Monotonic counter bumped each time a TCP client connects to this sink.
+    client_connect_gen: Arc<AtomicU64>,
 }
 
 impl MediaSink {
@@ -56,6 +59,7 @@ impl MediaSink {
             tx,
             codec_cfg: Arc::new(tokio::sync::Mutex::new(None)),
             stream_info: Arc::new(tokio::sync::Mutex::new(None)),
+            client_connect_gen: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -97,6 +101,18 @@ impl MediaSink {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<(u64, Vec<u8>)>> {
         self.tx.subscribe()
+    }
+
+    pub fn has_subscribers(&self) -> bool {
+        self.tx.receiver_count() > 0
+    }
+
+    pub fn note_client_connected(&self) {
+        self.client_connect_gen.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn client_connect_generation(&self) -> u64 {
+        self.client_connect_gen.load(Ordering::Relaxed)
     }
 
     pub async fn get_codec_cfg(&self) -> Option<Arc<Vec<u8>>> {
@@ -328,6 +344,7 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_f
                     };
 
                     if let MediaStreamKind::Audio { codec, .. } = stream_info.kind {
+                        sink.note_client_connected();
                         let ts_kind = match codec {
                             MediaCodecType::MEDIA_CODEC_AUDIO_PCM => TsStreamKind::AudioPcm,
                             _ => TsStreamKind::AudioAacAdts,
@@ -343,6 +360,9 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_f
                             return;
                         }
                         let mut rx = sink.subscribe();
+                        let mut first_audio_frame_at: Option<Instant> = None;
+                        let mut lag_events: u64 = 0;
+                        let mut lagged_frames: u64 = 0;
                         let mut psi_ticker =
                             tokio::time::interval(std::time::Duration::from_secs(2));
                         psi_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -357,6 +377,13 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_f
                                             if pts_us == 0 {
                                                 continue;
                                             }
+                                            if first_audio_frame_at.is_none() {
+                                                first_audio_frame_at = Some(Instant::now());
+                                                info!(
+                                                    "media_tcp_server: {addr} ({label}) first audio frame after {}ms",
+                                                    connected_at.elapsed().as_millis()
+                                                );
+                                            }
                                             let Some(ts_data) = prepare_ts_audio_data(&stream_info, data) else {
                                                 warn!(
                                                     "media_tcp_server: {addr} ({label}) missing audio config for codec {}",
@@ -370,8 +397,12 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_f
                                             }
                                         }
                                         Err(broadcast::error::RecvError::Lagged(n)) => {
+                                            lag_events = lag_events.saturating_add(1);
+                                            lagged_frames = lagged_frames.saturating_add(n as u64);
                                             warn!(
-                                                "media_tcp_server: {addr} ({label}) lagged by {n} frames"
+                                                "media_tcp_server: {addr} ({label}) lagged by {n} audio frames (events={}, total_frames={})",
+                                                lag_events,
+                                                lagged_frames
                                             );
                                         }
                                         Err(broadcast::error::RecvError::Closed) => break,
@@ -385,10 +416,20 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_f
                                 }
                             }
                         }
+                        info!(
+                            "media_tcp_server: {addr} ({label}) audio summary: lived={}ms first_frame={}ms lag_events={} lagged_frames={}",
+                            connected_at.elapsed().as_millis(),
+                            first_audio_frame_at
+                                .map(|t| t.duration_since(connected_at).as_millis().to_string())
+                                .unwrap_or_else(|| "none".to_string()),
+                            lag_events,
+                            lagged_frames
+                        );
                         info!("<green>media_tcp_server</>: client disconnected {addr} ({label})");
                         return;
                     }
 
+                    sink.note_client_connected();
                     info!("<green>media_tcp_server</>: client connected {addr} ({label})");
                     let mut rx = sink.subscribe();
                     let mut ts = MpegTsState::new();
@@ -397,6 +438,9 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_f
                     let mut first_video_frame_at: Option<Instant> = None;
                     let mut first_idr_seen_at: Option<Instant> = None;
                     let mut first_output_at: Option<Instant> = None;
+                    let mut lag_events: u64 = 0;
+                    let mut lagged_frames: u64 = 0;
+                    let mut sync_resets: u64 = 0;
                     let mut unsynced_access_units: u64 = 0;
                     let mut missing_codec_cfg_warned = false;
 
@@ -532,10 +576,17 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_f
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                                            lag_events = lag_events.saturating_add(1);
+                                            lagged_frames = lagged_frames.saturating_add(n as u64);
                                         warn!(
-                                            "media_tcp_server: client {addr} ({label}) lagged by {n} frames, re-syncing"
+                                            "media_tcp_server: client {addr} ({label}) lagged by {n} video frames, re-syncing (events={}, total_frames={}, lived={}ms)",
+                                            lag_events,
+                                            lagged_frames,
+                                            connected_at.elapsed().as_millis()
                                         );
+                                        sync_resets = sync_resets.saturating_add(1);
                                         synced = false;
+                                        ts = MpegTsState::new(); // reset PTS baseline on resync
                                         pending_pts_us = None;
                                         pending_au.clear();
                                     }
@@ -546,13 +597,27 @@ pub async fn media_tcp_server(port: u16, label: String, sink: MediaSink, _wait_f
                                 if stream.write_all(&null_pkt).await.is_err() {
                                     break;
                                 }
-                                let psi = ts.pat_pmt();
-                                if stream.write_all(&psi).await.is_err() {
-                                    break;
-                                }
                             }
                         }
                     }
+                    info!(
+                        "media_tcp_server: {addr} ({label}) video summary: lived={}ms first_frame={}ms first_live_idr={}ms first_output={}ms lag_events={} lagged_frames={} sync_resets={} unsynced_au={} wait_for_live_idr={}",
+                        connected_at.elapsed().as_millis(),
+                        first_video_frame_at
+                            .map(|t| t.duration_since(connected_at).as_millis().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        first_idr_seen_at
+                            .map(|t| t.duration_since(connected_at).as_millis().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        first_output_at
+                            .map(|t| t.duration_since(connected_at).as_millis().to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        lag_events,
+                        lagged_frames,
+                        sync_resets,
+                        unsynced_access_units,
+                        false
+                    );
                     info!("<green>media_tcp_server</>: client disconnected {addr} ({label})");
                 });
             }
