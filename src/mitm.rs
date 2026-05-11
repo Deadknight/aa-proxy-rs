@@ -102,18 +102,18 @@ pub struct ModifyContext {
     pub(crate) sensors: Option<Vec<Sensor>>,
     pub(crate) nav_channel: Option<u8>,
     pub(crate) audio_channels: Vec<u8>,
-    ev_tx: Sender<EvTaskCommand>,
+    pub(crate) ev_tx: Sender<EvTaskCommand>,
     pub(crate) input_channel: Option<u8>,
     pub(crate) hu_tx: Option<Sender<Packet>>,
-    hu_input_state: HuInputState,
+    pub(crate) hu_input_state: HuInputState,
     /// Offset→sink map (keys 0-6). Used only at SDR time to look up which sink
     /// to assign to each real channel. Never used for tapping.
-    media_sinks: HashMap<u8, MediaSink>,
+    pub(crate) media_sinks: HashMap<u8, MediaSink>,
     /// channel_id→sink map. Populated from SDR. Used for tapping data packets.
-    media_channels: HashMap<u8, MediaSink>,
+    pub(crate) media_channels: HashMap<u8, MediaSink>,
     /// Per-channel reassembly state for tapped media messages that span multiple
     /// AA transport frames.
-    media_fragments: HashMap<u8, MediaFrameBuffer>,
+    pub(crate) media_fragments: HashMap<u8, MediaFrameBuffer>,
     /// VEC service ids injected by aa-proxy-rs into the service discovery response.
     pub(crate) vendor_service_ids: HashSet<u8>,
     /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
