@@ -49,14 +49,6 @@ pub struct InjectedMediaState {
     trace_after_start: u16,
 }
 
-// // message related constants:
-// pub const HEADER_LENGTH: usize = 4;
-// pub const FRAME_TYPE_FIRST: u8 = 1 << 0;
-// pub const FRAME_TYPE_LAST: u8 = 1 << 1;
-// pub const FRAME_TYPE_MASK: u8 = FRAME_TYPE_FIRST | FRAME_TYPE_LAST;
-// const _CONTROL: u8 = 1 << 2;
-// pub const ENCRYPTED: u8 = 1 << 3;
-
 #[derive(Clone, Copy)]
 struct DisplayProfile {
     display_type: DisplayType,
