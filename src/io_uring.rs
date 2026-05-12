@@ -216,7 +216,7 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
         );
         match timeout(Duration::from_secs(3), TokioTcpStream::connect(remote_addr)).await {
             Err(_) => {
-                warn!(
+                debug!(
                     "{} tcp_bridge: timeout connecting to remote server {}",
                     NAME, remote_addr
                 );
@@ -234,7 +234,7 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
                 );
                 match timeout(Duration::from_secs(3), TokioTcpStream::connect(local_addr)).await {
                     Err(_) => {
-                        warn!(
+                        debug!(
                             "{} tcp_bridge: timeout connecting to local server {}",
                             NAME, local_addr
                         );
