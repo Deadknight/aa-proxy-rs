@@ -33,6 +33,7 @@ use tokio_uring::net::TcpListener;
 use tokio_uring::net::TcpStream;
 use tokio_uring::BufResult;
 use tokio_uring::UnsubmittedWrite;
+use tokio_util::sync::CancellationToken;
 
 // module name for logging engine
 const NAME: &str = "<i><bright-black> proxy: </>";
@@ -208,13 +209,22 @@ async fn flatten<T>(handle: &mut JoinHandle<Result<T>>) -> Result<T> {
     }
 }
 
-async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
+async fn tcp_bridge(remote_addr: &str, local_addr: &str, cancel: CancellationToken) {
     loop {
         debug!(
             "{} tcp_bridge: before connect, local={} remote={}",
             NAME, local_addr, remote_addr
         );
-        match timeout(Duration::from_secs(3), TokioTcpStream::connect(remote_addr)).await {
+
+        let connect_result = tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("{} tcp_bridge: cancelled before connect ({})", NAME, remote_addr);
+                return;
+            }
+            result = timeout(Duration::from_secs(3), TokioTcpStream::connect(remote_addr)) => result,
+        };
+
+        match connect_result {
             Err(_) => {
                 debug!(
                     "{} tcp_bridge: timeout connecting to remote server {}",
@@ -232,7 +242,16 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
                     "{} tcp_bridge: remote side connected: ({})",
                     NAME, remote_addr
                 );
-                match timeout(Duration::from_secs(3), TokioTcpStream::connect(local_addr)).await {
+
+                let local_result = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!("{} tcp_bridge: cancelled before local connect ({})", NAME, local_addr);
+                        return;
+                    }
+                    result = timeout(Duration::from_secs(3), TokioTcpStream::connect(local_addr)) => result,
+                };
+
+                match local_result {
                     Err(_) => {
                         debug!(
                             "{} tcp_bridge: timeout connecting to local server {}",
@@ -251,15 +270,23 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
                             NAME, local_addr
                         );
                         info!("{} Connected to companion app TCP server ({}), starting bidirectional transfer...", NAME, local_addr);
-                        match copy_bidirectional(&mut remote, &mut local).await {
-                            Ok((from_remote, from_local)) => {
-                                debug!(
-                                    "{} tcp_bridge: Connection closed: remote->local={} local->remote={}",
-                                    NAME, from_remote, from_local
-                                );
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                debug!("{} tcp_bridge: cancelled during transfer ({})", NAME, remote_addr);
+                                return;
                             }
-                            Err(e) => {
-                                error!("{} Error during bidirectional copy: {}", NAME, e);
+                            res = copy_bidirectional(&mut remote, &mut local) => {
+                                match res {
+                                    Ok((from_remote, from_local)) => {
+                                        debug!(
+                                            "{} tcp_bridge: Connection closed: remote->local={} local->remote={}",
+                                            NAME, from_remote, from_local
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("{} Error during bidirectional copy: {}", NAME, e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -267,7 +294,14 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // Wait before retry, but bail immediately if cancelled
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("{} tcp_bridge: cancelled during retry wait ({})", NAME, remote_addr);
+                return;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
 }
 
@@ -299,7 +333,9 @@ pub async fn mac_from_ipv4(addr: SocketAddr) -> io::Result<Option<MacAddress>> {
 
 /// Asynchronously wait for an inbound TCP connection
 /// returning TcpStream of first client connected
-async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStream, SocketAddr)> {
+async fn tcp_wait_for_connection(
+    listener: &mut TcpListener,
+) -> Result<(TcpStream, SocketAddr, CancellationToken)> {
     let retval = listener.accept();
     let (stream, addr) = match timeout(TCP_CLIENT_TIMEOUT, retval)
         .await
@@ -316,10 +352,15 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
         NAME, addr
     );
 
+    // One CancellationToken per session — cancelled when the session ends,
+    // which stops all tcp_bridge tasks spawned for this client.
+    let cancel = CancellationToken::new();
+
     // this is creating a reverse tcp bridge for Android
     // direct connection to the device side is not allowed
     // Note: this is only meaningful for MD/phone connections, not DHU emulator clients.
     if !addr.ip().is_loopback() {
+        let c = cancel.clone();
         tokio::spawn(async move {
             info!(
                 "{} starting TCP reverse connection, Android IP: {}",
@@ -331,6 +372,7 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
             tcp_bridge(
                 &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
                 "127.0.0.1:80",
+                c,
             )
             .await;
         });
@@ -341,6 +383,7 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
         );
     }
 
+    let c = cancel.clone();
     tokio::spawn(async move {
         info!(
             "{} starting TCP reverse connection for WS, Android IP: {}",
@@ -352,10 +395,12 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
         tcp_bridge(
             &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT_WS),
             "127.0.0.1:80",
+            c,
         )
         .await;
     });
 
+    let c = cancel.clone();
     tokio::spawn(async move {
         info!(
             "{} starting TCP reverse connection for SWUpdate, Android IP: {}",
@@ -367,6 +412,7 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
         tcp_bridge(
             &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT_SWUPDATE),
             "127.0.0.1:8080",
+            c,
         )
         .await;
     });
@@ -375,7 +421,7 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
     // even if there is only a small amount of data
     stream.set_nodelay(true)?;
 
-    Ok((stream, addr))
+    Ok((stream, addr, cancel))
 }
 
 pub async fn io_loop(
@@ -460,6 +506,8 @@ pub async fn io_loop(
         let mut hu_tcp = None;
         let mut hu_usb = None;
         let mut usb_used = false;
+        // CancellationToken for tcp_bridge tasks spawned for this session
+        let mut bridge_cancel: Option<CancellationToken> = None;
 
         if config.wired.is_some() {
             info!("{} 💤 waiting for USB or bluetooth handshake...", NAME);
@@ -483,9 +531,10 @@ pub async fn io_loop(
                 }
                 _ = tcp_start.notified() => {
                     info!("{} 🛰️ MD TCP server: listening for phone connection...", NAME);
-                    if let Ok((s, ip)) = tcp_wait_for_connection(&mut md_listener.as_mut().unwrap()).await {
+                    if let Ok((s, ip, cancel)) = tcp_wait_for_connection(&mut md_listener.as_mut().unwrap()).await {
                         md_tcp = Some(s);
                         client_mac = mac_from_ipv4(ip).await.unwrap_or(None);
+                        bridge_cancel = Some(cancel);
                     } else {
                         let _ = need_restart.send(None);
                         continue;
@@ -500,11 +549,14 @@ pub async fn io_loop(
                 "{} 🛰️ MD TCP server: listening for phone connection...",
                 NAME
             );
-            if let Ok((s, ip)) = tcp_wait_for_connection(&mut md_listener.as_mut().unwrap()).await {
+            if let Ok((s, ip, cancel)) =
+                tcp_wait_for_connection(&mut md_listener.as_mut().unwrap()).await
+            {
                 md_tcp = Some(s);
                 // Get MAC address of the connected client for later disassociation
                 client_mac = mac_from_ipv4(ip).await.unwrap_or(None);
                 usb_connected.store(false, Ordering::Relaxed);
+                bridge_cancel = Some(cancel);
             } else {
                 // notify main loop to restart
                 let _ = need_restart.send(None);
@@ -517,7 +569,9 @@ pub async fn io_loop(
                 "{} 🛰️ DHU TCP server: listening for `Desktop Head Unit` connection...",
                 NAME
             );
-            if let Ok((s, _)) = tcp_wait_for_connection(&mut dhu_listener.as_mut().unwrap()).await {
+            if let Ok((s, _, _)) =
+                tcp_wait_for_connection(&mut dhu_listener.as_mut().unwrap()).await
+            {
                 hu_tcp = Some(s);
             } else {
                 // notify main loop to restart
@@ -703,6 +757,12 @@ pub async fn io_loop(
                 let _ = dev.reset().await;
             }
         }
+
+        // Cancel all tcp_bridge tasks spawned for this session before cleanup
+        if let Some(cancel) = bridge_cancel.take() {
+            cancel.cancel();
+        }
+
         // Make sure the reference count drops to zero and the socket is
         // freed by aborting both tasks (which both hold a `Rc<TcpStream>`
         // for each direction)
