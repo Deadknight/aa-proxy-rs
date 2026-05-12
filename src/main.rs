@@ -1,5 +1,6 @@
 use aa_proxy_rs::bluetooth;
 use aa_proxy_rs::bt_sco::{self, BtScoOptions};
+use aa_proxy_rs::bt_sco_echo::BtScoEchoSettings;
 use aa_proxy_rs::button::button_handler;
 use aa_proxy_rs::config::SharedConfig;
 use aa_proxy_rs::config::SharedConfigJson;
@@ -249,6 +250,13 @@ async fn tokio_main(
             media_resampler: cfg.bt_sco_media_bridge_resampler,
             bridge_sco_uplink_pcm: cfg.bt_sco_mic_bridge,
             sco_uplink_ring_capacity: cfg.bt_sco_mic_uplink_ring_capacity,
+            echo_settings: BtScoEchoSettings {
+                control: cfg.bt_sco_mic_echo_control,
+                mic_gain_percent: cfg.bt_sco_mic_gain_percent,
+                duck_threshold: cfg.bt_sco_mic_duck_threshold,
+                duck_percent: cfg.bt_sco_mic_duck_percent,
+                duck_hold_ms: cfg.bt_sco_mic_duck_hold_ms,
+            },
         }) {
             Ok(_) => {
                 info!(

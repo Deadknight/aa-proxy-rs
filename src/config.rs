@@ -147,6 +147,28 @@ impl Display for BtScoMediaBridgeResampler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BtScoMicEchoControl {
+    Off,
+    Ducking,
+}
+
+impl Default for BtScoMicEchoControl {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl Display for BtScoMicEchoControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Ducking => "ducking",
+        })
+    }
+}
+
 fn webserver_default_bind() -> Option<String> {
     Some("0.0.0.0:80".into())
 }
@@ -325,6 +347,17 @@ pub struct AppConfig {
     pub bt_sco_mic_request: bool,
     /// Maximum 60-byte SCO uplink packets buffered for the mic bridge.
     pub bt_sco_mic_uplink_ring_capacity: usize,
+    /// Echo handling for the microphone uplink. `off` preserves the current
+    /// proven path; `ducking` lowers mic gain while downlink audio is active.
+    pub bt_sco_mic_echo_control: BtScoMicEchoControl,
+    /// Microphone uplink gain percent after echo processing. 100 means no gain.
+    pub bt_sco_mic_gain_percent: u32,
+    /// Downlink peak threshold that marks far-end audio as active for ducking.
+    pub bt_sco_mic_duck_threshold: i16,
+    /// Mic gain percent while far-end/downlink audio is active.
+    pub bt_sco_mic_duck_percent: u32,
+    /// How long to keep ducking after the last active downlink frame.
+    pub bt_sco_mic_duck_hold_ms: u32,
 
     /// Directory where `.wasm` hook files are loaded from.
     /// Each script gets read-only WASI access only to a private subfolder named
@@ -508,23 +541,28 @@ impl Default for AppConfig {
             hu_button_handler: None,
             bt_sco: false,
             bt_sco_keep_bluetooth_alive: true,
-            bt_sco_media_bridge: false,
-            bt_sco_media_bridge_audio_type: BtScoMediaBridgeAudioType::Guidance,
+            bt_sco_media_bridge: true,
+            bt_sco_media_bridge_audio_type: BtScoMediaBridgeAudioType::Media,
             bt_sco_media_bridge_gain_percent: 300,
             bt_sco_media_bridge_limiter: BtScoMediaBridgeLimiter::Off,
             bt_sco_media_bridge_resampler: BtScoMediaBridgeResampler::Repeat,
             bt_sco_media_bridge_ring_capacity: 128,
             bt_sco_media_bridge_start_existing: true,
-            bt_sco_media_bridge_start_on_first_audio: false,
-            bt_sco_media_bridge_audio_peak_threshold: 64,
-            bt_sco_media_bridge_start_timeout_ms: 1500,
+            bt_sco_media_bridge_start_on_first_audio: true,
+            bt_sco_media_bridge_audio_peak_threshold: 256,
+            bt_sco_media_bridge_start_timeout_ms: 5000,
             bt_sco_media_bridge_stop_existing_on_disconnect: true,
             bt_sco_media_bridge_fixed_cadence: false,
             bt_sco_media_bridge_cadence_ms: 22,
             bt_sco_media_bridge_jitter_buffer_ms: 60,
-            bt_sco_mic_bridge: false,
+            bt_sco_mic_bridge: true,
             bt_sco_mic_request: true,
             bt_sco_mic_uplink_ring_capacity: 256,
+            bt_sco_mic_echo_control: BtScoMicEchoControl::Ducking,
+            bt_sco_mic_gain_percent: 100,
+            bt_sco_mic_duck_threshold: 700,
+            bt_sco_mic_duck_percent: 35,
+            bt_sco_mic_duck_hold_ms: 180,
             wasm_hooks_dir: DEFAULT_WASM_HOOKS_DIR.into(),
             wasm_script_memory_limit_mb: 5,
             wasm_script_instance_limit: 16,
@@ -731,10 +769,11 @@ impl AppConfig {
         doc["bt_sco_mic_bridge"] = value(self.bt_sco_mic_bridge);
         doc["bt_sco_mic_request"] = value(self.bt_sco_mic_request);
         doc["bt_sco_mic_uplink_ring_capacity"] = value(self.bt_sco_mic_uplink_ring_capacity as i64);
-        // Remove obsolete SCO debug/raw-dump keys when config is saved.
-        let _ = doc.remove("bt_sco_debug");
-        let _ = doc.remove("bt_sco_dump_path");
-        let _ = doc.remove("bt_sco_write_silence");
+        doc["bt_sco_mic_echo_control"] = value(self.bt_sco_mic_echo_control.to_string());
+        doc["bt_sco_mic_gain_percent"] = value(self.bt_sco_mic_gain_percent as i64);
+        doc["bt_sco_mic_duck_threshold"] = value(self.bt_sco_mic_duck_threshold as i64);
+        doc["bt_sco_mic_duck_percent"] = value(self.bt_sco_mic_duck_percent as i64);
+        doc["bt_sco_mic_duck_hold_ms"] = value(self.bt_sco_mic_duck_hold_ms as i64);
         doc["wasm_hooks_dir"] = value(self.wasm_hooks_dir.display().to_string());
         doc["wasm_script_memory_limit_mb"] = value(self.wasm_script_memory_limit_mb as i64);
         doc["wasm_script_instance_limit"] = value(self.wasm_script_instance_limit as i64);

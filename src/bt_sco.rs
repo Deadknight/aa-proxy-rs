@@ -1,3 +1,4 @@
+use crate::bt_sco_echo::{self, BtScoEchoSettings};
 use crate::config::BtScoMediaBridgeResampler;
 use simplelog::*;
 use std::collections::{BTreeMap, VecDeque};
@@ -64,6 +65,8 @@ pub struct BtScoOptions {
     pub bridge_sco_uplink_pcm: bool,
     /// Maximum number of 60-byte SCO uplink packets buffered for the microphone bridge.
     pub sco_uplink_ring_capacity: usize,
+    /// Microphone echo handling settings for SCO uplink.
+    pub echo_settings: BtScoEchoSettings,
 }
 
 #[repr(C)]
@@ -222,6 +225,8 @@ impl ScoStats {
 /// It accepts the SCO/eSCO socket used by the phone call route and optionally
 /// bridges downlink/uplink audio to Android Auto media/microphone channels.
 pub fn spawn(options: BtScoOptions) -> io::Result<thread::JoinHandle<()>> {
+    bt_sco_echo::configure(options.echo_settings.clone());
+
     if options.bridge_aa_media_pcm {
         enable_aa_pcm_ring();
     }
@@ -241,7 +246,7 @@ pub fn spawn(options: BtScoOptions) -> io::Result<thread::JoinHandle<()>> {
 fn run(options: BtScoOptions) -> io::Result<()> {
     let listener = create_sco_listener()?;
 
-    info!(
+    debug!(
         "{} listening for incoming SCO/eSCO audio, bridge_aa_media_pcm={}, media_ring_capacity={}, bridge_sco_uplink_pcm={}, uplink_ring_capacity={}",
         NAME,
         options.bridge_aa_media_pcm,
@@ -277,8 +282,9 @@ fn run(options: BtScoOptions) -> io::Result<()> {
         clear_aa_pcm_queue();
         SCO_CONNECTED.store(true, Ordering::SeqCst);
         clear_sco_uplink_queue();
+        bt_sco_echo::reset_for_sco_generation(generation);
 
-        info!(
+        debug!(
             "{} SCO/eSCO connected from {}, generation={}",
             NAME,
             format_bdaddr(peer.sco_bdaddr),
@@ -350,6 +356,10 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
     let mut audio_window_non_silent_packets = 0u64;
     let mut first_non_silent_at: Option<Instant> = None;
     let mut first_non_silent_packet = 0u64;
+    let mut uplink_written_packets = 0u64;
+    let mut uplink_mic_packets = 0u64;
+    let mut uplink_silence_packets = 0u64;
+    let mut uplink_write_errors = 0u64;
 
     loop {
         let n = unsafe {
@@ -368,7 +378,7 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
         }
 
         if n == 0 {
-            info!("{} SCO EOF", NAME);
+            debug!("{} SCO EOF", NAME);
             break;
         }
 
@@ -383,7 +393,7 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
             if first_non_silent_at.is_none() {
                 first_non_silent_at = Some(now);
                 first_non_silent_packet = stats.packets;
-                info!(
+                debug!(
                     "{} first non-silent SCO downlink packet: packet={}, after={}ms, peak={}, rms={:.1}, threshold={}",
                     NAME,
                     first_non_silent_packet,
@@ -407,6 +417,8 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
             );
         }
 
+        bt_sco_echo::observe_downlink_sco_8k_mono(&buf[..n]);
+
         if options.bridge_aa_media_pcm {
             sco_s16le_mono_8k_to_aa_pcm_s16le_stereo_48k(
                 &buf[..n],
@@ -424,7 +436,10 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
         }
 
         if options.bridge_sco_uplink_pcm {
-            let uplink = pop_sco_uplink_frame(n).unwrap_or_else(|| vec![0u8; n]);
+            let (uplink, from_mic) = match pop_sco_uplink_frame(n) {
+                Some(frame) => (frame, true),
+                None => (vec![0u8; n], false),
+            };
             let written = unsafe {
                 libc::write(
                     fd,
@@ -434,11 +449,19 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
             };
 
             if written < 0 {
+                uplink_write_errors += 1;
                 warn!(
                     "{} SCO mic-uplink write error: {}",
                     NAME,
                     io::Error::last_os_error()
                 );
+            } else {
+                uplink_written_packets += 1;
+                if from_mic {
+                    uplink_mic_packets += 1;
+                } else {
+                    uplink_silence_packets += 1;
+                }
             }
         }
 
@@ -447,8 +470,8 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
             let first_audio_ms = first_non_silent_at
                 .map(|t| t.duration_since(started).as_millis().to_string())
                 .unwrap_or_else(|| "none".to_string());
-            info!(
-                "{} SCO active: {}, audio_window[peak={}, rms={:.1}, non_silent_packets={}, silent_packets={}, first_audio_ms={}, first_audio_packet={}], elapsed={}s",
+            debug!(
+                "{} SCO active: {}, audio_window[peak={}, rms={:.1}, non_silent_packets={}, silent_packets={}, first_audio_ms={}, first_audio_packet={}], uplink[written={}, mic_packets={}, silence_packets={}, write_errors={}, queued={}], elapsed={}s",
                 NAME,
                 stats.summary(started),
                 audio_window_peak,
@@ -457,6 +480,11 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
                 audio_window_silent_packets,
                 first_audio_ms,
                 first_non_silent_packet,
+                uplink_written_packets,
+                uplink_mic_packets,
+                uplink_silence_packets,
+                uplink_write_errors,
+                sco_uplink_queue_len(),
                 started.elapsed().as_secs()
             );
             audio_window_peak = 0;
@@ -481,10 +509,15 @@ fn handle_sco_connection(fd: RawFd, options: &BtScoOptions, generation: u64) {
         libc::close(fd);
     }
 
-    info!(
-        "{} SCO disconnected: {}, elapsed={}s",
+    debug!(
+        "{} SCO disconnected: {}, uplink[written={}, mic_packets={}, silence_packets={}, write_errors={}, queued={}], elapsed={}s",
         NAME,
         stats.summary(started),
+        uplink_written_packets,
+        uplink_mic_packets,
+        uplink_silence_packets,
+        uplink_write_errors,
+        sco_uplink_queue_len(),
         started.elapsed().as_secs()
     );
 }
@@ -636,6 +669,13 @@ fn pop_sco_uplink_frame(len: usize) -> Option<Vec<u8>> {
     }
 }
 
+fn sco_uplink_queue_len() -> usize {
+    SCO_UPLINK_RING
+        .get()
+        .map(|ring| ring.lock().unwrap().len())
+        .unwrap_or(0)
+}
+
 /// Convert Android Auto microphone/source PCM to the SCO uplink format observed on
 /// the target setup: signed 16-bit little-endian, mono, 8 kHz, 60-byte packets.
 ///
@@ -677,13 +717,24 @@ pub fn push_sco_uplink_pcm_from_aa_mic(
     };
 
     let frames = input.len() / frame_bytes;
-    let pending_arc = enable_sco_uplink_pending();
-    let mut pending = pending_arc.lock().unwrap();
+    let mut samples_8k: Vec<i16> = Vec::with_capacity(frames / step + 1);
 
     for frame_idx in (0..frames).step_by(step) {
         let offset = frame_idx * frame_bytes;
         // Use the first channel when the HU ever exposes stereo/dual-mic PCM.
-        pending.extend_from_slice(&input[offset..offset + 2]);
+        samples_8k.push(i16::from_le_bytes([input[offset], input[offset + 1]]));
+    }
+
+    bt_sco_echo::process_mic_8k_samples(&mut samples_8k);
+    if samples_8k.is_empty() {
+        return;
+    }
+
+    let pending_arc = enable_sco_uplink_pending();
+    let mut pending = pending_arc.lock().unwrap();
+
+    for sample in samples_8k {
+        pending.extend_from_slice(&sample.to_le_bytes());
 
         while pending.len() >= SCO_UPLINK_PACKET_BYTES {
             let packet: Vec<u8> = pending.drain(..SCO_UPLINK_PACKET_BYTES).collect();
@@ -721,12 +772,12 @@ fn rms_from_energy(energy: u128, samples: u64) -> f64 {
 
 fn log_sco_socket_info(fd: RawFd) {
     match getsockopt_value::<ScoOptions>(fd, SOL_SCO, SCO_OPTIONS) {
-        Ok(v) => info!("{} SCO_OPTIONS mtu={}", NAME, v.mtu),
+        Ok(v) => debug!("{} SCO_OPTIONS mtu={}", NAME, v.mtu),
         Err(e) => debug!("{} SCO_OPTIONS unavailable: {}", NAME, e),
     }
 
     match getsockopt_value::<ScoConnInfo>(fd, SOL_SCO, SCO_CONNINFO) {
-        Ok(v) => info!(
+        Ok(v) => debug!(
             "{} SCO_CONNINFO hci_handle=0x{:04x} dev_class={:02x}:{:02x}:{:02x}",
             NAME,
             v.hci_handle,
@@ -738,7 +789,7 @@ fn log_sco_socket_info(fd: RawFd) {
     }
 
     match getsockopt_value::<BtVoice>(fd, SOL_BLUETOOTH, BT_VOICE) {
-        Ok(v) => info!(
+        Ok(v) => debug!(
             "{} BT_VOICE setting=0x{:04x} ({})",
             NAME,
             v.setting,
@@ -748,12 +799,12 @@ fn log_sco_socket_info(fd: RawFd) {
     }
 
     match getsockopt_int(fd, SOL_BLUETOOTH, BT_RCVMTU) {
-        Ok(v) => info!("{} BT_RCVMTU={}", NAME, v),
+        Ok(v) => debug!("{} BT_RCVMTU={}", NAME, v),
         Err(e) => debug!("{} BT_RCVMTU unavailable: {}", NAME, e),
     }
 
     match getsockopt_int(fd, SOL_BLUETOOTH, BT_SNDMTU) {
-        Ok(v) => info!("{} BT_SNDMTU={}", NAME, v),
+        Ok(v) => debug!("{} BT_SNDMTU={}", NAME, v),
         Err(e) => debug!("{} BT_SNDMTU unavailable: {}", NAME, e),
     }
 }

@@ -150,12 +150,12 @@ pub fn set_target_channel(
     runtime.max_unacked.store(0, Ordering::SeqCst);
 
     if previous != channel {
-        info!(
+        debug!(
             "{} selected existing AA PCM sink channel=<b>{:#04x}</>, {}Hz, {}ch, {}bit, gain={}%, limiter={}, start_existing={}, start_on_first_audio={}, peak_threshold={}, start_timeout={}ms, stop_on_disconnect={}, fixed_cadence={}ms/{}, jitter_buffer={}ms, epoch={}; will piggyback DATA only",
             NAME, channel, sample_rate, channels, bits, gain_percent, limiter, start_existing, start_on_first_audio, audio_peak_threshold, start_timeout_ms.max(1), stop_existing_on_disconnect, cadence_ms.max(1), fixed_cadence, jitter_buffer_ms, epoch
         );
     } else {
-        info!(
+        debug!(
             "{} re-armed existing AA PCM sink channel=<b>{:#04x}</>, {}Hz, {}ch, {}bit, gain={}%, limiter={}, start_existing={}, start_on_first_audio={}, peak_threshold={}, start_timeout={}ms, stop_on_disconnect={}, fixed_cadence={}ms/{}, jitter_buffer={}ms, epoch={}; will piggyback DATA only",
             NAME, channel, sample_rate, channels, bits, gain_percent, limiter, start_existing, start_on_first_audio, audio_peak_threshold, start_timeout_ms.max(1), stop_existing_on_disconnect, cadence_ms.max(1), fixed_cadence, jitter_buffer_ms, epoch
         );
@@ -186,12 +186,12 @@ pub fn set_microphone_source(
     bt_sco::clear_sco_uplink_queue();
 
     if previous != channel {
-        info!(
+        debug!(
             "{} selected AA microphone source channel=<b>{:#04x}</>, {}Hz, {}ch, {}bit, epoch={}, request_enabled={}",
             NAME, channel, sample_rate, channels, bits, epoch, request_enabled
         );
     } else {
-        info!(
+        debug!(
             "{} re-armed AA microphone source channel=<b>{:#04x}</>, {}Hz, {}ch, {}bit, epoch={}, request_enabled={}",
             NAME, channel, sample_rate, channels, bits, epoch, request_enabled
         );
@@ -233,7 +233,7 @@ pub fn notify_media_config(channel: u8, cfg: &AudioConfig) {
     runtime.config_channel.store(channel, Ordering::SeqCst);
     runtime.config_epoch.store(epoch, Ordering::SeqCst);
 
-    info!(
+    debug!(
         "{} existing HU media CONFIG seen for channel=<b>{:#04x}</>: status={:?}, config_index={}, max_unacked={}, epoch={}; bridge is ready for SCO DATA piggyback",
         NAME,
         channel,
@@ -252,7 +252,7 @@ pub fn notify_microphone_response(channel: u8, payload: &[u8]) {
         return;
     }
 
-    info!(
+    debug!(
         "{} MICROPHONE_RESPONSE ch=<b>{:#04x}</> len={} hex={}",
         NAME,
         channel,
@@ -305,7 +305,7 @@ fn bridge_loop(runtime: Arc<Runtime>) {
             pending_start_started_at = None;
             silent_frames_before_start = 0;
             next_cadence_send_at = None;
-            info!(
+            debug!(
                 "{} target channel=<b>{:#04x}</>, epoch={} armed; waiting for existing HU media CONFIG, no CHANNEL_OPEN/SETUP will be injected",
                 NAME, channel, epoch
             );
@@ -429,7 +429,7 @@ fn bridge_loop(runtime: Arc<Runtime>) {
             if data_packets <= 5 || last_data_log.elapsed() >= Duration::from_secs(5) {
                 let config_index = runtime.configuration_index.load(Ordering::SeqCst);
                 let max_unacked = runtime.max_unacked.load(Ordering::SeqCst);
-                info!(
+                debug!(
                     "{} DATA piggyback ch=<b>{:#04x}</> packets={} pts={}us last_frames={} last_bytes={} peak={} config_index={} max_unacked={}",
                     NAME,
                     channel,
@@ -514,12 +514,12 @@ fn handle_media_disconnected_state(
         if runtime.stop_existing_on_disconnect.load(Ordering::SeqCst) {
             let _ = send_media_stop(runtime, channel);
         }
-        info!(
+        debug!(
             "{} media bridge stopped for ch=<b>{:#04x}</>, sco_generation={}, packets_sent={}",
             NAME, channel, *media_started_generation, *data_packets
         );
     } else if *pending_start_generation != 0 {
-        info!(
+        debug!(
             "{} media bridge pending start cleared for ch=<b>{:#04x}</>, sco_generation={}, silent_frames_before_start={}",
             NAME, channel, *pending_start_generation, *silent_frames_before_start
         );
@@ -562,7 +562,7 @@ fn ensure_media_started_for_frame(
         if runtime.stop_existing_on_disconnect.load(Ordering::SeqCst) {
             let _ = send_media_stop(runtime, channel);
         }
-        info!(
+        debug!(
             "{} media bridge generation switch: stopped previous ch=<b>{:#04x}</>, old_generation={}, new_generation={}, packets_sent={}",
             NAME,
             channel,
@@ -587,7 +587,7 @@ fn ensure_media_started_for_frame(
         let start_on_first_audio = runtime.start_on_first_audio.load(Ordering::SeqCst);
         let threshold = runtime.audio_peak_threshold.load(Ordering::SeqCst);
         let timeout_ms = runtime.start_timeout_ms.load(Ordering::SeqCst).max(1);
-        info!(
+        debug!(
             "{} media bridge pending START for ch=<b>{:#04x}</>, sco_generation={}, start_on_first_audio={}, peak_threshold={}, timeout={}ms",
             NAME, channel, generation, start_on_first_audio, threshold, timeout_ms
         );
@@ -609,7 +609,7 @@ fn ensure_media_started_for_frame(
     if start_on_first_audio && !is_non_silent && !timed_out {
         *silent_frames_before_start += 1;
         if *silent_frames_before_start <= 5 || *silent_frames_before_start % 100 == 0 {
-            info!(
+            debug!(
                 "{} waiting for first SCO downlink audio before START ch=<b>{:#04x}</>, sco_generation={}, silent_frames={}, peak={}, threshold={}, elapsed={}ms",
                 NAME,
                 channel,
@@ -634,7 +634,7 @@ fn ensure_media_started_for_frame(
     if runtime.start_existing.load(Ordering::SeqCst) {
         let config_index = runtime.configuration_index.load(Ordering::SeqCst);
         if send_media_start(runtime, channel, DEFAULT_SESSION_ID, config_index).is_ok() {
-            info!(
+            debug!(
                 "{} media bridge START sent for existing ch=<b>{:#04x}</>, session_id={}, config_index={}, sco_generation={}, epoch={}, reason={}, peak={}, threshold={}, silent_frames_before_start={}, elapsed={}ms",
                 NAME,
                 channel,
@@ -650,7 +650,7 @@ fn ensure_media_started_for_frame(
             );
         }
     } else {
-        info!(
+        debug!(
             "{} media bridge using DATA-only mode for ch=<b>{:#04x}</>, sco_generation={}, reason={}, peak={}, threshold={}, silent_frames_before_start={}, elapsed={}ms",
             NAME,
             channel,
@@ -710,7 +710,7 @@ fn send_media_stop(runtime: &Runtime, channel: u8) -> std::result::Result<(), ()
 
     let result = send_packet(runtime, pkt, "MEDIA_MESSAGE_STOP(existing)");
     if result.is_ok() {
-        info!("{} MEDIA_MESSAGE_STOP existing ch=<b>{:#04x}</>", NAME, channel);
+        debug!("{} MEDIA_MESSAGE_STOP existing ch=<b>{:#04x}</>", NAME, channel);
     }
     result
 }
@@ -732,7 +732,7 @@ fn handle_microphone_request_state(runtime: &Runtime, last_wait_log: &mut Instan
                 .store(generation, Ordering::SeqCst);
             runtime.mic_open.store(true, Ordering::SeqCst);
             bt_sco::clear_sco_uplink_queue();
-            info!(
+            debug!(
                 "{} requested HU microphone open ch=<b>{:#04x}</>, sco_generation={}",
                 NAME, channel, generation
             );
@@ -744,7 +744,7 @@ fn handle_microphone_request_state(runtime: &Runtime, last_wait_log: &mut Instan
         let _ = send_microphone_request(runtime, channel, false);
         runtime.mic_open_sco_generation.store(0, Ordering::SeqCst);
         bt_sco::clear_sco_uplink_queue();
-        info!("{} requested HU microphone close ch=<b>{:#04x}</>", NAME, channel);
+        debug!("{} requested HU microphone close ch=<b>{:#04x}</>", NAME, channel);
         return;
     }
 
