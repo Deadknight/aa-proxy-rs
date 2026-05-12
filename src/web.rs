@@ -13,8 +13,11 @@ use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
 use crate::ev::EV_MODEL_FILE;
 use crate::mitm::protos::KeyCode;
+use crate::mitm::send_byebye;
+use crate::mitm::send_input_key;
 use crate::mitm::send_key_event;
 use crate::mitm::send_rotary_event;
+use crate::mitm::send_toll_card;
 use crate::mitm::Packet;
 use crate::mitm::Result;
 use crate::mitm::{send_odometer_data, OdometerData};
@@ -154,6 +157,9 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/tire-pressure-status", get(tire_pressure_status_handler))
         .route("/inject_event", post(inject_event_handler))
         .route("/inject_rotary", post(inject_rotary_handler))
+        .route("/toll-card/add", post(toll_card_add_handler))
+        .route("/toll-card/remove", post(toll_card_remove_handler))
+        .route("/input/key", post(input_key_handler))
         .route("/userdata-backup", get(userdata_backup_handler))
         .route("/userdata-restore", post(userdata_restore_handler))
         .route("/factory-reset", post(factory_reset_handler))
@@ -175,6 +181,7 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/bt/known-devices",
             get(bt_known_devices_handler).delete(bt_forget_known_devices_handler),
         )
+        .route("/disconnect", post(disconnect_handler))
         .with_state(state)
 }
 
@@ -542,10 +549,119 @@ pub async fn inject_rotary_handler(
     (StatusCode::OK, "OK").into_response()
 }
 
+async fn send_toll_card_from_web(state: Arc<AppState>, is_card_present: bool) -> impl IntoResponse {
+    if let Some(ch) = *state.sensor_channel.lock().await {
+        if let Some(tx) = state.tx.lock().await.clone() {
+            if let Err(e) = send_toll_card(tx.clone(), ch, is_card_present).await {
+                error!("{} Toll card send error: {}", NAME, e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to send toll card data",
+                )
+                    .into_response();
+            }
+            return (StatusCode::OK, "OK").into_response();
+        }
+        warn!(
+            "{} Not sending toll card packet because tx is unavailable",
+            NAME
+        );
+        return (StatusCode::SERVICE_UNAVAILABLE, "No active session tx").into_response();
+    }
+
+    warn!(
+        "{} Not sending toll card packet because no sensor channel yet",
+        NAME
+    );
+    (StatusCode::SERVICE_UNAVAILABLE, "No sensor channel yet").into_response()
+}
+
+pub async fn toll_card_add_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    send_toll_card_from_web(state, true).await
+}
+
+pub async fn toll_card_remove_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    send_toll_card_from_web(state, false).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InputKeyRequest {
+    pub keycode: u32,
+    pub down: Option<bool>,
+    pub longpress: Option<bool>,
+}
+
+pub async fn input_key_handler(
+    State(state): State<Arc<AppState>>,
+    Json(data): Json<InputKeyRequest>,
+) -> impl IntoResponse {
+    let Some(input_ch) = *state.input_channel.lock().await else {
+        warn!(
+            "{} Not sending key packet because no input channel yet",
+            NAME
+        );
+        return (StatusCode::SERVICE_UNAVAILABLE, "No input channel yet").into_response();
+    };
+
+    let Some(tx) = state.tx.lock().await.clone() else {
+        warn!("{} Not sending key packet because tx is unavailable", NAME);
+        return (StatusCode::SERVICE_UNAVAILABLE, "No active session tx").into_response();
+    };
+
+    let down = data.down.unwrap_or(true);
+    let longpress = data.longpress.unwrap_or(false);
+
+    if data.down.is_none() {
+        // Default behavior is a tap: press and release.
+        if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, true, longpress).await {
+            error!("{} Input key send (down) error: {}", NAME, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to send key event",
+            )
+                .into_response();
+        }
+        if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, false, longpress).await {
+            error!("{} Input key send (up) error: {}", NAME, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to send key event",
+            )
+                .into_response();
+        }
+    } else if let Err(e) = send_input_key(tx.clone(), input_ch, data.keycode, down, longpress).await
+    {
+        error!("{} Input key send error: {}", NAME, e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to send key event",
+        )
+            .into_response();
+    }
+
+    (StatusCode::OK, "OK").into_response()
+}
+
 fn generate_filename(kind: &str) -> String {
     let now = Local::now();
     now.format(&format!("%Y%m%d%H%M%S_aa-proxy-rs_{}.tar.gz", kind))
         .to_string()
+}
+
+async fn disconnect_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(tx) = state.tx.lock().await.clone() {
+        if let Err(e) = send_byebye(tx).await {
+            error!("{} ByeBye send error: {}", NAME, e);
+        }
+    } else {
+        warn!("{} disconnect requested but no active session", NAME);
+    }
+    state.config.write().await.action_requested = Some(Action::Reconnect);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from("Disconnect has been requested"))
+        .unwrap()
 }
 
 async fn restart_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {

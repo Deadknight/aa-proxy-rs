@@ -47,6 +47,8 @@ const TCP_CLIENT_TIMEOUT: Duration = Duration::new(30, 0);
 const COMP_APP_TCP_PORT: u16 = 9999;
 const COMP_APP_TCP_PORT_WS: u16 = 9998;
 const COMP_APP_TCP_PORT_SWUPDATE: u16 = 9997;
+// Original queue depth was 10. Keep this small to avoid queue-induced latency.
+const MITM_QUEUE_CAPACITY: usize = 10;
 
 use crate::config::{Action, SharedConfig};
 use crate::config::{TCP_DHU_PORT, TCP_SERVER_PORT};
@@ -212,14 +214,38 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
             "{} tcp_bridge: before connect, local={} remote={}",
             NAME, local_addr, remote_addr
         );
-        match TokioTcpStream::connect(remote_addr).await {
-            Ok(mut remote) => {
+        match timeout(Duration::from_secs(3), TokioTcpStream::connect(remote_addr)).await {
+            Err(_) => {
+                debug!(
+                    "{} tcp_bridge: timeout connecting to remote server {}",
+                    NAME, remote_addr
+                );
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    "{} tcp_bridge: failed to connect to remote server {}: {}",
+                    NAME, remote_addr, e
+                );
+            }
+            Ok(Ok(mut remote)) => {
                 debug!(
                     "{} tcp_bridge: remote side connected: ({})",
                     NAME, remote_addr
                 );
-                match TokioTcpStream::connect(local_addr).await {
-                    Ok(mut local) => {
+                match timeout(Duration::from_secs(3), TokioTcpStream::connect(local_addr)).await {
+                    Err(_) => {
+                        debug!(
+                            "{} tcp_bridge: timeout connecting to local server {}",
+                            NAME, local_addr
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        debug!(
+                            "{} tcp_bridge: failed to connect to local server {}: {}",
+                            NAME, local_addr, e
+                        );
+                    }
+                    Ok(Ok(mut local)) => {
                         debug!(
                             "{} tcp_bridge: local side connected: ({})",
                             NAME, local_addr
@@ -237,19 +263,7 @@ async fn tcp_bridge(remote_addr: &str, local_addr: &str) {
                             }
                         }
                     }
-                    Err(e) => {
-                        debug!(
-                            "{} tcp_bridge: Failed to connect to local server {}: {}",
-                            NAME, local_addr, e
-                        );
-                    }
                 }
-            }
-            Err(e) => {
-                debug!(
-                    "{} tcp_bridge: Failed to connect to remote server {}: {}",
-                    NAME, remote_addr, e
-                );
             }
         }
 
@@ -304,20 +318,28 @@ async fn tcp_wait_for_connection(listener: &mut TcpListener) -> Result<(TcpStrea
 
     // this is creating a reverse tcp bridge for Android
     // direct connection to the device side is not allowed
-    tokio::spawn(async move {
-        info!(
-            "{} starting TCP reverse connection, Android IP: {}",
-            NAME,
-            addr.ip()
+    // Note: this is only meaningful for MD/phone connections, not DHU emulator clients.
+    if !addr.ip().is_loopback() {
+        tokio::spawn(async move {
+            info!(
+                "{} starting TCP reverse connection, Android IP: {}",
+                NAME,
+                addr.ip()
+            );
+            // FIXME use port configured by user for webserver
+            // or ignore when webserver disabled...
+            tcp_bridge(
+                &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
+                "127.0.0.1:80",
+            )
+            .await;
+        });
+    } else {
+        debug!(
+            "{} skipping reverse tcp_bridge for localhost client ({})",
+            NAME, addr
         );
-        // FIXME use port configured by user for webserver
-        // or ignore when webserver disabled...
-        tcp_bridge(
-            &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
-            "127.0.0.1:80",
-        )
-        .await;
-    });
+    }
 
     tokio::spawn(async move {
         info!(
@@ -546,10 +568,14 @@ pub async fn io_loop(
         let mut hu_tcp_stream = None;
 
         // MITM/proxy mpsc channels:
-        let (tx_hu, rx_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (tx_md, rx_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (txr_hu, rxr_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
-        let (txr_md, rxr_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(10);
+        // Keep enough in-flight capacity so reader tasks do not stall under bursty
+        // media traffic and starve control-channel forwarding.
+        let (tx_hu, rx_md): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (tx_md, rx_hu): (Sender<Packet>, Receiver<Packet>) = mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (txr_hu, rxr_md): (Sender<Packet>, Receiver<Packet>) =
+            mpsc::channel(MITM_QUEUE_CAPACITY);
+        let (txr_md, rxr_hu): (Sender<Packet>, Receiver<Packet>) =
+            mpsc::channel(MITM_QUEUE_CAPACITY);
 
         // selecting I/O device for reading and writing
         // and creating desired objects for proxy functions
@@ -613,7 +639,7 @@ pub async fn io_loop(
             ev_tx.clone(),
             Some(tx_hu.clone()),
             script_registry.clone(),
-            HashMap::new(),
+            persistent_media_sinks.clone(),
             ws_event_tx.clone(),
         ));
         from_stream = tokio_uring::spawn(proxy(
@@ -713,6 +739,8 @@ pub async fn io_loop(
         *tx_lock = None;
         let mut sc_lock = sensor_channel.lock().await;
         *sc_lock = None;
+        let mut ic_lock = input_channel.lock().await;
+        *ic_lock = None;
         // stop EV battery logger if neded
         if config.ev_battery_logger.is_some() {
             ev_tx.send(EvTaskCommand::Stop).await?;

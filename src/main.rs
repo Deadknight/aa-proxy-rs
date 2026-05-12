@@ -11,6 +11,7 @@ use aa_proxy_rs::device_info;
 use aa_proxy_rs::ev::BatteryData;
 use aa_proxy_rs::io_uring::io_loop;
 use aa_proxy_rs::led::{LedColor, LedManager, LedMode};
+use aa_proxy_rs::mitm::send_byebye;
 use aa_proxy_rs::mitm::OdometerData;
 use aa_proxy_rs::mitm::Packet;
 use aa_proxy_rs::mitm::TirePressureData;
@@ -196,6 +197,46 @@ async fn action_handler(config: &mut SharedConfig) {
     }
 }
 
+async fn clean_disconnect_and_exit(
+    tx: Arc<Mutex<Option<Sender<Packet>>>>,
+    config: SharedConfig,
+    reason: &str,
+) -> ! {
+    info!("{} {}: initiating clean disconnect", NAME, reason);
+
+    if let Some(sender) = tx.lock().await.clone() {
+        if let Err(e) = send_byebye(sender).await {
+            warn!("{} {}: ByeBye send failed: {}", NAME, reason, e);
+        }
+        // Give the BYEBYE exchange a short head start before forcing reconnect.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    } else {
+        info!("{} {}: no active session tx, skipping ByeBye", NAME, reason);
+    }
+
+    // Trigger normal io_loop teardown (TCP shutdown + USB reset + context cleanup).
+    config.write().await.action_requested = Some(Action::Reconnect);
+
+    // Wait for io_loop cleanup to clear the active tx context, but don't hang forever.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if tx.lock().await.is_none() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                "{} {}: teardown did not complete before deadline, exiting anyway",
+                NAME, reason
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    info!("{} {}: exiting process after teardown", NAME, reason);
+    std::process::exit(0);
+}
+
 async fn tokio_main(
     config: SharedConfig,
     config_json: SharedConfigJson,
@@ -222,7 +263,7 @@ async fn tokio_main(
         config: config.clone(),
         config_json: config_json.clone(),
         config_file: config_file.into(),
-        tx,
+        tx: tx.clone(),
         sensor_channel,
         input_channel,
         last_battery_data,
@@ -232,6 +273,52 @@ async fn tokio_main(
         ws_event_tx,
         script_registry,
     };
+
+    // Handle process-exit signals with a protocol-clean teardown.
+    let tx_signal = tx.clone();
+    let config_signal = config.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("{} signal handler init failed (SIGTERM): {}", NAME, e);
+                    return;
+                }
+            };
+            let mut sigquit = match signal(SignalKind::quit()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("{} signal handler init failed (SIGQUIT): {}", NAME, e);
+                    return;
+                }
+            };
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("{} received Ctrl+C/SIGINT, attempting clean disconnect...", NAME);
+                }
+                _ = sigterm.recv() => {
+                    info!("{} received SIGTERM, attempting clean disconnect...", NAME);
+                }
+                _ = sigquit.recv() => {
+                    info!("{} received SIGQUIT, attempting clean disconnect...", NAME);
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                info!("{} received Ctrl+C, attempting clean disconnect...", NAME);
+            }
+        }
+
+        clean_disconnect_and_exit(tx_signal, config_signal, "signal exit").await;
+    });
 
     // LED support
     let mut led_manager = if led_support {

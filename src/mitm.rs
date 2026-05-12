@@ -11,6 +11,10 @@ use crate::script_wasm::{
 };
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
+use crate::display::add_display_services;
+use crate::display::emulate_injected_media_packet;
+use crate::display::maybe_emit_pending_injected_focus;
+use crate::display::InjectedMediaState;
 use crate::vendor_ext::{
     add_vendor_extension_service, ensure_vendor_channel_open, ensure_vendor_topic_event_bridge,
     handle_vendor_channel_packet, has_vendor_extension_service, is_vendor_channel,
@@ -72,7 +76,7 @@ pub use crate::media_tap::{
 use crate::media_tap::{reassemble_media_packet, tap_media_message, MediaFrameBuffer};
 
 // module name for logging engine
-fn get_name(proxy_type: ProxyType) -> String {
+pub fn get_name(proxy_type: ProxyType) -> String {
     let proxy = match proxy_type {
         ProxyType::HeadUnit => "HU",
         ProxyType::MobileDevice => "MD",
@@ -104,18 +108,32 @@ pub struct ModifyContext {
     pub(crate) sensors: Option<Vec<Sensor>>,
     pub(crate) nav_channel: Option<u8>,
     pub(crate) audio_channels: Vec<u8>,
-    ev_tx: Sender<EvTaskCommand>,
+    pub(crate) ev_tx: Sender<EvTaskCommand>,
     pub(crate) input_channel: Option<u8>,
     pub(crate) hu_tx: Option<Sender<Packet>>,
-    hu_input_state: HuInputState,
+    pub(crate) hu_input_state: HuInputState,
     /// Offset→sink map (keys 0-6). Used only at SDR time to look up which sink
     /// to assign to each real channel. Never used for tapping.
-    media_sinks: HashMap<u8, MediaSink>,
+    pub(crate) media_sinks: HashMap<u8, MediaSink>,
     /// channel_id→sink map. Populated from SDR. Used for tapping data packets.
-    media_channels: HashMap<u8, MediaSink>,
+    pub(crate) media_channels: HashMap<u8, MediaSink>,
     /// Per-channel reassembly state for tapped media messages that span multiple
     /// AA transport frames.
-    media_fragments: HashMap<u8, MediaFrameBuffer>,
+    pub(crate) media_fragments: HashMap<u8, MediaFrameBuffer>,
+    /// Original HU-advertised services from ServiceDiscoveryResponse.
+    pub(crate) hu_service_ids: HashSet<i32>,
+    /// Services synthesized by aa-proxy-rs and exposed only to the phone side.
+    pub(crate) injected_service_ids: HashSet<i32>,
+    /// Channels corresponding to injected services that must never be forwarded to HU.
+    pub(crate) injected_channels: HashSet<u8>,
+    /// Injected media service_id/channel -> display type.
+    pub(crate) injected_media_display: HashMap<u8, DisplayType>,
+    /// Per-channel media state for injected virtual sinks (hidden from HU).
+    pub(crate) injected_media_state: HashMap<u8, InjectedMediaState>,
+    /// Last observed tap client connection generation by media channel.
+    pub(crate) injected_media_connect_gen: HashMap<u8, u64>,
+    /// Last observed tap-consumer presence by media channel.
+    pub(crate) injected_media_had_tap_client: HashMap<u8, bool>,
     /// VEC service ids injected by aa-proxy-rs into the service discovery response.
     pub(crate) vendor_service_ids: HashSet<u8>,
     /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
@@ -157,6 +175,14 @@ pub enum PacketAction {
     Drop,
     /// Send the packet back toward the originating side (crafted reply).
     SendBack,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketFlow {
+    /// Packet observed on endpoint reader path (device -> proxy).
+    FromEndpoint,
+    /// Packet observed on forwarding path (proxy -> endpoint).
+    ToEndpoint,
 }
 
 /// rust-openssl doesn't support BIO_s_mem
@@ -337,6 +363,7 @@ pub async fn pkt_debug(
         MESSAGE_AUTH_COMPLETE => &AuthResponse::parse_from_bytes(data)?,
         MESSAGE_SERVICE_DISCOVERY_REQUEST => &ServiceDiscoveryRequest::parse_from_bytes(data)?,
         MESSAGE_SERVICE_DISCOVERY_RESPONSE => &ServiceDiscoveryResponse::parse_from_bytes(data)?,
+        MESSAGE_SERVICE_DISCOVERY_UPDATE => &ServiceDiscoveryUpdate::parse_from_bytes(data)?,
         MESSAGE_PING_REQUEST => &PingRequest::parse_from_bytes(data)?,
         MESSAGE_PING_RESPONSE => &PingResponse::parse_from_bytes(data)?,
         MESSAGE_NAV_FOCUS_REQUEST => &NavFocusRequestNotification::parse_from_bytes(data)?,
@@ -546,6 +573,7 @@ fn choose_bt_sco_media_bridge_sink(
 /// packet modification hook
 pub async fn pkt_modify_hook(
     proxy_type: ProxyType,
+    flow: PacketFlow,
     pkt: &mut Packet,
     ctx: &mut ModifyContext,
     tap_media: bool,
@@ -973,6 +1001,16 @@ pub async fn pkt_modify_hook(
         }
     }
 
+    let control = protos::ControlMessageType::from_i32(message_id);
+    let control_allowed_on_service_channel = matches!(
+        control,
+        Some(MESSAGE_CHANNEL_OPEN_REQUEST | MESSAGE_CHANNEL_OPEN_RESPONSE)
+    );
+
+    if pkt.channel != 0 && !control_allowed_on_service_channel {
+        return Ok(PacketAction::Forward);
+    }
+
     if pkt.channel != 0 {
         // Non-zero channel AAP lifecycle/control frame.
         // Keep this separate from our custom vendor app-data parser.
@@ -1052,14 +1090,12 @@ pub async fn pkt_modify_hook(
             };
             return handle_vendor_channel_packet(pkt, ctx, vec_event_runtime).await;
         }
-
-        return Ok(PacketAction::Forward);
     }
+
     // trying to obtain an Enum from message_id
-    let control = protos::ControlMessageType::from_i32(message_id);
     debug!(
-        "message_id = {:04X}, {:?}, proxy_type: {:?}",
-        message_id, control, proxy_type
+        "message_id = {:04X}, {:?}, proxy_type: {:?}, flow: {:?}",
+        message_id, control, proxy_type, flow
     );
 
     // parsing data
@@ -1092,6 +1128,44 @@ pub async fn pkt_modify_hook(
 
             let service_id = msg.service_id() as u8;
 
+            // display code
+            let injected = ctx.injected_service_ids.contains(&msg.service_id());
+            let hu_known = ctx.hu_service_ids.contains(&msg.service_id());
+
+            info!(
+                "{} <blue>ChannelOpenRequest:</> flow={:?}, service_id=<b>{}</>, priority={}, injected={}, hu_known={}",
+                get_name(proxy_type),
+                flow,
+                service_id,
+                msg.priority(),
+                injected,
+                hu_known
+            );
+
+            if injected {
+                if proxy_type == ProxyType::HeadUnit && flow == PacketFlow::ToEndpoint {
+                    // Keep injected services hidden from HU: answer locally with success.
+                    ctx.injected_channels.insert(service_id);
+
+                    let mut response = ChannelOpenResponse::new();
+                    response.set_status(MessageStatus::STATUS_SUCCESS);
+                    let mut payload = response.write_to_bytes()?;
+                    payload.insert(0, ((MESSAGE_CHANNEL_OPEN_RESPONSE as u16) >> 8) as u8);
+                    payload.insert(1, ((MESSAGE_CHANNEL_OPEN_RESPONSE as u16) & 0xff) as u8);
+                    pkt.payload = payload;
+
+                    info!(
+                        "{} <yellow>transparency:</> synthesized CHANNEL_OPEN_RESPONSE for injected service_id <b>{}</>; HU path suppressed",
+                        get_name(proxy_type),
+                        service_id
+                    );
+
+                    // handled=true => send this reply packet back to MD side only.
+                    return Ok(PacketAction::SendBack);
+                }
+            }
+
+            // VEC code
             info!(
                 "{} <yellow>{:?}</>: received CHANNEL_OPEN_REQUEST for service_id=<b>{:#04x}</> vendor_match={}",
                 get_name(proxy_type),
@@ -1149,21 +1223,26 @@ pub async fn pkt_modify_hook(
                 ctx.sensors = Some(svc.sensor_source_service.sensors.clone());
             }
 
+            if proxy_type == ProxyType::HeadUnit {
+                ctx.hu_service_ids = msg.services.iter().map(|s| s.id()).collect();
+            }
+
             // Populate media_channels (channel_id→sink) from the offset→sink map.
-            // Must run in MobileDevice context where the sinks are held —
-            // the SDR response from HU passes through proxy(MobileDevice).rxr first.
-            if proxy_type == ProxyType::MobileDevice && !ctx.media_sinks.is_empty() {
+            // Both MD and HU need this; for HU, we'll populate again after add_display_services
+            // to include injected services (cluster, etc).
+            if !ctx.media_sinks.is_empty() {
                 for svc in msg.services.iter() {
                     let ch = svc.id() as u8;
                     if !svc.media_sink_service.video_configs.is_empty() {
                         let offset = svc.media_sink_service.display_type().value() as u8;
                         if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
-                            sink.set_video_stream_info(
-                                svc.media_sink_service.available_type(),
-                                svc.media_sink_service.display_type(),
-                            )
-                            .await;
                             ctx.media_channels.insert(ch, sink);
+                            debug!(
+                                "{} media_channels.insert: ch={:#04x} offset={}",
+                                get_name(proxy_type),
+                                ch,
+                                offset
+                            );
                             info!(
                                 "{} <blue>media tap:</> video channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
                                 get_name(proxy_type),
@@ -1193,7 +1272,23 @@ pub async fn pkt_modify_hook(
                                 audio_config,
                             )
                             .await;
+
+                            let audio_config =
+                                svc.media_sink_service.audio_configs.first().map(|acfg| {
+                                    AudioStreamConfig {
+                                        sample_rate: acfg.sampling_rate(),
+                                        channels: acfg.number_of_channels(),
+                                        bits: acfg.number_of_bits(),
+                                    }
+                                });
+
                             ctx.media_channels.insert(ch, sink);
+                            debug!(
+                                "{} media_channels.insert: ch={:#04x} offset={}",
+                                get_name(proxy_type),
+                                ch,
+                                offset
+                            );
                             if let Some(acfg) = audio_config {
                                 info!(
                                     "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?}, {}Hz, {}ch, {}bit)",
@@ -1629,6 +1724,123 @@ pub async fn pkt_modify_hook(
                 }
             }
 
+            let added_services = add_display_services(&mut msg, cfg);
+            if added_services > 0 {
+                let before_ids: HashSet<i32> = ctx.hu_service_ids.clone();
+                let after_ids: HashSet<i32> = msg.services.iter().map(|s| s.id()).collect();
+                for sid in after_ids.difference(&before_ids) {
+                    ctx.injected_service_ids.insert(*sid);
+                    if let Some(svc) = msg.services.iter().find(|s| s.id() == *sid) {
+                        if !svc.media_sink_service.video_configs.is_empty() {
+                            ctx.injected_media_display
+                                .insert(*sid as u8, svc.media_sink_service.display_type());
+                        }
+                    }
+                }
+                info!(
+                    "{} <yellow>{:?}</>: injected <b>{}</> display service(s)",
+                    get_name(proxy_type),
+                    control.unwrap(),
+                    added_services,
+                );
+                info!(
+                    "{} <blue>injected service ids:</> <b>{:?}</>",
+                    get_name(proxy_type),
+                    ctx.injected_service_ids
+                );
+            }
+
+            // Populate media_channels (channel_id→sink) from the offset→sink map.
+            // Do this after add_display_services so HU includes injected channels (e.g., cluster 0x08).
+            // Both proxy contexts use this for injected suppression/deferred focus evaluation.
+            debug!(
+                "{} SDR handling: media_sinks.len()={} media_channels.len()={}",
+                get_name(proxy_type),
+                ctx.media_sinks.len(),
+                ctx.media_channels.len()
+            );
+
+            if !ctx.media_sinks.is_empty() {
+                for svc in msg.services.iter() {
+                    let ch = svc.id() as u8;
+                    if !svc.media_sink_service.video_configs.is_empty() {
+                        let offset = svc.media_sink_service.display_type().value() as u8;
+                        if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
+                            sink.set_video_stream_info(
+                                svc.media_sink_service.available_type(),
+                                svc.media_sink_service.display_type(),
+                            )
+                            .await;
+                            ctx.media_channels.insert(ch, sink);
+                            debug!(
+                                "{} media_channels.insert: ch={:#04x} offset={}",
+                                get_name(proxy_type),
+                                ch,
+                                offset
+                            );
+                            info!(
+                                "{} <blue>media tap:</> video channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
+                                get_name(proxy_type),
+                                ch,
+                                offset,
+                                svc.media_sink_service.available_type(),
+                                svc.media_sink_service.display_type()
+                            );
+                        }
+                    } else if !svc.media_sink_service.audio_configs.is_empty()
+                        || svc.media_sink_service.audio_type.is_some()
+                    {
+                        // audio offset = audio_type value + 2 (offsets 0-2 reserved for video)
+                        let offset = svc.media_sink_service.audio_type().value() as u8 + 2;
+                        if let Some(sink) = ctx.media_sinks.get(&offset).cloned() {
+                            let audio_config =
+                                svc.media_sink_service.audio_configs.first().map(|acfg| {
+                                    AudioStreamConfig {
+                                        sample_rate: acfg.sampling_rate(),
+                                        channels: acfg.number_of_channels(),
+                                        bits: acfg.number_of_bits(),
+                                    }
+                                });
+                            sink.set_audio_stream_info(
+                                svc.media_sink_service.available_type(),
+                                svc.media_sink_service.audio_type(),
+                                audio_config,
+                            )
+                            .await;
+                            ctx.media_channels.insert(ch, sink);
+                            debug!(
+                                "{} media_channels.insert: ch={:#04x} offset={}",
+                                get_name(proxy_type),
+                                ch,
+                                offset
+                            );
+                            if let Some(acfg) = audio_config {
+                                info!(
+                                    "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?}, {}Hz, {}ch, {}bit)",
+                                    get_name(proxy_type),
+                                    ch,
+                                    offset,
+                                    svc.media_sink_service.available_type(),
+                                    svc.media_sink_service.audio_type(),
+                                    acfg.sample_rate,
+                                    acfg.channels,
+                                    acfg.bits
+                                );
+                            } else {
+                                info!(
+                                    "{} <blue>media tap:</> audio channel <b>{:#04x}</> → port offset <b>{}</> ({:?}, {:?})",
+                                    get_name(proxy_type),
+                                    ch,
+                                    offset,
+                                    svc.media_sink_service.available_type(),
+                                    svc.media_sink_service.audio_type()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // add vendor channel as extra, do not touch existing HU channels
             // this must be last entry do not replace
             if cfg.add_vendor_channel {
@@ -1676,6 +1888,34 @@ pub async fn pkt_modify_hook(
             // inserting 2 bytes of message_id at the beginning
             pkt.payload.insert(0, (message_id >> 8) as u8);
             pkt.payload.insert(1, (message_id & 0xff) as u8);
+        }
+        MESSAGE_SERVICE_DISCOVERY_UPDATE => {
+            if let Ok(msg) = ServiceDiscoveryUpdate::parse_from_bytes(data) {
+                if let Some(service) = msg.service.as_ref() {
+                    let sid = service.id();
+                    let injected = ctx.injected_service_ids.contains(&sid);
+                    let hu_advertised = ctx.hu_service_ids.contains(&sid);
+
+                    info!(
+                        "{} <blue>SDU:</> flow={:?}, service_id=<b>{}</>, injected={}, hu_advertised={}",
+                        get_name(proxy_type),
+                        flow,
+                        sid,
+                        injected,
+                        hu_advertised
+                    );
+
+                    if proxy_type == ProxyType::HeadUnit && flow == PacketFlow::FromEndpoint {
+                        ctx.hu_service_ids.insert(sid);
+                    }
+                } else {
+                    info!(
+                        "{} <blue>SDU:</> flow={:?}, no service payload",
+                        get_name(proxy_type),
+                        flow
+                    );
+                }
+            }
         }
         _ => return Ok(PacketAction::Forward),
     };
@@ -1773,6 +2013,104 @@ pub async fn send_rotary_event(tx: Sender<Packet>, input_ch: u8, delta: i32) -> 
     tx.send(pkt).await?;
     info!("mitm/web: injecting ROTARY delta={}", delta);
 
+    Ok(())
+}
+
+/// Inject a key input event on AA input channel.
+/// FIXME: make single function from this and send_key_event above
+pub async fn send_input_key(
+    tx: Sender<Packet>,
+    input_ch: u8,
+    keycode: u32,
+    down: bool,
+    longpress: bool,
+) -> Result<()> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
+
+    let mut key = key_event::Key::new();
+    key.set_keycode(keycode);
+    key.set_down(down);
+    key.set_metastate(0);
+    key.set_longpress(longpress);
+
+    let mut key_event = KeyEvent::new();
+    key_event.keys.push(key);
+
+    let mut input = InputReport::new();
+    input.set_timestamp(ts);
+    input.key_event = Some(key_event).into();
+
+    let mut payload: Vec<u8> = input.write_to_bytes()?;
+    payload.insert(0, ((INPUT_MESSAGE_INPUT_REPORT as u16) >> 8) as u8);
+    payload.insert(1, ((INPUT_MESSAGE_INPUT_REPORT as u16) & 0xff) as u8);
+
+    let pkt = Packet {
+        channel: input_ch,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    };
+    tx.send(pkt).await?;
+    info!(
+        "mitm/web: injecting INPUT_REPORT key packet (keycode={}, down={}, longpress={})...",
+        keycode, down, longpress
+    );
+
+    Ok(())
+}
+
+/// Inject toll card presence data via sensor batch.
+pub async fn send_toll_card(
+    tx: Sender<Packet>,
+    sensor_ch: u8,
+    is_card_present: bool,
+) -> Result<()> {
+    let mut msg = SensorBatch::new();
+    let mut toll = TollCardData::new();
+    toll.set_is_card_present(is_card_present);
+    msg.toll_card_data.push(toll);
+
+    // creating back binary data for sending
+    let mut payload: Vec<u8> = msg.write_to_bytes()?;
+    // add SENSOR header
+    payload.insert(0, ((SENSOR_MESSAGE_BATCH as u16) >> 8) as u8);
+    payload.insert(1, ((SENSOR_MESSAGE_BATCH as u16) & 0xff) as u8);
+
+    let pkt = Packet {
+        channel: sensor_ch,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    };
+    tx.send(pkt).await?;
+    info!(
+        "mitm/web: injecting TOLL_CARD_DATA packet (is_card_present={})...",
+        is_card_present
+    );
+
+    Ok(())
+}
+
+/// Send a ByeByeRequest on the control channel (channel 0) to the phone,
+/// requesting a clean AA session teardown with reason USER_SELECTION.
+pub async fn send_byebye(tx: Sender<Packet>) -> Result<()> {
+    let mut msg = ByeByeRequest::new();
+    msg.set_reason(ByeByeReason::USER_SELECTION);
+
+    let mut payload: Vec<u8> = msg.write_to_bytes()?;
+    // prepend 2-byte message_id for MESSAGE_BYEBYE_REQUEST (= 15 = 0x000F)
+    let msg_id = ControlMessageType::MESSAGE_BYEBYE_REQUEST as u16;
+    payload.insert(0, (msg_id >> 8) as u8);
+    payload.insert(1, (msg_id & 0xff) as u8);
+
+    let pkt = Packet {
+        channel: 0,
+        flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+        final_length: None,
+        payload,
+    };
+    tx.send(pkt).await?;
+    info!("mitm: Sending ByeByeRequest (USER_SELECTION) to phone...");
     Ok(())
 }
 
@@ -1929,7 +2267,7 @@ async fn read_input_data<A: Endpoint<A>>(
     rbuf: &mut VecDeque<u8>,
     obj: &mut IoDevice<A>,
     incremental_read: bool,
-) -> Result<()> {
+) -> Result<usize> {
     let mut newdata = vec![0u8; BUFFER_LEN];
     let mut n;
     let mut len;
@@ -1976,13 +2314,17 @@ async fn read_input_data<A: Endpoint<A>>(
                 .await
                 .context("read_input_data: TcpStreamIo timeout")?;
             len = n.context("read_input_data: TcpStreamIo read error")?;
+            if len == 0 {
+                // TCP EOF means the peer closed the connection; propagate as disconnect.
+                return Err("read_input_data: TcpStreamIo EOF".into());
+            }
         }
         _ => todo!(),
     }
     if len > 0 {
         rbuf.write(&newdata.slice(..len))?;
     }
-    Ok(())
+    Ok(len)
 }
 
 /// runtime musl detection
@@ -2002,13 +2344,22 @@ pub async fn endpoint_reader<A: Endpoint<A>>(
         read_input_data(&mut rbuf, &mut device, incremental_read).await?;
         // check if we have complete packet available
         loop {
-            if rbuf.len() > HEADER_LENGTH {
+            // Accept packets as soon as we have the complete fixed header.
+            // Using >= is required for valid zero-payload frames (frame_size == HEADER_LENGTH).
+            if rbuf.len() >= HEADER_LENGTH {
                 let channel = rbuf[0];
                 let flags = rbuf[1];
+
+                // FIRST frames carry an extended 8-byte header. If only 4 bytes
+                // are buffered, wait for the remaining header bytes before parsing.
+                if (flags & FRAME_TYPE_MASK) == FRAME_TYPE_FIRST && rbuf.len() < 8 {
+                    break;
+                }
+
                 let mut header_size = HEADER_LENGTH;
                 let mut final_length = None;
                 let payload_size = (rbuf[3] as u16 + ((rbuf[2] as u16) << 8)) as usize;
-                if rbuf.len() > 8 && (flags & FRAME_TYPE_MASK) == FRAME_TYPE_FIRST {
+                if rbuf.len() >= 8 && (flags & FRAME_TYPE_MASK) == FRAME_TYPE_FIRST {
                     header_size += 4;
                     final_length = Some(
                         ((rbuf[4] as u32) << 24)
@@ -2278,16 +2629,79 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         media_sinks,
         media_channels: HashMap::new(),
         media_fragments: HashMap::new(),
+        hu_service_ids: HashSet::new(),
+        injected_service_ids: HashSet::new(),
+        injected_channels: HashSet::new(),
+        injected_media_display: HashMap::new(),
+        injected_media_state: HashMap::new(),
+        injected_media_connect_gen: HashMap::new(),
+        injected_media_had_tap_client: HashMap::new(),
         vendor_service_ids: HashSet::new(),
         vendor_channel_states: HashMap::new(),
         vendor_topic_event_bridges: HashMap::new(),
     };
+    let mut focus_poll = tokio::time::interval(Duration::from_millis(100));
+    focus_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    focus_poll.tick().await;
     loop {
         tokio::select! {
         // handling data from opposite device's thread, which needs to be transmitted
         Some(mut pkt) = rx.recv() => {
+            if proxy_type == ProxyType::HeadUnit {
+                maybe_emit_pending_injected_focus(proxy_type, &mut ctx, &cfg, &tx)?;
+            }
+
+            // Keep injected-only channels invisible to HU.
+            if proxy_type == ProxyType::HeadUnit
+                && pkt.channel != 0
+                && ctx.injected_channels.contains(&pkt.channel)
+            {
+                let had_fragment_state = ctx.media_fragments.contains_key(&pkt.channel);
+                // Injected media packets were already tapped on the MobileDevice ingress path.
+                // Reassemble here only so ACK synthesis can track whole media messages.
+                let reassembled_frame = reassemble_media_packet(&mut ctx.media_fragments, &pkt);
+
+                if emulate_injected_media_packet(
+                    proxy_type,
+                    &mut pkt,
+                    &mut ctx,
+                    reassembled_frame.as_deref(),
+                    had_fragment_state,
+                )? {
+                    debug!(
+                        "{} synthesized injected media reply on channel <b>{:#04x}</>",
+                        get_name(proxy_type),
+                        pkt.channel
+                    );
+                    tx.send(pkt).await?;
+
+                    maybe_emit_pending_injected_focus(proxy_type, &mut ctx, &cfg, &tx)?;
+
+                    continue;
+                }
+
+                let msg_id = pkt.payload
+                    .get(0..2)
+                    .map(|bytes| {
+                        format!(
+                            "0x{:04X}",
+                            u16::from_be_bytes([bytes[0], bytes[1]])
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+
+                debug!(
+                    "{} dropping injected channel packet towards HU on channel <b>{:#04x}</> message_id={}",
+                    get_name(proxy_type),
+                    pkt.channel,
+                    msg_id
+                );
+                continue;
+            }
+
             let action = pkt_modify_hook(
                 proxy_type,
+                PacketFlow::ToEndpoint,
                 &mut pkt,
                 &mut ctx,
                 false,
@@ -2342,6 +2756,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 Ok(_) => {
                     let action = pkt_modify_hook(
                         proxy_type,
+                        PacketFlow::FromEndpoint,
                         &mut pkt,
                         &mut ctx,
                         proxy_type == ProxyType::MobileDevice,
@@ -2372,6 +2787,10 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 Err(e) => error!("decrypt_payload: {:?}", e),
             }
         }
+
+        _ = focus_poll.tick(), if proxy_type == ProxyType::HeadUnit => {
+            maybe_emit_pending_injected_focus(proxy_type, &mut ctx, &cfg, &tx)?;
+        }
         }
     }
 }
@@ -2395,6 +2814,13 @@ mod tests {
             media_sinks: HashMap::new(),
             media_channels: HashMap::new(),
             media_fragments: HashMap::new(),
+            hu_service_ids: HashSet::new(),
+            injected_service_ids: HashSet::new(),
+            injected_channels: HashSet::new(),
+            injected_media_display: HashMap::new(),
+            injected_media_state: HashMap::new(),
+            injected_media_connect_gen: HashMap::new(),
+            injected_media_had_tap_client: HashMap::new(),
             vendor_service_ids: HashSet::new(),
             vendor_channel_states: HashMap::new(),
             vendor_topic_event_bridges: HashMap::new(),
