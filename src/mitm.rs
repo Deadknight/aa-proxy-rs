@@ -1008,14 +1008,6 @@ pub async fn pkt_modify_hook(
     }
 
     let control = protos::ControlMessageType::from_i32(message_id);
-    let control_allowed_on_service_channel = matches!(
-        control,
-        Some(MESSAGE_CHANNEL_OPEN_REQUEST | MESSAGE_CHANNEL_OPEN_RESPONSE)
-    );
-
-    if pkt.channel != 0 && !control_allowed_on_service_channel {
-        return Ok(PacketAction::Forward);
-    }
 
     if pkt.channel != 0 {
         // Non-zero channel AAP lifecycle/control frame.
@@ -1080,6 +1072,8 @@ pub async fn pkt_modify_hook(
             }
         }
 
+        // Vendor-extension app-data is not an AAP control message, so it must be
+        // intercepted before the generic non-zero-channel forward guard below.
         if is_vendor_channel(ctx, pkt.channel) {
             debug!(
                 "{} intercepted VEC app-data packet channel=<b>{:#04x}</> len={} proxy_type={:?} state={:?}",
@@ -1095,6 +1089,15 @@ pub async fn pkt_modify_hook(
                 script_registry: script_registry.clone(),
             };
             return handle_vendor_channel_packet(pkt, ctx, vec_event_runtime).await;
+        }
+
+        let control_allowed_on_service_channel = matches!(
+            control,
+            Some(MESSAGE_CHANNEL_OPEN_REQUEST | MESSAGE_CHANNEL_OPEN_RESPONSE)
+        );
+
+        if !control_allowed_on_service_channel {
+            return Ok(PacketAction::Forward);
         }
     }
 
