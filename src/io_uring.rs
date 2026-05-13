@@ -2,6 +2,7 @@
 use crate::script_wasm::ScriptRegistry;
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
+use crate::mitm::SharedServiceDiscoveryResponse;
 use crate::web::ServerEvent;
 use bytesize::ByteSize;
 use core::net::SocketAddr;
@@ -433,6 +434,7 @@ pub async fn io_loop(
     input_channel: Arc<Mutex<Option<u8>>>,
     last_battery: Arc<RwLock<Option<BatteryData>>>,
     last_speed: Arc<RwLock<Option<i32>>>,
+    last_service_discovery_response: SharedServiceDiscoveryResponse,
     usb_connected: Arc<AtomicBool>,
     script_registry: Option<Arc<ScriptRegistry>>,
     ws_event_tx: BroadcastSender<ServerEvent>,
@@ -690,6 +692,7 @@ pub async fn io_loop(
             input_channel.clone(),
             last_battery.clone(),
             last_speed.clone(),
+            last_service_discovery_response.clone(),
             ev_tx.clone(),
             Some(tx_hu.clone()),
             script_registry.clone(),
@@ -708,6 +711,7 @@ pub async fn io_loop(
             input_channel.clone(),
             last_battery.clone(),
             last_speed.clone(),
+            last_service_discovery_response.clone(),
             ev_tx.clone(),
             Some(tx_md.clone()),
             script_registry.clone(),

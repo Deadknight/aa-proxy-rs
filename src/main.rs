@@ -14,6 +14,7 @@ use aa_proxy_rs::led::{LedColor, LedManager, LedMode};
 use aa_proxy_rs::mitm::send_byebye;
 use aa_proxy_rs::mitm::OdometerData;
 use aa_proxy_rs::mitm::Packet;
+use aa_proxy_rs::mitm::SharedServiceDiscoveryResponse;
 use aa_proxy_rs::mitm::TirePressureData;
 #[cfg(feature = "wasm-scripting")]
 use aa_proxy_rs::script_wasm::start_wasm_engine;
@@ -249,6 +250,7 @@ async fn tokio_main(
     last_battery_data: Arc<RwLock<Option<BatteryData>>>,
     last_odometer_data: Arc<RwLock<Option<OdometerData>>>,
     last_speed: Arc<RwLock<Option<i32>>>,
+    last_service_discovery_response: SharedServiceDiscoveryResponse,
     last_tire_pressure_data: Arc<RwLock<Option<TirePressureData>>>,
     led_support: bool,
     button_support: bool,
@@ -269,6 +271,7 @@ async fn tokio_main(
         last_battery_data,
         last_odometer_data,
         last_speed,
+        last_service_discovery_response,
         last_tire_pressure_data,
         ws_event_tx,
         script_registry,
@@ -727,6 +730,8 @@ fn main() -> Result<()> {
     let last_odometer_data = Arc::new(RwLock::new(None));
     let last_speed: Arc<RwLock<Option<i32>>> = Arc::new(RwLock::new(None));
     let last_speed_cloned = last_speed.clone();
+    let last_service_discovery_response = Arc::new(RwLock::new(None));
+    let last_service_discovery_response_cloned = last_service_discovery_response.clone();
     let last_tire_pressure_data = Arc::new(RwLock::new(None));
     let usb_connected = Arc::new(AtomicBool::new(false));
     let usb_connected_cloned = usb_connected.clone();
@@ -771,6 +776,7 @@ fn main() -> Result<()> {
             last_battery_data_cloned,
             last_odometer_data,
             last_speed_cloned,
+            last_service_discovery_response_cloned,
             last_tire_pressure_data,
             led_support,
             button_support,
@@ -792,6 +798,7 @@ fn main() -> Result<()> {
         input_channel,
         last_battery_data,
         last_speed,
+        last_service_discovery_response,
         usb_connected,
         script_registry.clone(),
         ws_event_tx.clone(),
