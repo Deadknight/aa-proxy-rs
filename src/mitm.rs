@@ -88,6 +88,9 @@ pub fn get_name(proxy_type: ProxyType) -> String {
 // async contexts needs some extra restrictions
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Last ServiceDiscoveryResponse observed by the MITM path, stored as protobuf JSON.
+pub type SharedServiceDiscoveryResponse = Arc<RwLock<Option<serde_json::Value>>>;
+
 // message related constants:
 pub const HEADER_LENGTH: usize = 4;
 pub const FRAME_TYPE_FIRST: u8 = 1 << 0;
@@ -579,6 +582,34 @@ fn choose_bt_sco_media_bridge_sink(
     best.map(|(score, channel, cfg, audio_type)| (channel, cfg, audio_type, score))
 }
 
+async fn update_last_service_discovery_response(
+    proxy_type: ProxyType,
+    last_service_discovery_response: &SharedServiceDiscoveryResponse,
+    msg: &ServiceDiscoveryResponse,
+) {
+    match protobuf_json_mapping::print_to_string(msg) {
+        Ok(json_string) => match serde_json::from_str::<serde_json::Value>(&json_string) {
+            Ok(json_value) => {
+                *last_service_discovery_response.write().await = Some(json_value);
+            }
+            Err(e) => {
+                warn!(
+                    "{} failed to parse protobuf JSON ServiceDiscoveryResponse: {}",
+                    get_name(proxy_type),
+                    e
+                );
+            }
+        },
+        Err(e) => {
+            warn!(
+                "{} failed to convert ServiceDiscoveryResponse to JSON: {}",
+                get_name(proxy_type),
+                e
+            );
+        }
+    }
+}
+
 /// packet modification hook
 pub async fn pkt_modify_hook(
     proxy_type: ProxyType,
@@ -590,6 +621,7 @@ pub async fn pkt_modify_hook(
     input_channel: Arc<tokio::sync::Mutex<Option<u8>>>,
     last_battery: Arc<RwLock<Option<BatteryData>>>,
     last_speed: Arc<RwLock<Option<i32>>>,
+    last_service_discovery_response: SharedServiceDiscoveryResponse,
     cfg: &AppConfig,
     config: &mut SharedConfig,
     script_registry: Option<Arc<ScriptRegistry>>,
@@ -1008,14 +1040,6 @@ pub async fn pkt_modify_hook(
     }
 
     let control = protos::ControlMessageType::from_i32(message_id);
-    let control_allowed_on_service_channel = matches!(
-        control,
-        Some(MESSAGE_CHANNEL_OPEN_REQUEST | MESSAGE_CHANNEL_OPEN_RESPONSE)
-    );
-
-    if pkt.channel != 0 && !control_allowed_on_service_channel {
-        return Ok(PacketAction::Forward);
-    }
 
     if pkt.channel != 0 {
         // Non-zero channel AAP lifecycle/control frame.
@@ -1080,6 +1104,8 @@ pub async fn pkt_modify_hook(
             }
         }
 
+        // Vendor-extension app-data is not an AAP control message, so it must be
+        // intercepted before the generic non-zero-channel forward guard below.
         if is_vendor_channel(ctx, pkt.channel) {
             debug!(
                 "{} intercepted VEC app-data packet channel=<b>{:#04x}</> len={} proxy_type={:?} state={:?}",
@@ -1095,6 +1121,15 @@ pub async fn pkt_modify_hook(
                 script_registry: script_registry.clone(),
             };
             return handle_vendor_channel_packet(pkt, ctx, vec_event_runtime).await;
+        }
+
+        let control_allowed_on_service_channel = matches!(
+            control,
+            Some(MESSAGE_CHANNEL_OPEN_REQUEST | MESSAGE_CHANNEL_OPEN_RESPONSE)
+        );
+
+        if !control_allowed_on_service_channel {
+            return Ok(PacketAction::Forward);
         }
     }
 
@@ -1890,6 +1925,13 @@ pub async fn pkt_modify_hook(
                 protobuf::text_format::print_to_string_pretty(&msg)
             );
 
+            update_last_service_discovery_response(
+                proxy_type,
+                &last_service_discovery_response,
+                &msg,
+            )
+            .await;
+
             // rewrite payload to new message contents
             pkt.payload = msg.write_to_bytes()?;
             // inserting 2 bytes of message_id at the beginning
@@ -2461,6 +2503,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
     input_channel: Arc<tokio::sync::Mutex<Option<u8>>>,
     last_battery: Arc<RwLock<Option<BatteryData>>>,
     last_speed: Arc<RwLock<Option<i32>>>,
+    last_service_discovery_response: SharedServiceDiscoveryResponse,
     ev_tx: Sender<EvTaskCommand>,
     hu_tx: Option<Sender<Packet>>,
     script_registry: Option<Arc<ScriptRegistry>>,
@@ -2716,6 +2759,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                 input_channel.clone(),
                 last_battery.clone(),
                 last_speed.clone(),
+                last_service_discovery_response.clone(),
                 &cfg,
                 &mut config,
                 script_registry.clone(),
@@ -2771,6 +2815,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         input_channel.clone(),
                         last_battery.clone(),
                         last_speed.clone(),
+                        last_service_discovery_response.clone(),
                         &cfg,
                         &mut config,
                         script_registry.clone(),

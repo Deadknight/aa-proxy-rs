@@ -19,6 +19,7 @@ use crate::mitm::send_key_event;
 use crate::mitm::send_rotary_event;
 use crate::mitm::send_toll_card;
 use crate::mitm::Packet;
+use crate::mitm::SharedServiceDiscoveryResponse;
 use crate::mitm::Result;
 use crate::mitm::{send_odometer_data, OdometerData};
 use crate::mitm::{send_tire_pressure_data, TirePressureData};
@@ -132,6 +133,7 @@ pub struct AppState {
     pub last_battery_data: Arc<RwLock<Option<BatteryData>>>,
     pub last_odometer_data: Arc<RwLock<Option<OdometerData>>>,
     pub last_speed: Arc<RwLock<Option<i32>>>,
+    pub last_service_discovery_response: SharedServiceDiscoveryResponse,
     pub last_tire_pressure_data: Arc<RwLock<Option<TirePressureData>>>,
     pub ws_event_tx: broadcast::Sender<ServerEvent>,
     pub script_registry: Option<Arc<ScriptRegistry>>,
@@ -165,6 +167,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/factory-reset", post(factory_reset_handler))
         .route("/set-time", post(set_time_handler))
         .route("/speed", get(speed_handler))
+        .route("/service-discovery-response", get(service_discovery_response_handler))
         .route("/version", get(version_handler))
         .route("/ws", get(ws_handler))
         .route("/raw-topic-data", post(raw_topic_data_handler))
@@ -1144,6 +1147,24 @@ async fn speed_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         Json(serde_json::json!({ "speed": d })).into_response()
     } else {
         (StatusCode::NO_CONTENT, "No speed data yet").into_response()
+    }
+}
+
+async fn service_discovery_response_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let data = state.last_service_discovery_response.read().await;
+    if let Some(value) = data.clone() {
+        Json(value).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "service_discovery_response_not_available",
+                "message": "No ServiceDiscoveryResponse has been observed yet"
+            })),
+        )
+            .into_response()
     }
 }
 
