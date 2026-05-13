@@ -61,6 +61,116 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BtScoMediaBridgeAudioType {
+    Guidance,
+    Media,
+    Auto,
+}
+
+impl Default for BtScoMediaBridgeAudioType {
+    fn default() -> Self {
+        Self::Guidance
+    }
+}
+
+impl Display for BtScoMediaBridgeAudioType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Guidance => "guidance",
+            Self::Media => "media",
+            Self::Auto => "auto",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BtScoMediaBridgeLimiter {
+    Off,
+    Hard,
+    Soft,
+}
+
+impl Default for BtScoMediaBridgeLimiter {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl Display for BtScoMediaBridgeLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Hard => "hard",
+            Self::Soft => "soft",
+        })
+    }
+}
+
+impl BtScoMediaBridgeLimiter {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Hard,
+            2 => Self::Soft,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Hard => 1,
+            Self::Soft => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BtScoMediaBridgeResampler {
+    Repeat,
+    Linear,
+}
+
+impl Default for BtScoMediaBridgeResampler {
+    fn default() -> Self {
+        Self::Repeat
+    }
+}
+
+impl Display for BtScoMediaBridgeResampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Repeat => "repeat",
+            Self::Linear => "linear",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BtScoMicEchoControl {
+    Off,
+    Ducking,
+}
+
+impl Default for BtScoMicEchoControl {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl Display for BtScoMicEchoControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Ducking => "ducking",
+        })
+    }
+}
+
 fn webserver_default_bind() -> Option<String> {
     Some("0.0.0.0:80".into())
 }
@@ -195,6 +305,82 @@ pub struct AppConfig {
     /// Requires `mitm = true`.
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub hu_button_handler: Option<String>,
+
+    /// Master switch for the experimental Bluetooth SCO/eSCO call-audio bridge/listener.
+    ///
+    /// When enabled, the SCO listener can stay active and, if configured, bridge
+    /// call downlink/uplink audio.
+    pub bt_sco: bool,
+    /// Keep the Android Auto Bluetooth profile/RFCOMM connection alive after Wi-Fi
+    /// bootstrap while the SCO bridge is enabled. This is required when the phone
+    /// should keep routing call audio to aa-proxy-rs instead of dropping BT after
+    /// the AA Wi-Fi setup phase.
+    pub bt_sco_keep_bluetooth_alive: bool,
+    /// Experimental downlink bridge: SCO call audio -> AA PCM media sink.
+    /// Disabled by default. Requires `mitm = true`.
+    pub bt_sco_media_bridge: bool,
+    /// Preferred AA PCM sink type for SCO downlink.
+    /// Values: `guidance`, `media`, or `auto`. For phone calls, `guidance` is
+    /// often more audible because AA/HU may mute the normal media stream while a
+    /// call and microphone session are active.
+    pub bt_sco_media_bridge_audio_type: BtScoMediaBridgeAudioType,
+    /// Output gain for SCO downlink after conversion, as percent. 100 means no gain.
+    /// Useful because the raw SCO downlink can be quiet on some phones/HUs.
+    pub bt_sco_media_bridge_gain_percent: u32,
+    /// Optional limiter applied after gain. `off` keeps the existing behavior
+    /// except for unavoidable i16 saturation; `hard` clips earlier; `soft`
+    /// compresses peaks more gently.
+    pub bt_sco_media_bridge_limiter: BtScoMediaBridgeLimiter,
+    /// SCO 8 kHz -> AA 48 kHz resampler. `repeat` preserves the proven path;
+    /// `linear` smooths the 6x upsampling and can reduce roughness/crackle.
+    pub bt_sco_media_bridge_resampler: BtScoMediaBridgeResampler,
+    /// Converted AA PCM chunk ring capacity for the SCO media bridge.
+    /// Higher values tolerate stalls; lower values reduce latency. 128 is safe.
+    pub bt_sco_media_bridge_ring_capacity: usize,
+    /// Send MEDIA_MESSAGE_START on the selected, already-configured AA PCM sink
+    /// when SCO connects. This is useful for DHU/HUs that discard DATA until the
+    /// existing stream is explicitly started. CHANNEL_OPEN/SETUP are still not sent.
+    pub bt_sco_media_bridge_start_existing: bool,
+    /// If enabled, delay MEDIA_MESSAGE_START/DATA until the SCO downlink carries
+    /// non-silent audio. This helps diagnose/avoid call-routing cases where the
+    /// phone opens SCO but sends silence until the route is toggled.
+    pub bt_sco_media_bridge_start_on_first_audio: bool,
+    /// Peak threshold used by start_on_first_audio. Values below this are treated
+    /// as silence after conversion/gain. 64 is conservative for 16-bit PCM.
+    pub bt_sco_media_bridge_audio_peak_threshold: u32,
+    /// Fallback timeout for start_on_first_audio. If no non-silent downlink is
+    /// seen within this many milliseconds, START/DATA begins anyway so calls are
+    /// not muted forever.
+    pub bt_sco_media_bridge_start_timeout_ms: u32,
+    /// Send MEDIA_MESSAGE_STOP on the selected existing AA PCM sink when SCO disconnects.
+    pub bt_sco_media_bridge_stop_existing_on_disconnect: bool,
+    /// If enabled, pace outgoing AA DATA packets with a fixed cadence instead
+    /// of sending as soon as converted SCO chunks arrive. This can reduce jitter
+    /// on some HUs, but is disabled by default to preserve the proven behavior.
+    pub bt_sco_media_bridge_fixed_cadence: bool,
+    /// Fixed DATA cadence in milliseconds when fixed cadence is enabled.
+    pub bt_sco_media_bridge_cadence_ms: u32,
+    /// Minimum converted-audio buffer before the first fixed-cadence DATA packet.
+    pub bt_sco_media_bridge_jitter_buffer_ms: u32,
+    /// Experimental uplink bridge: AA HU microphone/source PCM -> Bluetooth SCO uplink.
+    /// Disabled by default. Requires `mitm = true`.
+    pub bt_sco_mic_bridge: bool,
+    /// Send AA MEDIA_MESSAGE_MICROPHONE_REQUEST open/close while SCO is connected.
+    /// Keep enabled for the first mic test; disable to observe/passively log mic frames only.
+    pub bt_sco_mic_request: bool,
+    /// Maximum 60-byte SCO uplink packets buffered for the mic bridge.
+    pub bt_sco_mic_uplink_ring_capacity: usize,
+    /// Echo handling for the microphone uplink. `off` preserves the current
+    /// proven path; `ducking` lowers mic gain while downlink audio is active.
+    pub bt_sco_mic_echo_control: BtScoMicEchoControl,
+    /// Microphone uplink gain percent after echo processing. 100 means no gain.
+    pub bt_sco_mic_gain_percent: u32,
+    /// Downlink peak threshold that marks far-end audio as active for ducking.
+    pub bt_sco_mic_duck_threshold: i16,
+    /// Mic gain percent while far-end/downlink audio is active.
+    pub bt_sco_mic_duck_percent: u32,
+    /// How long to keep ducking after the last active downlink frame.
+    pub bt_sco_mic_duck_hold_ms: u32,
 
     /// Directory where `.wasm` hook files are loaded from.
     /// Each script gets read-only WASI access only to a private subfolder named
@@ -394,6 +580,30 @@ impl Default for AppConfig {
             collect_speed: false,
             disable_driving_status: false,
             hu_button_handler: None,
+            bt_sco: false,
+            bt_sco_keep_bluetooth_alive: true,
+            bt_sco_media_bridge: true,
+            bt_sco_media_bridge_audio_type: BtScoMediaBridgeAudioType::Media,
+            bt_sco_media_bridge_gain_percent: 300,
+            bt_sco_media_bridge_limiter: BtScoMediaBridgeLimiter::Off,
+            bt_sco_media_bridge_resampler: BtScoMediaBridgeResampler::Repeat,
+            bt_sco_media_bridge_ring_capacity: 128,
+            bt_sco_media_bridge_start_existing: true,
+            bt_sco_media_bridge_start_on_first_audio: true,
+            bt_sco_media_bridge_audio_peak_threshold: 256,
+            bt_sco_media_bridge_start_timeout_ms: 5000,
+            bt_sco_media_bridge_stop_existing_on_disconnect: true,
+            bt_sco_media_bridge_fixed_cadence: false,
+            bt_sco_media_bridge_cadence_ms: 22,
+            bt_sco_media_bridge_jitter_buffer_ms: 60,
+            bt_sco_mic_bridge: true,
+            bt_sco_mic_request: true,
+            bt_sco_mic_uplink_ring_capacity: 256,
+            bt_sco_mic_echo_control: BtScoMicEchoControl::Ducking,
+            bt_sco_mic_gain_percent: 100,
+            bt_sco_mic_duck_threshold: 700,
+            bt_sco_mic_duck_percent: 35,
+            bt_sco_mic_duck_hold_ms: 180,
             wasm_hooks_dir: DEFAULT_WASM_HOOKS_DIR.into(),
             wasm_script_memory_limit_mb: 5,
             wasm_script_instance_limit: 16,
@@ -600,6 +810,39 @@ impl AppConfig {
         if let Some(cmd) = &self.hu_button_handler {
             doc["hu_button_handler"] = value(cmd);
         }
+        doc["bt_sco"] = value(self.bt_sco);
+        doc["bt_sco_keep_bluetooth_alive"] = value(self.bt_sco_keep_bluetooth_alive);
+        doc["bt_sco_media_bridge"] = value(self.bt_sco_media_bridge);
+        doc["bt_sco_media_bridge_audio_type"] =
+            value(self.bt_sco_media_bridge_audio_type.to_string());
+        doc["bt_sco_media_bridge_gain_percent"] =
+            value(self.bt_sco_media_bridge_gain_percent as i64);
+        doc["bt_sco_media_bridge_limiter"] = value(self.bt_sco_media_bridge_limiter.to_string());
+        doc["bt_sco_media_bridge_resampler"] =
+            value(self.bt_sco_media_bridge_resampler.to_string());
+        doc["bt_sco_media_bridge_ring_capacity"] =
+            value(self.bt_sco_media_bridge_ring_capacity as i64);
+        doc["bt_sco_media_bridge_start_existing"] = value(self.bt_sco_media_bridge_start_existing);
+        doc["bt_sco_media_bridge_start_on_first_audio"] =
+            value(self.bt_sco_media_bridge_start_on_first_audio);
+        doc["bt_sco_media_bridge_audio_peak_threshold"] =
+            value(self.bt_sco_media_bridge_audio_peak_threshold as i64);
+        doc["bt_sco_media_bridge_start_timeout_ms"] =
+            value(self.bt_sco_media_bridge_start_timeout_ms as i64);
+        doc["bt_sco_media_bridge_stop_existing_on_disconnect"] =
+            value(self.bt_sco_media_bridge_stop_existing_on_disconnect);
+        doc["bt_sco_media_bridge_fixed_cadence"] = value(self.bt_sco_media_bridge_fixed_cadence);
+        doc["bt_sco_media_bridge_cadence_ms"] = value(self.bt_sco_media_bridge_cadence_ms as i64);
+        doc["bt_sco_media_bridge_jitter_buffer_ms"] =
+            value(self.bt_sco_media_bridge_jitter_buffer_ms as i64);
+        doc["bt_sco_mic_bridge"] = value(self.bt_sco_mic_bridge);
+        doc["bt_sco_mic_request"] = value(self.bt_sco_mic_request);
+        doc["bt_sco_mic_uplink_ring_capacity"] = value(self.bt_sco_mic_uplink_ring_capacity as i64);
+        doc["bt_sco_mic_echo_control"] = value(self.bt_sco_mic_echo_control.to_string());
+        doc["bt_sco_mic_gain_percent"] = value(self.bt_sco_mic_gain_percent as i64);
+        doc["bt_sco_mic_duck_threshold"] = value(self.bt_sco_mic_duck_threshold as i64);
+        doc["bt_sco_mic_duck_percent"] = value(self.bt_sco_mic_duck_percent as i64);
+        doc["bt_sco_mic_duck_hold_ms"] = value(self.bt_sco_mic_duck_hold_ms as i64);
         doc["wasm_hooks_dir"] = value(self.wasm_hooks_dir.display().to_string());
         doc["wasm_script_memory_limit_mb"] = value(self.wasm_script_memory_limit_mb as i64);
         doc["wasm_script_instance_limit"] = value(self.wasm_script_instance_limit as i64);

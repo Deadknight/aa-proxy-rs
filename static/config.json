@@ -149,6 +149,125 @@
       }
     },
     {
+      "title": "🎧 BLUTOOTH HEADSET",
+      "values": {
+        "bt_sco": {
+          "typ": "boolean",
+          "description": "Enable the experimental Bluetooth SCO/eSCO call-audio bridge/listener."
+        },
+        "bt_sco_keep_bluetooth_alive": {
+          "typ": "boolean",
+          "description": "When bt_sco is enabled, keep the Android Auto Bluetooth profile/RFCOMM connection alive after Wi-Fi bootstrap so the phone continues routing call audio to aa-proxy-rs."
+        },
+        "bt_sco_media_bridge": {
+          "typ": "boolean",
+          "description": "Experimental: bridge Bluetooth SCO call downlink into a selected Android Auto PCM sink. Requires MITM and bt_sco listener."
+        },
+        "bt_sco_media_bridge_audio_type": {
+          "typ": "select",
+          "description": "Preferred AA PCM sink for SCO downlink.",
+          "values": [
+            "guidance",
+            "media",
+            "auto"
+          ]
+        },
+        "bt_sco_media_bridge_gain_percent": {
+          "typ": "integer",
+          "description": "SCO downlink output gain percent after conversion. 100 means no gain. Start with 300 if call audio is quiet."
+        },
+        "bt_sco_media_bridge_limiter": {
+          "typ": "select",
+          "description": "Limiter applied after gain: off preserves the proven path except unavoidable i16 saturation, hard clips peaks earlier, soft compresses peaks more gently.",
+          "values": [
+            "off",
+            "hard",
+            "soft"
+          ]
+        },
+        "bt_sco_media_bridge_resampler": {
+          "typ": "select",
+          "description": "SCO 8 kHz to AA 48 kHz resampler: repeat preserves the proven path, linear smooths the 6x upsampling and may reduce roughness/crackle.",
+          "values": [
+            "repeat",
+            "linear"
+          ]
+        },
+        "bt_sco_media_bridge_ring_capacity": {
+          "typ": "integer",
+          "description": "Maximum converted AA PCM chunks buffered for SCO media bridge. 128 is a safe default; lower values reduce latency."
+        },
+        "bt_sco_media_bridge_start_existing": {
+          "typ": "boolean",
+          "description": "When SCO connects, send MEDIA_MESSAGE_START on the selected existing/configured PCM sink before piggyback DATA. Does not send CHANNEL_OPEN or SETUP."
+        },
+        "bt_sco_media_bridge_start_on_first_audio": {
+          "typ": "boolean",
+          "description": "Delay MEDIA_MESSAGE_START/DATA until the SCO downlink contains non-silent audio. Useful for diagnosing phone call routes where SCO opens but initially carries silence."
+        },
+        "bt_sco_media_bridge_audio_peak_threshold": {
+          "typ": "integer",
+          "description": "Peak threshold for start_on_first_audio. Converted 16-bit PCM frames below this value are treated as silence. 64 is a conservative starting point."
+        },
+        "bt_sco_media_bridge_start_timeout_ms": {
+          "typ": "integer",
+          "description": "Fallback timeout for start_on_first_audio. If no non-silent SCO downlink is seen within this time, START/DATA begins anyway."
+        },
+        "bt_sco_media_bridge_stop_existing_on_disconnect": {
+          "typ": "boolean",
+          "description": "When SCO disconnects, send MEDIA_MESSAGE_STOP on the selected existing PCM sink. Useful to reset DHU/HU audio renderer state between calls."
+        },
+        "bt_sco_media_bridge_fixed_cadence": {
+          "typ": "boolean",
+          "description": "Pace outgoing AA DATA packets at a fixed cadence instead of sending immediately when converted SCO chunks arrive. Disabled by default to preserve the proven behavior."
+        },
+        "bt_sco_media_bridge_cadence_ms": {
+          "typ": "integer",
+          "description": "DATA packet cadence in milliseconds when fixed cadence is enabled. 22 ms matches the current 6-SCO-packet chunk timing closely."
+        },
+        "bt_sco_media_bridge_jitter_buffer_ms": {
+          "typ": "integer",
+          "description": "Minimum converted-audio buffer before the first fixed-cadence DATA packet. 60 ms is a conservative starting point."
+        },
+        "bt_sco_mic_bridge": {
+          "typ": "boolean",
+          "description": "Experimental: bridge Android Auto HU microphone/source PCM into Bluetooth SCO call uplink. Requires MITM and bt_sco listener."
+        },
+        "bt_sco_mic_request": {
+          "typ": "boolean",
+          "description": "Send MEDIA_MESSAGE_MICROPHONE_REQUEST open/close when SCO connects/disconnects. Disable for passive mic logging only."
+        },
+        "bt_sco_mic_uplink_ring_capacity": {
+          "typ": "integer",
+          "description": "Maximum 60-byte SCO uplink packets buffered for microphone bridge. 256 is a safe default."
+        },
+        "bt_sco_mic_echo_control": {
+          "typ": "select",
+          "description": "Microphone echo handling for SCO uplink. off preserves current behavior; ducking lowers mic while downlink audio is active.",
+          "values": [
+            "off",
+            "ducking"
+          ]
+        },
+        "bt_sco_mic_gain_percent": {
+          "typ": "integer",
+          "description": "Microphone uplink gain percent after echo processing. 100 means no gain."
+        },
+        "bt_sco_mic_duck_threshold": {
+          "typ": "integer",
+          "description": "Downlink peak threshold that marks far-end audio as active for ducking."
+        },
+        "bt_sco_mic_duck_percent": {
+          "typ": "integer",
+          "description": "Mic gain percent while far-end/downlink audio is active. Lower values reduce echo more but hurt full-duplex speech."
+        },
+        "bt_sco_mic_duck_hold_ms": {
+          "typ": "integer",
+          "description": "How long to keep ducking after the last active downlink frame."
+        }
+      }
+    },
+    {
       "title": "🕵️‍♂️ MITM CONFIGURATION",
       "values": {
         "mitm": {

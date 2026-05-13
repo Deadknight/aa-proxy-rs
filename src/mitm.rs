@@ -1,3 +1,5 @@
+use crate::bt_sco;
+use crate::bt_sco_media_bridge;
 use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
 #[cfg(feature = "wasm-scripting")]
@@ -61,7 +63,7 @@ use protobuf::text_format::print_to_string_pretty;
 use protobuf::{Enum, EnumOrUnknown, Message, MessageDyn};
 use protos::ControlMessageType::{self, *};
 
-use crate::config::{Action::Stop, AppConfig, SharedConfig};
+use crate::config::{Action::Stop, AppConfig, BtScoMediaBridgeAudioType, SharedConfig};
 use crate::config_types::HexdumpLevel;
 use crate::ev::EvTaskCommand;
 use crate::hu_input::{handle_hu_input, HuInputState};
@@ -377,6 +379,57 @@ pub async fn pkt_debug(
     Ok(())
 }
 
+fn choose_bt_sco_microphone_source(
+    msg: &ServiceDiscoveryResponse,
+) -> Option<(u8, AudioStreamConfig, i32)> {
+    let mut best: Option<(i32, u8, AudioStreamConfig)> = None;
+
+    for svc in msg.services.iter() {
+        let source = &svc.media_source_service;
+        if source.audio_config.is_none() {
+            continue;
+        }
+        if source.available_type() != MediaCodecType::MEDIA_CODEC_AUDIO_PCM {
+            continue;
+        }
+
+        let acfg = source.audio_config.as_ref().unwrap();
+        let cfg = AudioStreamConfig {
+            sample_rate: acfg.sampling_rate(),
+            channels: acfg.number_of_channels(),
+            bits: acfg.number_of_bits(),
+        };
+
+        let format_score = if cfg.sample_rate == 16_000 && cfg.channels == 1 && cfg.bits == 16 {
+            0
+        } else if cfg.sample_rate == 8_000 && cfg.channels == 1 && cfg.bits == 16 {
+            10
+        } else {
+            (cfg.sample_rate as i32 - 16_000).abs() / 1000
+                + (cfg.channels as i32 - 1).abs() * 20
+                + (cfg.bits as i32 - 16).abs() * 10
+                + 50
+        };
+
+        let call_score = if source.available_while_in_call() {
+            0
+        } else {
+            5
+        };
+        let score = format_score + call_score;
+
+        if best
+            .as_ref()
+            .map(|(best_score, _, _)| score < *best_score)
+            .unwrap_or(true)
+        {
+            best = Some((score, svc.id() as u8, cfg));
+        }
+    }
+
+    best.map(|(score, channel, cfg)| (channel, cfg, score))
+}
+
 #[cfg(not(feature = "wasm-scripting"))]
 async fn run_wasm_hooks(
     _proxy_type: ProxyType,
@@ -450,6 +503,80 @@ async fn run_wasm_hooks(
     }
 
     Ok(Some(false))
+}
+
+fn choose_bt_sco_media_bridge_sink(
+    msg: &ServiceDiscoveryResponse,
+    preferred_audio_type: BtScoMediaBridgeAudioType,
+) -> Option<(u8, AudioStreamConfig, AudioStreamType, i32)> {
+    let mut best: Option<(i32, u8, AudioStreamConfig, AudioStreamType)> = None;
+
+    for svc in msg.services.iter() {
+        let sink = &svc.media_sink_service;
+        if sink.audio_configs.is_empty() {
+            continue;
+        }
+        if sink.available_type() != MediaCodecType::MEDIA_CODEC_AUDIO_PCM {
+            continue;
+        }
+
+        let audio_type = sink.audio_type();
+        let audio_type_score = match preferred_audio_type {
+            // Call-audio mode: try GUIDANCE first because several HUs mute MEDIA
+            // while a phone call/microphone session is active.
+            // Call-audio mode: try GUIDANCE first because several HUs mute MEDIA
+            // while a phone call/microphone session is active.
+            BtScoMediaBridgeAudioType::Guidance => match audio_type {
+                AUDIO_STREAM_GUIDANCE => 0,
+                AUDIO_STREAM_MEDIA => 40,
+                AUDIO_STREAM_SYSTEM_AUDIO => 80,
+                _ => 120,
+            },
+            BtScoMediaBridgeAudioType::Media => match audio_type {
+                AUDIO_STREAM_MEDIA => 0,
+                AUDIO_STREAM_GUIDANCE => 40,
+                AUDIO_STREAM_SYSTEM_AUDIO => 80,
+                _ => 120,
+            },
+            // Legacy behaviour: prefer normal media first.
+            BtScoMediaBridgeAudioType::Auto => match audio_type {
+                AUDIO_STREAM_MEDIA => 0,
+                AUDIO_STREAM_GUIDANCE => 40,
+                AUDIO_STREAM_SYSTEM_AUDIO => 80,
+                _ => 120,
+            },
+        };
+
+        for acfg in sink.audio_configs.iter() {
+            let cfg = AudioStreamConfig {
+                sample_rate: acfg.sampling_rate(),
+                channels: acfg.number_of_channels(),
+                bits: acfg.number_of_bits(),
+            };
+
+            let ideal_channels = match audio_type {
+                AUDIO_STREAM_GUIDANCE => 1,
+                _ => 2,
+            };
+
+            let format_score =
+                if cfg.sample_rate == 48_000 && cfg.channels == ideal_channels && cfg.bits == 16 {
+                    0
+                } else {
+                    (cfg.sample_rate as i32 - 48_000).abs() / 1000
+                        + (cfg.channels as i32 - ideal_channels as i32).abs() * 20
+                        + (cfg.bits as i32 - 16).abs() * 5
+                };
+
+            let score = audio_type_score + format_score;
+            match best {
+                Some((best_score, _, _, _)) if best_score <= score => {}
+                _ => best = Some((score, svc.id() as u8, cfg, audio_type)),
+            }
+        }
+    }
+
+    best.map(|(score, channel, cfg, audio_type)| (channel, cfg, audio_type, score))
 }
 
 /// packet modification hook
@@ -826,6 +953,49 @@ pub async fn pkt_modify_hook(
         }
     }
 
+    if cfg.bt_sco_media_bridge
+        && proxy_type == ProxyType::MobileDevice
+        && pkt.channel != 0
+        && message_id == MEDIA_MESSAGE_CONFIG as i32
+    {
+        if let Ok(msg) = AudioConfig::parse_from_bytes(data) {
+            bt_sco_media_bridge::notify_media_config(pkt.channel, &msg);
+        }
+    }
+
+    if cfg.bt_sco_mic_bridge && proxy_type == ProxyType::MobileDevice && pkt.channel != 0 {
+        match protos::MediaMessageId::from_i32(message_id).unwrap_or(MEDIA_MESSAGE_DATA) {
+            MEDIA_MESSAGE_DATA => {
+                if let Some((sample_rate, channels, bits)) =
+                    bt_sco_media_bridge::microphone_source_config(pkt.channel)
+                {
+                    // AA media DATA payload is: uint64 timestamp/PTS followed by PCM bytes.
+                    if data.len() >= 8 {
+                        let mic_pcm = &data[8..];
+                        bt_sco::push_sco_uplink_pcm_from_aa_mic(
+                            mic_pcm,
+                            sample_rate,
+                            channels,
+                            bits,
+                            cfg.bt_sco_mic_uplink_ring_capacity,
+                        );
+                    } else {
+                        warn!(
+                            "{} <blue>bt-sco mic bridge:</> DATA on mic channel <b>{:#04x}</> too short: {} bytes",
+                            get_name(proxy_type),
+                            pkt.channel,
+                            data.len()
+                        );
+                    }
+                }
+            }
+            MEDIA_MESSAGE_MICROPHONE_RESPONSE => {
+                bt_sco_media_bridge::notify_microphone_response(pkt.channel, data);
+            }
+            _ => {}
+        }
+    }
+
     // tap media frames for debug streaming (only on MobileDevice path = phone → HU direction)
     if tap_media && proxy_type == ProxyType::MobileDevice {
         if let Some(frame_data) = reassemble_media_packet(&mut ctx.media_fragments, pkt) {
@@ -1149,6 +1319,99 @@ pub async fn pkt_modify_hook(
                             }
                         }
                     }
+                }
+            }
+
+            if cfg.bt_sco_media_bridge && proxy_type == ProxyType::MobileDevice {
+                if let Some((bridge_channel, acfg, audio_type, score)) =
+                    choose_bt_sco_media_bridge_sink(&msg, cfg.bt_sco_media_bridge_audio_type)
+                {
+                    if let Some(tx) = ctx.hu_tx.clone() {
+                        bt_sco_media_bridge::init_or_update(tx);
+                        bt_sco_media_bridge::set_target_channel(
+                            bridge_channel,
+                            acfg.sample_rate,
+                            acfg.channels,
+                            acfg.bits,
+                            cfg.bt_sco_media_bridge_gain_percent,
+                            cfg.bt_sco_media_bridge_limiter,
+                            cfg.bt_sco_media_bridge_start_existing,
+                            cfg.bt_sco_media_bridge_start_on_first_audio,
+                            cfg.bt_sco_media_bridge_audio_peak_threshold,
+                            cfg.bt_sco_media_bridge_start_timeout_ms,
+                            cfg.bt_sco_media_bridge_stop_existing_on_disconnect,
+                            cfg.bt_sco_media_bridge_fixed_cadence,
+                            cfg.bt_sco_media_bridge_cadence_ms,
+                            cfg.bt_sco_media_bridge_jitter_buffer_ms,
+                        );
+                        info!(
+                            "{} <blue>bt-sco media bridge:</> selected PCM sink channel=<b>{:#04x}</> ({:?}, {}Hz, {}ch, {}bit, preference={}, gain={}%, limiter={}, resampler={}, start_existing={}, start_on_first_audio={}, peak_threshold={}, start_timeout={}ms, stop_on_disconnect={}, fixed_cadence={}ms/{}, jitter_buffer={}ms, score={})",
+                            get_name(proxy_type),
+                            bridge_channel,
+                            audio_type,
+                            acfg.sample_rate,
+                            acfg.channels,
+                            acfg.bits,
+                            cfg.bt_sco_media_bridge_audio_type,
+                            cfg.bt_sco_media_bridge_gain_percent,
+                            cfg.bt_sco_media_bridge_limiter,
+                            cfg.bt_sco_media_bridge_resampler,
+                            cfg.bt_sco_media_bridge_start_existing,
+                            cfg.bt_sco_media_bridge_start_on_first_audio,
+                            cfg.bt_sco_media_bridge_audio_peak_threshold,
+                            cfg.bt_sco_media_bridge_start_timeout_ms,
+                            cfg.bt_sco_media_bridge_stop_existing_on_disconnect,
+                            cfg.bt_sco_media_bridge_cadence_ms,
+                            cfg.bt_sco_media_bridge_fixed_cadence,
+                            cfg.bt_sco_media_bridge_jitter_buffer_ms,
+                            score
+                        );
+                    } else {
+                        warn!(
+                            "{} <blue>bt-sco media bridge:</> cannot start, HU tx is missing",
+                            get_name(proxy_type)
+                        );
+                    }
+                } else {
+                    warn!(
+                        "{} <blue>bt-sco media bridge:</> no usable PCM media sink found in SDR",
+                        get_name(proxy_type)
+                    );
+                }
+            }
+
+            if cfg.bt_sco_mic_bridge && proxy_type == ProxyType::MobileDevice {
+                if let Some((mic_channel, acfg, score)) = choose_bt_sco_microphone_source(&msg) {
+                    if let Some(tx) = ctx.hu_tx.clone() {
+                        bt_sco_media_bridge::init_or_update(tx);
+                        bt_sco_media_bridge::set_microphone_source(
+                            mic_channel,
+                            acfg.sample_rate,
+                            acfg.channels,
+                            acfg.bits,
+                            cfg.bt_sco_mic_request,
+                        );
+                        info!(
+                            "{} <blue>bt-sco mic bridge:</> selected PCM microphone source channel=<b>{:#04x}</> ({}Hz, {}ch, {}bit, score={}, request={})",
+                            get_name(proxy_type),
+                            mic_channel,
+                            acfg.sample_rate,
+                            acfg.channels,
+                            acfg.bits,
+                            score,
+                            cfg.bt_sco_mic_request
+                        );
+                    } else {
+                        warn!(
+                            "{} <blue>bt-sco mic bridge:</> cannot start, tx is missing",
+                            get_name(proxy_type)
+                        );
+                    }
+                } else {
+                    warn!(
+                        "{} <blue>bt-sco mic bridge:</> no usable PCM media_source/microphone source found in SDR",
+                        get_name(proxy_type)
+                    );
                 }
             }
 
