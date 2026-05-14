@@ -36,6 +36,12 @@ const VEC_OP_ON_TOPIC_EVENT: u8 = 0x87;
 
 const VEC_OP_ERROR: u8 = 0xFF;
 
+// Keep outbound custom VEC app-data packets below the aa-proxy IO buffer
+// and below the sizes that some phone/HU stacks appear to tolerate on a
+// single vendor-extension channel frame. The AA transport supports FIRST /
+// middle / LAST fragmentation, so large REST responses are split here.
+const VEC_APP_FRAGMENT_CHUNK_SIZE: usize = 4 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VecChannelState {
     Opened,
@@ -239,6 +245,68 @@ fn build_vendor_app_reply(channel: u8, opcode: u8, payload: Vec<u8>) -> Packet {
         final_length: None,
         payload: out,
     }
+}
+
+fn build_vendor_app_reply_fragments(channel: u8, opcode: u8, payload: Vec<u8>) -> Vec<Packet> {
+    let mut out = Vec::with_capacity(2 + payload.len());
+    out.push(VEC_APP_VERSION);
+    out.push(opcode);
+    out.extend_from_slice(&payload);
+
+    if out.len() <= VEC_APP_FRAGMENT_CHUNK_SIZE {
+        return vec![Packet {
+            channel,
+            // Custom vendor app-data frame. Do not set CONTROL here.
+            flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+            final_length: None,
+            payload: out,
+        }];
+    }
+
+    let total_len = out.len() as u32;
+    let total_chunks = (out.len() + VEC_APP_FRAGMENT_CHUNK_SIZE - 1)
+        / VEC_APP_FRAGMENT_CHUNK_SIZE;
+
+    info!(
+        "VEC reply fragmented channel={:#04x} opcode={:#04x} total_len={} chunks={} chunk_size={}",
+        channel, opcode, total_len, total_chunks, VEC_APP_FRAGMENT_CHUNK_SIZE
+    );
+
+    let mut packets = Vec::with_capacity(total_chunks);
+    for (index, chunk) in out.chunks(VEC_APP_FRAGMENT_CHUNK_SIZE).enumerate() {
+        let first = index == 0;
+        let last = index + 1 == total_chunks;
+
+        let mut flags = ENCRYPTED;
+        if first {
+            flags |= FRAME_TYPE_FIRST;
+        }
+        if last {
+            flags |= FRAME_TYPE_LAST;
+        }
+
+        packets.push(Packet {
+            channel,
+            flags,
+            final_length: if first { Some(total_len) } else { None },
+            payload: chunk.to_vec(),
+        });
+    }
+
+    packets
+}
+
+async fn send_vendor_app_reply_fragments(
+    tx: Sender<Packet>,
+    channel: u8,
+    opcode: u8,
+    payload: Vec<u8>,
+) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<Packet>> {
+    for reply in build_vendor_app_reply_fragments(channel, opcode, payload) {
+        tx.send(reply).await?;
+    }
+
+    Ok(())
 }
 
 fn build_error_reply(channel: u8, message: impl Into<String>) -> Packet {
@@ -708,10 +776,14 @@ pub(crate) async fn handle_vendor_channel_packet(
                     }
                 };
 
-                let reply =
-                    build_vendor_app_reply(channel, VEC_OP_REST_CALL_RESULT, payload.into_bytes());
-
-                if let Err(e) = tx.send(reply).await {
+                if let Err(e) = send_vendor_app_reply_fragments(
+                    tx,
+                    channel,
+                    VEC_OP_REST_CALL_RESULT,
+                    payload.into_bytes(),
+                )
+                .await
+                {
                     warn!("Failed to send async VEC REST result to phone: {}", e);
                 }
             });
