@@ -21,6 +21,7 @@ use crate::mitm::send_toll_card;
 use crate::mitm::Packet;
 use crate::mitm::SharedServiceDiscoveryResponse;
 use crate::mitm::Result;
+use crate::mitm::SharedServiceDiscoveryResponse;
 use crate::mitm::{send_odometer_data, OdometerData};
 use crate::mitm::{send_tire_pressure_data, TirePressureData};
 #[cfg(feature = "wasm-scripting")]
@@ -167,7 +168,10 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/factory-reset", post(factory_reset_handler))
         .route("/set-time", post(set_time_handler))
         .route("/speed", get(speed_handler))
-        .route("/service-discovery-response", get(service_discovery_response_handler))
+        .route(
+            "/service-discovery-response",
+            get(service_discovery_response_handler),
+        )
         .route("/version", get(version_handler))
         .route("/ws", get(ws_handler))
         .route("/raw-topic-data", post(raw_topic_data_handler))
