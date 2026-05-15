@@ -126,6 +126,8 @@ pub struct SdrUiPhoneInfo {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SdrUiDisplayProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_id: Option<i32>,
     pub display_id: u32,
     pub display_type: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -532,10 +534,18 @@ fn merge_missing_displays(
 ) -> bool {
     let mut changed = false;
     for display in snapshot {
-        if let Some(existing_display) = target
-            .iter_mut()
-            .find(|d| display_matches(d, display.display_id, &display.display_type))
-        {
+        if let Some(existing_display) = target.iter_mut().find(|d| {
+            display_matches(
+                d,
+                display.service_id,
+                display.display_id,
+                &display.display_type,
+            )
+        }) {
+            if existing_display.service_id.is_none() && display.service_id.is_some() {
+                existing_display.service_id = display.service_id;
+                changed = true;
+            }
             for video in &display.video_configs {
                 if !existing_display
                     .video_configs
@@ -566,11 +576,12 @@ fn apply_display_profiles(
             continue;
         }
 
+        let service_id = svc.id();
         let sink_display_id = svc.media_sink_service.display_id();
         let sink_display_type = format!("{:?}", svc.media_sink_service.display_type());
         let Some(display_profile) = displays
             .iter()
-            .find(|d| display_matches(d, sink_display_id, &sink_display_type))
+            .find(|d| display_matches(d, Some(service_id), sink_display_id, &sink_display_type))
         else {
             continue;
         };
@@ -738,7 +749,18 @@ fn keep_insets_inside_resolution(
     }
 }
 
-fn display_matches(profile: &SdrUiDisplayProfile, display_id: u32, display_type: &str) -> bool {
+fn display_matches(
+    profile: &SdrUiDisplayProfile,
+    service_id: Option<i32>,
+    display_id: u32,
+    display_type: &str,
+) -> bool {
+    if let (Some(profile_service_id), Some(service_id)) = (profile.service_id, service_id) {
+        if profile_service_id != service_id {
+            return false;
+        }
+    }
+
     profile.display_id == display_id
         && (profile.display_type.is_empty() || profile.display_type == display_type)
 }
@@ -764,6 +786,7 @@ fn snapshot_displays(msg: &ServiceDiscoveryResponse) -> Vec<SdrUiDisplayProfile>
         }
 
         let mut display = SdrUiDisplayProfile {
+            service_id: Some(svc.id()),
             display_id: svc.media_sink_service.display_id(),
             display_type: format!("{:?}", svc.media_sink_service.display_type()),
             video_configs: Vec::new(),
