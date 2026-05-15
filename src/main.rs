@@ -740,6 +740,13 @@ fn main() -> Result<()> {
         if config.crash_handler_enabled { "enabled" } else { "disabled" },
         config.crash_dir.display()
     );
+    info!(
+        "{} 🖼️ SDR UI overrides: <b><green>{}</> file=<b><green>{}</> autocreate={}",
+        NAME,
+        if config.sdr_ui_override_enabled { "enabled" } else { "disabled" },
+        config.sdr_ui_override_file.display(),
+        config.sdr_ui_override_autocreate_profiles
+    );
     if config.startup_delay > 0 {
         thread::sleep(Duration::from_secs(config.startup_delay.into()));
         info!(

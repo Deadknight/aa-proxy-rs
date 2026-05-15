@@ -21,6 +21,7 @@ pub mod mitm_prettyprint;
 pub mod mpegts;
 #[cfg(feature = "wasm-scripting")]
 pub mod script_wasm;
+pub mod sdr_ui;
 pub mod usb_gadget;
 pub mod usb_stream;
 pub mod vendor_ext;
