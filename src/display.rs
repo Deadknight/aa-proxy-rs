@@ -819,6 +819,7 @@ mod tests {
             vendor_service_ids: HashSet::new(),
             vendor_channel_states: HashMap::new(),
             vendor_topic_event_bridges: HashMap::new(),
+            debug_channel_kinds: HashMap::from([(0, PacketDebugServiceKind::Control)]),
         }
     }
 

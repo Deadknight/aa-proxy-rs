@@ -19,7 +19,6 @@ use crate::mitm::send_key_event;
 use crate::mitm::send_rotary_event;
 use crate::mitm::send_toll_card;
 use crate::mitm::Packet;
-use crate::mitm::SharedServiceDiscoveryResponse;
 use crate::mitm::Result;
 use crate::mitm::SharedServiceDiscoveryResponse;
 use crate::mitm::{send_odometer_data, OdometerData};

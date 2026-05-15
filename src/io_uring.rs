@@ -336,6 +336,7 @@ pub async fn mac_from_ipv4(addr: SocketAddr) -> io::Result<Option<MacAddress>> {
 /// returning TcpStream of first client connected
 async fn tcp_wait_for_connection(
     listener: &mut TcpListener,
+    start_companion_bridges: bool,
 ) -> Result<(TcpStream, SocketAddr, CancellationToken)> {
     let retval = listener.accept();
     let (stream, addr) = match timeout(TCP_CLIENT_TIMEOUT, retval)
@@ -357,72 +358,126 @@ async fn tcp_wait_for_connection(
     // which stops all tcp_bridge tasks spawned for this client.
     let cancel = CancellationToken::new();
 
-    // this is creating a reverse tcp bridge for Android
-    // direct connection to the device side is not allowed
-    // Note: this is only meaningful for MD/phone connections, not DHU emulator clients.
-    if !addr.ip().is_loopback() {
+    // this is creating a reverse tcp bridge for Android.
+    // Direct connection to the device side is not allowed. It is only meaningful
+    // for MD/phone connections; DHU emulator clients must not start these bridges.
+    if start_companion_bridges {
+        if !addr.ip().is_loopback() {
+            let c = cancel.clone();
+            tokio::spawn(async move {
+                info!(
+                    "{} starting TCP reverse connection, Android IP: {}",
+                    NAME,
+                    addr.ip()
+                );
+                // FIXME use port configured by user for webserver
+                // or ignore when webserver disabled...
+                tcp_bridge(
+                    &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
+                    "127.0.0.1:80",
+                    c,
+                )
+                .await;
+            });
+        } else {
+            debug!(
+                "{} skipping reverse tcp_bridge for localhost MD client ({})",
+                NAME, addr
+            );
+        }
+
         let c = cancel.clone();
         tokio::spawn(async move {
             info!(
-                "{} starting TCP reverse connection, Android IP: {}",
+                "{} starting TCP reverse connection for WS, Android IP: {}",
                 NAME,
                 addr.ip()
             );
             // FIXME use port configured by user for webserver
             // or ignore when webserver disabled...
             tcp_bridge(
-                &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT),
+                &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT_WS),
                 "127.0.0.1:80",
+                c,
+            )
+            .await;
+        });
+
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            info!(
+                "{} starting TCP reverse connection for SWUpdate, Android IP: {}",
+                NAME,
+                addr.ip()
+            );
+            // FIXME use port configured by user for webserver
+            // or ignore when webserver disabled...
+            tcp_bridge(
+                &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT_SWUPDATE),
+                "127.0.0.1:8080",
                 c,
             )
             .await;
         });
     } else {
         debug!(
-            "{} skipping reverse tcp_bridge for localhost client ({})",
+            "{} skipping companion reverse tcp_bridge for non-MD client ({})",
             NAME, addr
         );
     }
-
-    let c = cancel.clone();
-    tokio::spawn(async move {
-        info!(
-            "{} starting TCP reverse connection for WS, Android IP: {}",
-            NAME,
-            addr.ip()
-        );
-        // FIXME use port configured by user for webserver
-        // or ignore when webserver disabled...
-        tcp_bridge(
-            &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT_WS),
-            "127.0.0.1:80",
-            c,
-        )
-        .await;
-    });
-
-    let c = cancel.clone();
-    tokio::spawn(async move {
-        info!(
-            "{} starting TCP reverse connection for SWUpdate, Android IP: {}",
-            NAME,
-            addr.ip()
-        );
-        // FIXME use port configured by user for webserver
-        // or ignore when webserver disabled...
-        tcp_bridge(
-            &format!("{}:{}", addr.ip(), COMP_APP_TCP_PORT_SWUPDATE),
-            "127.0.0.1:8080",
-            c,
-        )
-        .await;
-    });
 
     // disable Nagle algorithm, so segments are always sent as soon as possible,
     // even if there is only a small amount of data
     stream.set_nodelay(true)?;
 
     Ok((stream, addr, cancel))
+}
+
+
+/// Connects to Android Auto Head Unit Server directly on the MD/phone side.
+/// This is used only when `aa_server_tcp_addr` is set. It intentionally does
+/// not start the companion reverse TCP bridges, because there is no inbound
+/// phone client address in this mode.
+async fn tcp_connect_to_aa_server(addr: &str) -> Result<TcpStream> {
+    let addr = addr.trim();
+    let socket_addr: SocketAddr = addr.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid aa_server_tcp_addr {addr:?}: {e}"),
+        )
+    })?;
+
+    info!(
+        "{} 🛰️ MD direct TCP: connecting to Android Auto Head Unit Server at <u>{}</u>...",
+        NAME, socket_addr
+    );
+
+    let stream = match timeout(TCP_CLIENT_TIMEOUT, TcpStream::connect(socket_addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            error!(
+                "{} 📵 MD direct TCP: connect failed to <u>{}</u>: {}",
+                NAME, socket_addr, e
+            );
+            return Err(Box::new(e));
+        }
+        Err(e) => {
+            let err = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("MD direct TCP connect timeout to {socket_addr}: {e}"),
+            );
+            error!("{} 📵 {}", NAME, err);
+            return Err(Box::new(err));
+        }
+    };
+
+    stream.set_nodelay(true)?;
+    info!(
+        "{} 📳 MD direct TCP: connected to Android Auto Head Unit Server at <u>{}</u>",
+        NAME, socket_addr
+    );
+
+    Ok(stream)
 }
 
 pub async fn io_loop(
@@ -511,7 +566,21 @@ pub async fn io_loop(
         // CancellationToken for tcp_bridge tasks spawned for this session
         let mut bridge_cancel: Option<CancellationToken> = None;
 
-        if config.wired.is_some() {
+        let aa_server_tcp_addr = config.aa_server_tcp_addr.trim().to_string();
+        let aa_server_tcp_enabled = !aa_server_tcp_addr.is_empty();
+
+        if aa_server_tcp_enabled {
+            // Direct Android Auto Head Unit Server mode replaces the MD/phone-side
+            // USB/Bluetooth/Wi-Fi transport only. Do not connect yet: open the
+            // HU/DHU side first, then create a fresh MD TCP connection immediately
+            // before starting the proxy so DHU's first version frame is not sent
+            // over a stale idle socket.
+            info!(
+                "{} 🛰️ MD direct TCP mode enabled, delaying MD connect until HU/DHU is ready: <u>{}</u>",
+                NAME, aa_server_tcp_addr
+            );
+            usb_connected.store(false, Ordering::Relaxed);
+        } else if config.wired.is_some() {
             info!("{} 💤 waiting for USB or bluetooth handshake...", NAME);
 
             let wired_clone = config.wired.clone();
@@ -533,7 +602,7 @@ pub async fn io_loop(
                 }
                 _ = tcp_start.notified() => {
                     info!("{} 🛰️ MD TCP server: listening for phone connection...", NAME);
-                    if let Ok((s, ip, cancel)) = tcp_wait_for_connection(&mut md_listener.as_mut().unwrap()).await {
+                    if let Ok((s, ip, cancel)) = tcp_wait_for_connection(&mut md_listener.as_mut().unwrap(), true).await {
                         md_tcp = Some(s);
                         client_mac = mac_from_ipv4(ip).await.unwrap_or(None);
                         bridge_cancel = Some(cancel);
@@ -552,7 +621,7 @@ pub async fn io_loop(
                 NAME
             );
             if let Ok((s, ip, cancel)) =
-                tcp_wait_for_connection(&mut md_listener.as_mut().unwrap()).await
+                tcp_wait_for_connection(&mut md_listener.as_mut().unwrap(), true).await
             {
                 md_tcp = Some(s);
                 // Get MAC address of the connected client for later disassociation
@@ -572,7 +641,7 @@ pub async fn io_loop(
                 NAME
             );
             if let Ok((s, _, _)) =
-                tcp_wait_for_connection(&mut dhu_listener.as_mut().unwrap()).await
+                tcp_wait_for_connection(&mut dhu_listener.as_mut().unwrap(), false).await
             {
                 hu_tcp = Some(s);
             } else {
@@ -597,6 +666,23 @@ pub async fn io_loop(
                     error!("{} 🔴 Error opening USB accessory: {}", NAME, e);
                     // notify main loop to restart
                     let _ = need_restart.send(None);
+                    continue;
+                }
+            }
+        }
+
+        if aa_server_tcp_enabled {
+            match tcp_connect_to_aa_server(&aa_server_tcp_addr).await {
+                Ok(s) => {
+                    md_tcp = Some(s);
+                }
+                Err(e) => {
+                    error!(
+                        "{} 🔴 MD direct TCP unavailable after HU/DHU became ready: {}",
+                        NAME, e
+                    );
+                    let _ = need_restart.send(None);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
             }

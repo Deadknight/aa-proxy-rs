@@ -331,6 +331,14 @@ async fn tokio_main(
     };
 
     let mut cfg = config.read().await.clone();
+    let aa_server_tcp_enabled = !cfg.aa_server_tcp_addr.trim().is_empty();
+    if aa_server_tcp_enabled {
+        info!(
+            "{} 🛰️ Android Auto Head Unit Server direct TCP mode enabled: <u>{}</u>",
+            NAME,
+            cfg.aa_server_tcp_addr.trim()
+        );
+    }
     let bt_sco_enabled = cfg.bt_sco || cfg.bt_sco_media_bridge || cfg.bt_sco_mic_bridge;
 
     if bt_sco_enabled {
@@ -418,23 +426,32 @@ async fn tokio_main(
     });
 
     // initial bluetooth setup
-    let mut bluetooth;
-    loop {
-        match bluetooth::init(cfg.btalias.clone(), cfg.advertise, cfg.dongle_mode).await {
-            Ok(result) => {
-                bluetooth = result;
-                break;
-            }
-            Err(e) => {
-                error!("{} Fatal error in Bluetooth setup: {}", NAME, e);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
+    let mut bluetooth = None;
+    if aa_server_tcp_enabled {
+        info!(
+            "{} 🛰️ Skipping Bluetooth AA setup because aa_server_tcp_addr is set",
+            NAME
+        );
+    } else {
+        loop {
+            match bluetooth::init(cfg.btalias.clone(), cfg.advertise, cfg.dongle_mode).await {
+                Ok(result) => {
+                    bluetooth = Some(result);
+                    break;
+                }
+                Err(e) => {
+                    error!("{} Fatal error in Bluetooth setup: {}", NAME, e);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
             }
         }
-    }
-    if cfg.advertise {
-        if let Err(e) = bluetooth.start_ble(state.clone(), cfg.enable_btle).await {
-            warn!("{} Error starting BLE: {}", NAME, e);
+        if cfg.advertise {
+            if let Some(ref mut bluetooth) = bluetooth {
+                if let Err(e) = bluetooth.start_ble(state.clone(), cfg.enable_btle).await {
+                    warn!("{} Error starting BLE: {}", NAME, e);
+                }
+            }
         }
     }
 
@@ -456,30 +473,43 @@ async fn tokio_main(
         }
 
         // run only if not handling this in handshake task
-        if let Some(ref wifi_conf) = wifi_config {
+        let aa_server_tcp_enabled = !cfg.aa_server_tcp_addr.trim().is_empty();
+        if aa_server_tcp_enabled {
+            // Direct MD TCP mode does not use the Bluetooth/Wi-Fi AA handshake.
+            // io_loop will connect to aa_server_tcp_addr after the HU/DHU side is ready.
+        } else if let Some(ref wifi_conf) = wifi_config {
             if !usb_connected.load(Ordering::Relaxed)
                 && (!(cfg.quick_reconnect && profile_connected.load(Ordering::Relaxed))
                     || cfg.action_requested == Some(Action::Stop))
             {
-                // bluetooth handshake
-                if let Err(e) = bluetooth
-                    .aa_handshake(
-                        cfg.connect.clone(),
-                        wifi_conf.clone(),
-                        tcp_start.clone(),
-                        Duration::from_secs(cfg.bt_timeout_secs.into()),
-                        cfg.action_requested == Some(Action::Stop),
-                        cfg.quick_reconnect,
-                        cfg.bt_poweroff,
-                        cfg.bt_sco || cfg.bt_sco_media_bridge || cfg.bt_sco_mic_bridge,
-                        cfg.bt_sco_keep_bluetooth_alive,
-                        restart_tx.subscribe(),
-                        restart_tx.clone(),
-                        profile_connected.clone(),
-                    )
-                    .await
-                {
-                    error!("{} bluetooth AA handshake error: {}", NAME, e);
+                if let Some(ref mut bluetooth) = bluetooth {
+                    // bluetooth handshake
+                    if let Err(e) = bluetooth
+                        .aa_handshake(
+                            cfg.connect.clone(),
+                            wifi_conf.clone(),
+                            tcp_start.clone(),
+                            Duration::from_secs(cfg.bt_timeout_secs.into()),
+                            cfg.action_requested == Some(Action::Stop),
+                            cfg.quick_reconnect,
+                            cfg.bt_poweroff,
+                            cfg.bt_sco || cfg.bt_sco_media_bridge || cfg.bt_sco_mic_bridge,
+                            cfg.bt_sco_keep_bluetooth_alive,
+                            restart_tx.subscribe(),
+                            restart_tx.clone(),
+                            profile_connected.clone(),
+                        )
+                        .await
+                    {
+                        error!("{} bluetooth AA handshake error: {}", NAME, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                } else {
+                    warn!(
+                        "{} Bluetooth AA handshake requested but Bluetooth was not initialized; restart after clearing aa_server_tcp_addr",
+                        NAME
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
