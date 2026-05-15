@@ -8,6 +8,7 @@ pub mod btle;
 pub mod button;
 pub mod config;
 pub mod config_types;
+pub mod crash;
 pub mod device_info;
 pub mod display;
 pub mod ev;

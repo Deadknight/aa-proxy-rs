@@ -8,6 +8,7 @@ use crate::config::ConfigJson;
 use crate::config::SharedConfig;
 use crate::config::SharedConfigJson;
 use crate::config::BASE_CONFIG_DIR;
+use crate::crash;
 use crate::device_info;
 use crate::ev::send_ev_data;
 use crate::ev::BatteryData;
@@ -146,6 +147,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/config-entry", post(update_config_entry))
         .route("/config-data", get(get_config_data))
         .route("/download", get(download_handler))
+        .route("/crashes", get(crashes_list_handler).delete(crashes_clear_handler))
+        .route(
+            "/crashes/:filename",
+            get(crashes_read_handler).delete(crashes_delete_handler),
+        )
         .route("/restart", post(restart_handler))
         .route("/reboot", post(reboot_handler))
         .route("/upload-hex-model", post(upload_hex_model_handler))
@@ -701,6 +707,119 @@ async fn reboot_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         .status(StatusCode::OK)
         .body(Body::from("Reboot has been requested"))
         .unwrap()
+}
+
+
+async fn crashes_list_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.config.read().await;
+    let crash_dir = cfg.crash_dir.clone();
+    let enabled = cfg.crash_handler_enabled;
+    drop(cfg);
+
+    match crash::list_crashes(&crash_dir) {
+        Ok(files) => Json(json!({
+            "crash_handler_enabled": enabled,
+            "crash_dir": crash_dir.display().to_string(),
+            "files": files,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": format!("Failed to list crash files: {}", e),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn crashes_read_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let crash_dir = state.config.read().await.crash_dir.clone();
+
+    match crash::read_crash_file(&crash_dir, &filename) {
+        Ok(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from(body))
+            .unwrap()
+            .into_response(),
+        Err(e) => crash_file_error_response(e, &filename, "read"),
+    }
+}
+
+async fn crashes_delete_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let crash_dir = state.config.read().await.crash_dir.clone();
+
+    match crash::delete_crash_file(&crash_dir, &filename) {
+        Ok(()) => Json(json!({
+            "status": "success",
+            "deleted": 1,
+            "filename": filename,
+        }))
+        .into_response(),
+        Err(e) => crash_file_error_response(e, &filename, "delete"),
+    }
+}
+
+async fn crashes_clear_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let crash_dir = state.config.read().await.crash_dir.clone();
+
+    match crash::clear_crashes(&crash_dir) {
+        Ok(deleted) => Json(json!({
+            "status": "success",
+            "deleted": deleted,
+            "crash_dir": crash_dir.display().to_string(),
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": format!("Failed to clear crash files: {}", e),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn crash_file_error_response(
+    e: std::io::Error,
+    filename: &str,
+    action: &str,
+) -> axum::response::Response {
+    match e.kind() {
+        std::io::ErrorKind::InvalidInput => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response(),
+        std::io::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "status": "error",
+                "message": format!("Crash file not found: {}", filename),
+            })),
+        )
+            .into_response(),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": format!("Failed to {} crash file: {}", action, e),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn download_handler(
@@ -1383,6 +1502,8 @@ async fn update_config_entry(
 
     match AppConfig::load(config_path) {
         Ok(new_cfg) => {
+            crash::set_crash_handler_enabled(new_cfg.crash_handler_enabled);
+            crash::set_crash_dir(new_cfg.crash_dir.clone());
             *cfg = new_cfg;
             info!(
                 "{} Config entry updated: {} = {}",
@@ -1482,6 +1603,8 @@ async fn set_config(
     };
 
     {
+        crash::set_crash_handler_enabled(new_cfg.crash_handler_enabled);
+        crash::set_crash_dir(new_cfg.crash_dir.clone());
         let mut cfg = state.config.write().await;
         *cfg = new_cfg.clone();
         cfg.save((&state.config_file).to_path_buf());

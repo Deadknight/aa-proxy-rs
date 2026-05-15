@@ -44,6 +44,14 @@
           "typ": "string",
           "description": "Log file path, by default it is saved to `/var/log` in `tmpfs`/memory. If you want, you can change it e.g. to `/data/aa-proxy-rs.log` and it will be saved to SD card (appended, not replaced)."
         },
+        "crash_handler_enabled": {
+          "typ": "boolean",
+          "description": "Enable Rust panic report files. Normal runtime cost is negligible; stacktrace capture and file write happen only when a panic occurs."
+        },
+        "crash_dir": {
+          "typ": "string",
+          "description": "Directory where Rust panic reports are written with timestamped filenames. Default: `/data/aa-proxy-rs/crashes`."
+        },
         "stats_interval": {
           "typ": "integer",
           "description": "Interval of showing data transfer statistics in the log (0 = disabled) [seconds]"

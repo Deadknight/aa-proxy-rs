@@ -7,6 +7,7 @@ use aa_proxy_rs::config::SharedConfigJson;
 use aa_proxy_rs::config::WifiConfig;
 use aa_proxy_rs::config::{Action, AppConfig};
 use aa_proxy_rs::config::{DEFAULT_WLAN_ADDR, TCP_SERVER_PORT};
+use aa_proxy_rs::crash;
 use aa_proxy_rs::device_info;
 use aa_proxy_rs::ev::BatteryData;
 use aa_proxy_rs::io_uring::io_loop;
@@ -661,6 +662,8 @@ fn main() -> Result<()> {
     };
     let config_json = AppConfig::load_config_json().expect("Invalid embedded config.json");
 
+    crash::install_panic_handler(config.crash_dir.clone(), config.crash_handler_enabled);
+
     logging_init(config.debug, config.disable_console_debug, &config.logfile);
     info!(
         "🛸 <b><blue>aa-proxy-rs</> is starting, build: {}, git: {}-{}",
@@ -730,6 +733,12 @@ fn main() -> Result<()> {
         "{} 📜 Log file path: <b><green>{}</>",
         NAME,
         config.logfile.display()
+    );
+    info!(
+        "{} 💥 Panic reports: <b><green>{}</> dir=<b><green>{}</>",
+        NAME,
+        if config.crash_handler_enabled { "enabled" } else { "disabled" },
+        config.crash_dir.display()
     );
     if config.startup_delay > 0 {
         thread::sleep(Duration::from_secs(config.startup_delay.into()));
