@@ -206,6 +206,153 @@
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
 
+      .multi-select-native {
+        display: none !important;
+      }
+
+      .multi-select-widget {
+        position: relative;
+        width: 100%;
+      }
+
+      .multi-select-control {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        min-height: 2.7rem;
+        width: 100%;
+        padding: 0.35rem 0.45rem;
+        border: var(--pico-border-width) solid var(--pico-form-element-border-color);
+        border-radius: var(--pico-border-radius);
+        background: var(--pico-form-element-background-color);
+        color: var(--pico-form-element-color);
+        cursor: pointer;
+      }
+
+      .multi-select-control:focus,
+      .multi-select-control:focus-within {
+        border-color: var(--pico-form-element-active-border-color);
+        box-shadow: 0 0 0 var(--pico-outline-width) var(--pico-form-element-focus-color);
+        outline: none;
+      }
+
+      .multi-select-chips {
+        display: flex;
+        flex: 1;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.35rem;
+        min-width: 0;
+      }
+
+      .multi-select-placeholder {
+        color: var(--pico-muted-color);
+        padding-inline: 0.25rem;
+      }
+
+      .multi-select-chip {
+        display: inline-flex;
+        align-items: center;
+        max-width: 100%;
+        gap: 0.35rem;
+        padding: 0.15rem 0.45rem;
+        border-radius: 999px;
+        background: #202632;
+        color: #fff;
+        font-size: 0.85rem;
+        line-height: 1.45;
+      }
+
+      .multi-select-chip-label {
+        max-width: 18rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .multi-select-chip-remove {
+        width: 1.15rem;
+        height: 1.15rem;
+        min-width: 1.15rem;
+        padding: 0;
+        margin: 0;
+        border: 0;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.16);
+        color: #fff;
+        font-size: 0.85rem;
+        line-height: 1;
+      }
+
+      .multi-select-chip-remove:hover,
+      .multi-select-chip-remove:focus-visible {
+        background: rgba(255, 255, 255, 0.28);
+      }
+
+      .multi-select-toggle {
+        width: 2rem;
+        min-width: 2rem;
+        padding: 0.25rem;
+        margin: 0;
+        border: 0;
+        background: transparent;
+        color: var(--pico-muted-color);
+        box-shadow: none;
+      }
+
+      .multi-select-menu {
+        position: absolute;
+        z-index: 10000;
+        top: calc(100% + 0.25rem);
+        left: 0;
+        right: 0;
+        max-height: 18rem;
+        overflow: auto;
+        padding: 0.35rem;
+        border: var(--pico-border-width) solid var(--pico-form-element-border-color);
+        border-radius: var(--pico-border-radius);
+        background: var(--pico-card-background-color);
+        box-shadow: 0 0.45rem 1.1rem rgba(0, 0, 0, 0.4);
+      }
+
+      .multi-select-option {
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+        width: 100%;
+        padding: 0.35rem 0.45rem;
+        margin: 0;
+        border-radius: 0.35rem;
+        cursor: pointer;
+      }
+
+      .multi-select-option:hover {
+        background: rgba(255, 255, 255, 0.06);
+      }
+
+      .multi-select-option input {
+        margin: 0;
+      }
+
+      .multi-select-option-label {
+        overflow-wrap: anywhere;
+      }
+
+      .multi-select-actions {
+        display: flex;
+        gap: 0.4rem;
+        justify-content: flex-end;
+        padding: 0.35rem 0.15rem 0.1rem;
+      }
+
+      .multi-select-actions button {
+        width: auto;
+        padding: 0.25rem 0.5rem;
+        margin: 0;
+        font-size: 0.85rem;
+      }
+
       @media (min-width: 900px) {
         .controller-columns {
           grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -494,6 +641,8 @@
         div.innerHTML = configValuesHtml;
         form.appendChild(div);
 
+        enhanceMultiSelects();
+
         // Insert bottom set of buttons
         form.appendChild(template.content.cloneNode(true));
 
@@ -530,7 +679,227 @@
             fileInput.click();
           });
         });
+
+        loadConfig();
       });
+
+      function splitCommaValue(value) {
+        if (Array.isArray(value)) {
+          return value
+            .map(String)
+            .map((part) => part.trim())
+            .filter(Boolean);
+        }
+
+        return String(value ?? "")
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean);
+      }
+
+      function getMultiSelectValues(select) {
+        return Array.from(select.selectedOptions).map((option) => option.value);
+      }
+
+      function setMultiSelectValues(select, values) {
+        const selectedValues = splitCommaValue(values);
+        for (const option of select.options) {
+          option.selected = selectedValues.includes(option.value);
+        }
+        syncMultiSelectWidget(select);
+      }
+
+      function closeAllMultiSelectMenus(exceptWidget = null) {
+        document.querySelectorAll(".multi-select-widget").forEach((widget) => {
+          if (widget === exceptWidget) return;
+          const menu = widget.querySelector(".multi-select-menu");
+          const control = widget.querySelector(".multi-select-control");
+          if (menu) menu.hidden = true;
+          if (control) control.setAttribute("aria-expanded", "false");
+        });
+      }
+
+      function setMultiSelectOpen(widget, open) {
+        const menu = widget.querySelector(".multi-select-menu");
+        const control = widget.querySelector(".multi-select-control");
+        if (!menu || !control) return;
+
+        if (open) {
+          closeAllMultiSelectMenus(widget);
+        }
+
+        menu.hidden = !open;
+        control.setAttribute("aria-expanded", String(open));
+      }
+
+      function toggleMultiSelect(widget) {
+        const menu = widget.querySelector(".multi-select-menu");
+        setMultiSelectOpen(widget, menu?.hidden !== false);
+      }
+
+      function syncMultiSelectWidget(select) {
+        const widget = select.nextElementSibling;
+        if (!widget || !widget.classList.contains("multi-select-widget"))
+          return;
+
+        const selectedValues = getMultiSelectValues(select);
+        const chips = widget.querySelector(".multi-select-chips");
+        if (!chips) return;
+
+        chips.innerHTML = "";
+
+        if (selectedValues.length === 0) {
+          const placeholder = document.createElement("span");
+          placeholder.className = "multi-select-placeholder";
+          placeholder.textContent = "None selected";
+          chips.appendChild(placeholder);
+        } else {
+          selectedValues.forEach((value) => {
+            const chip = document.createElement("span");
+            chip.className = "multi-select-chip";
+
+            const label = document.createElement("span");
+            label.className = "multi-select-chip-label";
+            label.textContent = value;
+            chip.appendChild(label);
+
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.className = "multi-select-chip-remove";
+            remove.setAttribute("aria-label", `Remove ${value}`);
+            remove.textContent = "×";
+            remove.addEventListener("click", (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+
+              const option = Array.from(select.options).find(
+                (opt) => opt.value === value,
+              );
+              if (option) option.selected = false;
+              select.dispatchEvent(new Event("change", { bubbles: true }));
+            });
+            chip.appendChild(remove);
+
+            chips.appendChild(chip);
+          });
+        }
+
+        widget
+          .querySelectorAll('input[type="checkbox"][data-multi-select-option]')
+          .forEach((checkbox) => {
+            checkbox.checked = selectedValues.includes(checkbox.value);
+          });
+      }
+
+      function enhanceMultiSelects() {
+        document.querySelectorAll("select[multiple]").forEach((select) => {
+          if (select.dataset.enhanced === "true") return;
+
+          select.dataset.enhanced = "true";
+          select.classList.add("multi-select-native");
+
+          const widget = document.createElement("div");
+          widget.className = "multi-select-widget";
+          widget.dataset.for = select.id;
+
+          const control = document.createElement("div");
+          control.className = "multi-select-control";
+          control.tabIndex = 0;
+          control.setAttribute("role", "combobox");
+          control.setAttribute("aria-haspopup", "listbox");
+          control.setAttribute("aria-expanded", "false");
+
+          const chips = document.createElement("div");
+          chips.className = "multi-select-chips";
+          control.appendChild(chips);
+
+          const toggle = document.createElement("button");
+          toggle.type = "button";
+          toggle.className = "multi-select-toggle";
+          toggle.setAttribute("aria-label", "Toggle options");
+          toggle.textContent = "▾";
+          control.appendChild(toggle);
+
+          const menu = document.createElement("div");
+          menu.className = "multi-select-menu";
+          menu.hidden = true;
+          menu.setAttribute("role", "listbox");
+          menu.setAttribute("aria-multiselectable", "true");
+
+          Array.from(select.options).forEach((option) => {
+            const row = document.createElement("label");
+            row.className = "multi-select-option";
+
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.value = option.value;
+            checkbox.dataset.multiSelectOption = "true";
+            checkbox.checked = option.selected;
+            checkbox.addEventListener("change", () => {
+              option.selected = checkbox.checked;
+              select.dispatchEvent(new Event("change", { bubbles: true }));
+            });
+            row.appendChild(checkbox);
+
+            const optionLabel = document.createElement("span");
+            optionLabel.className = "multi-select-option-label";
+            optionLabel.textContent = option.textContent || option.value;
+            row.appendChild(optionLabel);
+
+            menu.appendChild(row);
+          });
+
+          const actions = document.createElement("div");
+          actions.className = "multi-select-actions";
+
+          const clearButton = document.createElement("button");
+          clearButton.type = "button";
+          clearButton.textContent = "Clear";
+          clearButton.addEventListener("click", (event) => {
+            event.preventDefault();
+            for (const option of select.options) option.selected = false;
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+          });
+          actions.appendChild(clearButton);
+
+          const allButton = document.createElement("button");
+          allButton.type = "button";
+          allButton.textContent = "All";
+          allButton.addEventListener("click", (event) => {
+            event.preventDefault();
+            for (const option of select.options) option.selected = true;
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+          });
+          actions.appendChild(allButton);
+
+          menu.appendChild(actions);
+
+          control.addEventListener("click", () => toggleMultiSelect(widget));
+          control.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              toggleMultiSelect(widget);
+            } else if (event.key === "Escape") {
+              setMultiSelectOpen(widget, false);
+            }
+          });
+
+          select.addEventListener("change", () =>
+            syncMultiSelectWidget(select),
+          );
+
+          widget.appendChild(control);
+          widget.appendChild(menu);
+          select.insertAdjacentElement("afterend", widget);
+          syncMultiSelectWidget(select);
+        });
+
+        document.addEventListener("click", (event) => {
+          if (!event.target.closest(".multi-select-widget")) {
+            closeAllMultiSelectMenus();
+          }
+        });
+      }
 
       // upload function now accepts the actual input element
       async function uploadTarGzFile(fileInputEl, endpoint) {
@@ -579,16 +948,7 @@
         const el = document.getElementById(id);
         if (!el) return;
         if (el.tagName === "SELECT" && el.multiple) {
-          const selectedValues = Array.isArray(value)
-            ? value.map(String)
-            : String(value ?? "")
-                .split(",")
-                .map((part) => part.trim())
-                .filter(Boolean);
-
-          for (const option of el.options) {
-            option.selected = selectedValues.includes(option.value);
-          }
+          setMultiSelectValues(el, value);
         } else if (el.type === "checkbox") {
           el.checked = value;
         } else {
@@ -698,8 +1058,6 @@
           alert(`❌ Failed to save configuration:\n${error.message}`);
         }
       }
-
-      loadConfig();
     </script>
   </body>
 </html>

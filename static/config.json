@@ -119,12 +119,30 @@
           ]
         },
         "pkt_debug_filter_stages": {
-          "typ": "string",
-          "description": "Comma-separated stages to include. Empty = all. Values: raw_input, raw_output, decrypted_input, decrypted_output."
+          "typ": "multi-select",
+          "description": "Stages to include, empty=all",
+          "values": [
+            "raw_input",
+            "raw_output",
+            "decrypted_input",
+            "decrypted_output"
+          ]
         },
         "pkt_debug_filter_service_kinds": {
-          "typ": "string",
-          "description": "Comma-separated semantic service kinds to include. Empty = all. Examples: control, sensor_source, media_sink, input_source, media_source, bluetooth, radio, navigation_status, vendor_extension, wifi_projection."
+          "typ": "multi-select",
+          "description": "Service kinds to filter, empty=all",
+          "values": [
+            "control",
+            "sensor_source",
+            "media_sink",
+            "input_source",
+            "media_source",
+            "bluetooth",
+            "radio",
+            "navigation_status",
+            "vendor_extension",
+            "wifi_projection"
+          ]
         },
         "pkt_debug_filter_channels": {
           "typ": "string",
