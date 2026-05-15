@@ -16,6 +16,7 @@ pub mod io_uring;
 pub mod led;
 pub mod media_tap;
 pub mod mitm;
+pub mod mitm_prettyprint;
 pub mod mpegts;
 #[cfg(feature = "wasm-scripting")]
 pub mod script_wasm;
