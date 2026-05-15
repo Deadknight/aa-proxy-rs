@@ -1,6 +1,6 @@
 use chrono::Local;
 use serde::Serialize;
-use std::backtrace::Backtrace;
+//use std::backtrace::Backtrace;
 use std::fs::{self, File};
 use std::io::Write;
 use std::panic::{self, PanicHookInfo};
@@ -174,7 +174,8 @@ fn write_panic_report(panic_info: &PanicHookInfo<'_>) {
         }
 
         let _ = writeln!(file, "panic: {}", panic_payload_to_string(panic_info));
-        let _ = writeln!(file, "\nstacktrace:\n{}", Backtrace::force_capture());
+        //TODO: Deadknight: this does not work on strip :\, i'm leaving it here
+        //let _ = writeln!(file, "\nstacktrace:\n{}", Backtrace::force_capture());
     }
 }
 
