@@ -60,6 +60,7 @@ pub fn generate_config<P: AsRef<Path>>(output_path: P) -> Result<(), Box<dyn std
                             r#""""#.to_string()
                         }
                     }
+                    "multi-select" => r#""""#.to_string(),
                     _ => r#""""#.to_string(),
                 });
 

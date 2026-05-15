@@ -364,8 +364,12 @@
           "description": "Remove the Wi-Fi service from the `service discovery response`. This option may be helpful for head units with integrated wireless Android Auto."
         },
         "inject_display_types": {
-          "typ": "string",
-          "description": "Add video display services to the `service discovery response`. Possible values (comma separated): `cluster`, `aux`. Leave empty to disable. Useful when forcing additional display channels for capture. Requires `mitm = true`."
+          "typ": "multi-select",
+          "description": "Add video display services to the service discovery response. Select one or more display types. Leave empty to disable. Useful when forcing additional display channels for capture. Requires mitm = true.",
+          "values": [
+            "DISPLAY_TYPE_CLUSTER",
+            "DISPLAY_TYPE_AUXILIARY"
+          ]
         },
         "inject_add_input_sources": {
           "typ": "boolean",
@@ -484,8 +488,17 @@
           "description": "Path to executable for providing EV battery data (e.g. from an OBD dongle). It is started automatically when an Android Auto session begins and terminated when the session ends.\nAny parameters provided at the end of the path are passed to the executable as-is."
         },
         "ev_connector_types": {
-          "typ": "string",
-          "description": "List of EV connector types supported by your car. Possible values (separate multiple with a comma ','):\nEV_CONNECTOR_TYPE_J1772, EV_CONNECTOR_TYPE_MENNEKES, EV_CONNECTOR_TYPE_CHADEMO, EV_CONNECTOR_TYPE_COMBO_1, EV_CONNECTOR_TYPE_COMBO_2, EV_CONNECTOR_TYPE_TESLA_SUPERCHARGER, EV_CONNECTOR_TYPE_GBT\n\nIf left empty, the default is EV_CONNECTOR_TYPE_MENNEKES."
+          "typ": "multi-select",
+          "description": "List of EV connector types supported by your car. Select one or more values. If left empty, the default is EV_CONNECTOR_TYPE_MENNEKES.",
+          "values": [
+            "EV_CONNECTOR_TYPE_J1772",
+            "EV_CONNECTOR_TYPE_MENNEKES",
+            "EV_CONNECTOR_TYPE_CHADEMO",
+            "EV_CONNECTOR_TYPE_COMBO_1",
+            "EV_CONNECTOR_TYPE_COMBO_2",
+            "EV_CONNECTOR_TYPE_TESLA_SUPERCHARGER",
+            "EV_CONNECTOR_TYPE_GBT"
+          ]
         }
       }
     },

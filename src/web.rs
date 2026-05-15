@@ -269,6 +269,21 @@ pub fn render_config_values(config: &ConfigJson) -> String {
                         format!(r#"<input type="text" id="{key}" />"#)
                     }
                 }
+                "multi-select" => {
+                    // Render a multi-select with options if they exist. The saved
+                    // value stays a comma-separated string in config.toml.
+                    if let Some(options) = &val.values {
+                        let options_html = options
+                            .iter()
+                            .map(|opt| format!(r#"<option value="{opt}">{opt}</option>"#))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        format!(r#"<select id="{key}" multiple size="{}">{options_html}</select>"#, options.len().clamp(2, 8))
+                    } else {
+                        // fallback to text input if no options provided
+                        format!(r#"<input type="text" id="{key}" />"#)
+                    }
+                }
                 _ => format!(r#"<input type="text" id="{key}" />"#),
             };
 
