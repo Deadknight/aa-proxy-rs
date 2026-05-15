@@ -236,6 +236,9 @@ pub struct AppConfig {
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub wired: Option<UsbId>,
     pub dhu: bool,
+    /// Optional direct TCP address for Android Auto Head Unit Server on the MD/phone side.
+    /// Empty keeps the normal USB/Bluetooth/Wi-Fi MD transport behavior.
+    pub aa_server_tcp_addr: String,
     pub ev: bool,
     pub odometer: bool,
     pub tire_pressure: bool,
@@ -519,6 +522,7 @@ impl Default for AppConfig {
             developer_mode: false,
             wired: None,
             dhu: false,
+            aa_server_tcp_addr: String::new(),
             ev: false,
             odometer: false,
             tire_pressure: false,
@@ -758,6 +762,7 @@ impl AppConfig {
         doc["developer_mode"] = value(self.developer_mode);
         doc["wired"] = value(self.wired.as_ref().map_or(String::new(), |w| w.to_string()));
         doc["dhu"] = value(self.dhu);
+        doc["aa_server_tcp_addr"] = value(self.aa_server_tcp_addr.to_string());
         doc["ev"] = value(self.ev);
         doc["odometer"] = value(self.odometer);
         doc["tire_pressure"] = value(self.tire_pressure);
