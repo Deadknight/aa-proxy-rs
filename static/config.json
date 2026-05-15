@@ -83,7 +83,11 @@
       "values": {
         "debug": {
           "typ": "boolean",
-          "description": "Enable debug info"
+          "description": "Enable global debug logging. This also enables many non-packet debug messages."
+        },
+        "pkt_debug": {
+          "typ": "boolean",
+          "description": "Enable packet debug output independently from global debug logging. When enabled, pkt_debug lines are emitted at INFO level, so debug can stay disabled to avoid unrelated debug noise."
         },
         "hexdump_level": {
           "typ": "select",
@@ -100,6 +104,51 @@
         "disable_console_debug": {
           "typ": "boolean",
           "description": "Disable debug level on console, save it only to logfile (helpful for `hexdump-level` option)"
+        },
+        "pkt_debug_filter_enabled": {
+          "typ": "boolean",
+          "description": "Enable packet debug filtering. This narrows pkt_debug output on top of hexdump_level."
+        },
+        "pkt_debug_filter_proxy": {
+          "typ": "select",
+          "description": "Packet debug proxy filter.",
+          "values": [
+            "both",
+            "hu",
+            "md"
+          ]
+        },
+        "pkt_debug_filter_stages": {
+          "typ": "string",
+          "description": "Comma-separated stages to include. Empty = all. Values: raw_input, raw_output, decrypted_input, decrypted_output."
+        },
+        "pkt_debug_filter_service_kinds": {
+          "typ": "string",
+          "description": "Comma-separated semantic service kinds to include. Empty = all. Examples: control, sensor_source, media_sink, input_source, media_source, bluetooth, radio, navigation_status, vendor_extension, wifi_projection."
+        },
+        "pkt_debug_filter_channels": {
+          "typ": "string",
+          "description": "Comma-separated numeric channel IDs to include. Empty = all. Examples: 0x00,0x08,8."
+        },
+        "pkt_debug_filter_exclude_channels": {
+          "typ": "string",
+          "description": "Comma-separated numeric channel IDs to exclude. Examples: 0x01,1."
+        },
+        "pkt_debug_filter_message_ids": {
+          "typ": "string",
+          "description": "Comma-separated numeric message IDs to include. Empty = all. Examples: 0x0006,6."
+        },
+        "pkt_debug_filter_exclude_message_ids": {
+          "typ": "string",
+          "description": "Comma-separated numeric message IDs to exclude."
+        },
+        "pkt_debug_filter_pretty_proto": {
+          "typ": "boolean",
+          "description": "When packet debug filtering is enabled, also print decoded protobuf text for known control messages."
+        },
+        "pkt_debug_filter_max_payload_bytes": {
+          "typ": "integer",
+          "description": "When packet debug filtering is enabled, truncate payload dumps to this many bytes. 0 disables truncation."
         }
       }
     },

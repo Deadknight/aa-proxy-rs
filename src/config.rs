@@ -204,8 +204,31 @@ pub struct AppConfig {
     pub enable_btle: bool,
     pub dongle_mode: bool,
     pub debug: bool,
+    /// Enable packet debug output independently from global debug logging.
+    /// When enabled, pkt_debug lines are emitted at INFO level so `debug = false` can be kept.
+    pub pkt_debug: bool,
     pub hexdump_level: HexdumpLevel,
     pub disable_console_debug: bool,
+    /// Enable additional packet debug filtering on top of `hexdump_level`.
+    pub pkt_debug_filter_enabled: bool,
+    /// Packet debug proxy filter: `both`, `hu`, or `md`.
+    pub pkt_debug_filter_proxy: String,
+    /// Comma-separated hexdump stages: `raw_input`, `raw_output`, `decrypted_input`, `decrypted_output`. Empty means all.
+    pub pkt_debug_filter_stages: String,
+    /// Comma-separated semantic service kinds, e.g. `control,sensor_source,vendor_extension`. Empty means all.
+    pub pkt_debug_filter_service_kinds: String,
+    /// Comma-separated numeric channel IDs, e.g. `0x00,0x08,8`. Empty means all.
+    pub pkt_debug_filter_channels: String,
+    /// Comma-separated numeric channel IDs to exclude.
+    pub pkt_debug_filter_exclude_channels: String,
+    /// Comma-separated numeric message IDs, e.g. `0x0006,6`. Empty means all.
+    pub pkt_debug_filter_message_ids: String,
+    /// Comma-separated numeric message IDs to exclude.
+    pub pkt_debug_filter_exclude_message_ids: String,
+    /// When packet debug filtering is enabled, try to print protobuf text for known control messages.
+    pub pkt_debug_filter_pretty_proto: bool,
+    /// When packet debug filtering is enabled, truncate packet payload dumps to this many bytes. 0 disables truncation.
+    pub pkt_debug_filter_max_payload_bytes: usize,
     pub legacy: bool,
     pub quick_reconnect: bool,
     pub bt_poweroff: bool,
@@ -497,8 +520,19 @@ impl Default for AppConfig {
             enable_btle: true,
             dongle_mode: false,
             debug: false,
+            pkt_debug: false,
             hexdump_level: HexdumpLevel::Disabled,
             disable_console_debug: false,
+            pkt_debug_filter_enabled: false,
+            pkt_debug_filter_proxy: "both".to_string(),
+            pkt_debug_filter_stages: String::new(),
+            pkt_debug_filter_service_kinds: String::new(),
+            pkt_debug_filter_channels: String::new(),
+            pkt_debug_filter_exclude_channels: String::new(),
+            pkt_debug_filter_message_ids: String::new(),
+            pkt_debug_filter_exclude_message_ids: String::new(),
+            pkt_debug_filter_pretty_proto: true,
+            pkt_debug_filter_max_payload_bytes: 2048,
             legacy: true,
             quick_reconnect: false,
             bt_poweroff: false,
@@ -731,8 +765,23 @@ impl AppConfig {
         doc["enable_btle"] = value(self.enable_btle);
         doc["dongle_mode"] = value(self.dongle_mode);
         doc["debug"] = value(self.debug);
+        doc["pkt_debug"] = value(self.pkt_debug);
         doc["hexdump_level"] = value(format!("{:?}", self.hexdump_level));
         doc["disable_console_debug"] = value(self.disable_console_debug);
+        doc["pkt_debug_filter_enabled"] = value(self.pkt_debug_filter_enabled);
+        doc["pkt_debug_filter_proxy"] = value(self.pkt_debug_filter_proxy.to_string());
+        doc["pkt_debug_filter_stages"] = value(self.pkt_debug_filter_stages.to_string());
+        doc["pkt_debug_filter_service_kinds"] =
+            value(self.pkt_debug_filter_service_kinds.to_string());
+        doc["pkt_debug_filter_channels"] = value(self.pkt_debug_filter_channels.to_string());
+        doc["pkt_debug_filter_exclude_channels"] =
+            value(self.pkt_debug_filter_exclude_channels.to_string());
+        doc["pkt_debug_filter_message_ids"] = value(self.pkt_debug_filter_message_ids.to_string());
+        doc["pkt_debug_filter_exclude_message_ids"] =
+            value(self.pkt_debug_filter_exclude_message_ids.to_string());
+        doc["pkt_debug_filter_pretty_proto"] = value(self.pkt_debug_filter_pretty_proto);
+        doc["pkt_debug_filter_max_payload_bytes"] =
+            value(self.pkt_debug_filter_max_payload_bytes as i64);
         doc["legacy"] = value(self.legacy);
         doc["quick_reconnect"] = value(self.quick_reconnect);
         doc["bt_poweroff"] = value(self.bt_poweroff);
