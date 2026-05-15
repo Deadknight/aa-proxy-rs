@@ -27,6 +27,7 @@ pub const TCP_SERVER_PORT: i32 = 5288;
 pub const TCP_DHU_PORT: i32 = 5277;
 
 pub const DEFAULT_WASM_HOOKS_DIR: &str = "/data/wasm-hooks";
+pub const DEFAULT_CRASH_DIR: &str = "/data/aa-proxy-rs/crashes";
 
 pub type SharedConfig = Arc<RwLock<AppConfig>>;
 pub type SharedConfigJson = Arc<RwLock<ConfigJson>>;
@@ -234,6 +235,10 @@ pub struct AppConfig {
     pub bt_poweroff: bool,
     pub connect: BluetoothAddressList,
     pub logfile: PathBuf,
+    /// Enable writing Rust panic reports to disk.
+    pub crash_handler_enabled: bool,
+    /// Directory where panic reports are written.
+    pub crash_dir: PathBuf,
     pub stats_interval: u16,
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub udc: Option<String>,
@@ -538,6 +543,8 @@ impl Default for AppConfig {
             bt_poweroff: false,
             connect: BluetoothAddressList::default(),
             logfile: "/var/log/aa-proxy-rs.log".into(),
+            crash_handler_enabled: true,
+            crash_dir: DEFAULT_CRASH_DIR.into(),
             stats_interval: 0,
             udc: None,
             iface: "wlan0".to_string(),
@@ -787,6 +794,8 @@ impl AppConfig {
         doc["bt_poweroff"] = value(self.bt_poweroff);
         doc["connect"] = value(self.connect.to_string());
         doc["logfile"] = value(self.logfile.display().to_string());
+        doc["crash_handler_enabled"] = value(self.crash_handler_enabled);
+        doc["crash_dir"] = value(self.crash_dir.display().to_string());
         doc["stats_interval"] = value(self.stats_interval as i64);
         if let Some(udc) = &self.udc {
             doc["udc"] = value(udc);
