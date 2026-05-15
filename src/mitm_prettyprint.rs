@@ -6,7 +6,7 @@ use crate::mitm::protos::*;
 use crate::mitm::{get_name, ModifyContext, Packet, ProxyType, Result};
 use log::{debug, info, log_enabled, Level};
 use protobuf::text_format::print_to_string_pretty;
-use protobuf::{Enum, Message, MessageDyn};
+use protobuf::{Enum, Message};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -350,6 +350,622 @@ fn format_packet_for_debug(pkt: &Packet, max_payload_bytes: Option<usize>) -> St
     out
 }
 
+fn trim_preview(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
+    }
+    if value.chars().count() > max_chars {
+        out.push_str("...");
+    }
+    out
+}
+
+fn bytes_preview(data: &[u8], max_bytes: usize) -> String {
+    let shown_len = data.len().min(max_bytes);
+    let mut out = format!("len={}", data.len());
+    if shown_len > 0 {
+        out.push_str(&format!(" preview={:02X?}", &data[..shown_len]));
+    }
+    if shown_len < data.len() {
+        out.push_str(&format!(
+            " ... truncated {} byte(s)",
+            data.len() - shown_len
+        ));
+    }
+    out
+}
+
+fn json_field_string(value: &serde_json::Value, name: &str) -> Option<String> {
+    value.get(name)?.as_str().map(ToOwned::to_owned)
+}
+
+fn json_field_i64(value: &serde_json::Value, name: &str) -> Option<i64> {
+    value.get(name)?.as_i64()
+}
+
+fn json_payload_len_and_preview(value: &serde_json::Value, name: &str) -> Option<String> {
+    let raw = value.get(name)?;
+    if let Some(s) = raw.as_str() {
+        return Some(format!(
+            "{} chars, preview={}",
+            s.len(),
+            trim_preview(s, 240)
+        ));
+    }
+
+    let rendered = raw.to_string();
+    Some(format!(
+        "{} chars json, preview={}",
+        rendered.len(),
+        trim_preview(&rendered, 240)
+    ))
+}
+
+fn vec_opcode_name(opcode: u8) -> &'static str {
+    match opcode {
+        0x02 => "VEC_OP_PING",
+        0x03 => "VEC_OP_GET_STATUS",
+        0x04 => "VEC_OP_ECHO",
+        0x05 => "VEC_OP_REST_CALL",
+        0x06 => "VEC_OP_REST_CALL_SYNC",
+        0x07 => "VEC_OP_SUBSCRIBE_TOPIC_EVENT",
+        0x08 => "VEC_OP_UNSUBSCRIBE_TOPIC_EVENT",
+        0x09 => "VEC_OP_ON_SCRIPT_EVENT",
+        0x81 => "VEC_OP_PONG",
+        0x82 => "VEC_OP_STATUS",
+        0x83 => "VEC_OP_ECHO_REPLY",
+        0x85 => "VEC_OP_REST_CALL_REPLY",
+        0x86 => "VEC_OP_REST_CALL_RESULT",
+        0x87 => "VEC_OP_ON_TOPIC_EVENT",
+        0xFF => "VEC_OP_ERROR",
+        _ => "VEC_OP_UNKNOWN",
+    }
+}
+
+fn pretty_vec_app_packet(pkt: &Packet) -> Option<String> {
+    if pkt.payload.len() < 2 {
+        return Some("VEC app packet too short".to_string());
+    }
+
+    let version = pkt.payload[0];
+    let opcode = pkt.payload[1];
+    let body = &pkt.payload[2..];
+    let opcode_name = vec_opcode_name(opcode);
+
+    let mut out = format!(
+        "{}\n  version: {}\n  opcode: {:#04x}\n  body_len: {}",
+        opcode_name,
+        version,
+        opcode,
+        body.len()
+    );
+
+    if version != 0x01 {
+        out.push_str("\n  warning: unsupported VEC app version");
+    }
+
+    match opcode {
+        0x02 | 0x81 | 0x04 | 0x83 => {
+            if !body.is_empty() {
+                if let Ok(text) = std::str::from_utf8(body) {
+                    out.push_str(&format!("\n  body_text: {}", trim_preview(text, 240)));
+                } else {
+                    out.push_str(&format!("\n  body_bytes: {}", bytes_preview(body, 64)));
+                }
+            }
+        }
+        0x03 => {}
+        0x82 => {
+            if let Ok(text) = std::str::from_utf8(body) {
+                out.push_str(&format!("\n  status: {}", trim_preview(text, 240)));
+            }
+        }
+        0x05 | 0x06 => match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(json) => {
+                if let Some(method) = json_field_string(&json, "method") {
+                    out.push_str(&format!("\n  method: {}", method));
+                }
+                if let Some(path) = json_field_string(&json, "path") {
+                    out.push_str(&format!("\n  path: {}", path));
+                }
+                if let Some(body_info) = json_payload_len_and_preview(&json, "body") {
+                    out.push_str(&format!("\n  request_body: {}", body_info));
+                }
+            }
+            Err(e) => out.push_str(&format!("\n  json_error: {}", e)),
+        },
+        0x85 => match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(json) => {
+                if let Some(request_id) = json_field_string(&json, "request_id") {
+                    out.push_str(&format!("\n  request_id: {}", request_id));
+                }
+                if let Some(status) = json_field_i64(&json, "status") {
+                    out.push_str(&format!("\n  status: {}", status));
+                }
+            }
+            Err(e) => out.push_str(&format!("\n  json_error: {}", e)),
+        },
+        0x86 => match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(json) => {
+                if let Some(request_id) = json_field_string(&json, "request_id") {
+                    out.push_str(&format!("\n  request_id: {}", request_id));
+                }
+                if let Some(payload_info) = json_payload_len_and_preview(&json, "payload") {
+                    out.push_str(&format!("\n  payload: {}", payload_info));
+                }
+            }
+            Err(e) => out.push_str(&format!("\n  json_error: {}", e)),
+        },
+        0x07 | 0x08 => match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(json) => {
+                if let Some(topic) = json_field_string(&json, "topic") {
+                    out.push_str(&format!("\n  topic: {}", topic));
+                }
+            }
+            Err(e) => out.push_str(&format!("\n  json_error: {}", e)),
+        },
+        0x09 | 0x87 => match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(json) => {
+                if let Some(topic) = json_field_string(&json, "topic") {
+                    out.push_str(&format!("\n  topic: {}", topic));
+                }
+                if let Some(payload_info) = json_payload_len_and_preview(&json, "payload") {
+                    out.push_str(&format!("\n  payload: {}", payload_info));
+                }
+            }
+            Err(e) => out.push_str(&format!("\n  json_error: {}", e)),
+        },
+        0xFF => {
+            if let Ok(text) = std::str::from_utf8(body) {
+                out.push_str(&format!("\n  error: {}", trim_preview(text, 240)));
+            }
+        }
+        _ => {
+            out.push_str(&format!("\n  body_bytes: {}", bytes_preview(body, 64)));
+        }
+    }
+
+    Some(out)
+}
+
+fn message_name_for_kind(
+    service_kind: PacketDebugServiceKind,
+    message_id: u16,
+    pkt: &Packet,
+) -> String {
+    match service_kind {
+        PacketDebugServiceKind::Control => {
+            format!("{:?}", ControlMessageType::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::SensorSource => {
+            format!("{:?}", SensorMessageId::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::MediaSink | PacketDebugServiceKind::MediaSource => {
+            format!("{:?}", MediaMessageId::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::InputSource => {
+            format!("{:?}", InputMessageId::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::Bluetooth => {
+            format!("{:?}", BluetoothMessageId::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::WifiProjection => {
+            format!("{:?}", WifiProjectionMessageId::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::Radio => {
+            format!("{:?}", RadioMessageId::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::NavigationStatus => {
+            format!(
+                "{:?}",
+                NavigationStatusMessageId::from_i32(message_id.into())
+            )
+        }
+        PacketDebugServiceKind::MediaPlaybackStatus => {
+            format!(
+                "{:?}",
+                MediaPlaybackStatusMessageId::from_i32(message_id.into())
+            )
+        }
+        PacketDebugServiceKind::PhoneStatus => {
+            format!("{:?}", PhoneStatusMessageId::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::MediaBrowser => {
+            format!("{:?}", MediaBrowserMessageId::from_i32(message_id.into()))
+        }
+        PacketDebugServiceKind::GenericNotification => {
+            format!(
+                "{:?}",
+                GenericNotificationMessageId::from_i32(message_id.into())
+            )
+        }
+        PacketDebugServiceKind::VendorExtension => {
+            if pkt.payload.len() >= 2 && pkt.payload[0] == 0x01 {
+                format!("Some({})", vec_opcode_name(pkt.payload[1]))
+            } else {
+                format!(
+                    "{:?}",
+                    GalVerificationVendorExtensionMessageId::from_i32(message_id.into())
+                )
+            }
+        }
+        PacketDebugServiceKind::Unknown | PacketDebugServiceKind::CarProperty => "None".to_string(),
+    }
+}
+
+fn pretty_parse_error(type_name: &str, err: protobuf::Error) -> String {
+    format!("pretty parse failed as {}: {}", type_name, err)
+}
+
+macro_rules! parse_pretty_message {
+    ($ty:ty, $data:expr) => {{
+        match <$ty>::parse_from_bytes($data) {
+            Ok(msg) => Some(print_to_string_pretty(&msg)),
+            Err(e) => Some(pretty_parse_error(stringify!($ty), e)),
+        }
+    }};
+}
+
+fn pretty_control_message(control: Option<ControlMessageType>, data: &[u8]) -> Option<String> {
+    match control.unwrap_or(MESSAGE_UNEXPECTED_MESSAGE) {
+        MESSAGE_VERSION_REQUEST => parse_pretty_message!(VersionRequestOptions, data),
+        MESSAGE_VERSION_RESPONSE => parse_pretty_message!(VersionResponseOptions, data),
+        MESSAGE_BYEBYE_REQUEST => parse_pretty_message!(ByeByeRequest, data),
+        MESSAGE_BYEBYE_RESPONSE => parse_pretty_message!(ByeByeResponse, data),
+        MESSAGE_AUTH_COMPLETE => parse_pretty_message!(AuthResponse, data),
+        MESSAGE_SERVICE_DISCOVERY_REQUEST => parse_pretty_message!(ServiceDiscoveryRequest, data),
+        MESSAGE_SERVICE_DISCOVERY_RESPONSE => parse_pretty_message!(ServiceDiscoveryResponse, data),
+        MESSAGE_SERVICE_DISCOVERY_UPDATE => parse_pretty_message!(ServiceDiscoveryUpdate, data),
+        MESSAGE_PING_REQUEST => parse_pretty_message!(PingRequest, data),
+        MESSAGE_PING_RESPONSE => parse_pretty_message!(PingResponse, data),
+        MESSAGE_NAV_FOCUS_REQUEST => parse_pretty_message!(NavFocusRequestNotification, data),
+        MESSAGE_NAV_FOCUS_NOTIFICATION => parse_pretty_message!(NavFocusNotification, data),
+        MESSAGE_CHANNEL_OPEN_RESPONSE => parse_pretty_message!(ChannelOpenResponse, data),
+        MESSAGE_CHANNEL_OPEN_REQUEST => parse_pretty_message!(ChannelOpenRequest, data),
+        MESSAGE_CHANNEL_CLOSE_NOTIFICATION => parse_pretty_message!(ChannelCloseNotification, data),
+        MESSAGE_VOICE_SESSION_NOTIFICATION => parse_pretty_message!(VoiceSessionNotification, data),
+        MESSAGE_AUDIO_FOCUS_REQUEST => parse_pretty_message!(AudioFocusRequestNotification, data),
+        MESSAGE_AUDIO_FOCUS_NOTIFICATION => parse_pretty_message!(AudioFocusNotification, data),
+        MESSAGE_CAR_CONNECTED_DEVICES_REQUEST => {
+            parse_pretty_message!(CarConnectedDevicesRequest, data)
+        }
+        MESSAGE_CAR_CONNECTED_DEVICES_RESPONSE => parse_pretty_message!(CarConnectedDevices, data),
+        MESSAGE_USER_SWITCH_REQUEST => parse_pretty_message!(UserSwitchRequest, data),
+        MESSAGE_USER_SWITCH_RESPONSE => parse_pretty_message!(UserSwitchResponse, data),
+        MESSAGE_BATTERY_STATUS_NOTIFICATION => {
+            parse_pretty_message!(BatteryStatusNotification, data)
+        }
+        MESSAGE_CALL_AVAILABILITY_STATUS => parse_pretty_message!(CallAvailabilityStatus, data),
+        _ => None,
+    }
+}
+
+fn pretty_sensor_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match SensorMessageId::from_i32(message_id.into())
+        .unwrap_or(SensorMessageId::SENSOR_MESSAGE_ERROR)
+    {
+        SensorMessageId::SENSOR_MESSAGE_REQUEST => parse_pretty_message!(SensorRequest, data),
+        SensorMessageId::SENSOR_MESSAGE_RESPONSE => parse_pretty_message!(SensorResponse, data),
+        SensorMessageId::SENSOR_MESSAGE_BATCH => parse_pretty_message!(SensorBatch, data),
+        SensorMessageId::SENSOR_MESSAGE_ERROR => {
+            Some(format!("SENSOR_MESSAGE_ERROR raw_len={}", data.len()))
+        }
+    }
+}
+
+fn pretty_media_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match MediaMessageId::from_i32(message_id.into()).unwrap_or(MediaMessageId::MEDIA_MESSAGE_DATA)
+    {
+        MediaMessageId::MEDIA_MESSAGE_DATA => {
+            Some(format!("MEDIA_MESSAGE_DATA {}", bytes_preview(data, 64)))
+        }
+        MediaMessageId::MEDIA_MESSAGE_CODEC_CONFIG => Some(format!(
+            "MEDIA_MESSAGE_CODEC_CONFIG {}",
+            bytes_preview(data, 64)
+        )),
+        MediaMessageId::MEDIA_MESSAGE_SETUP => parse_pretty_message!(Setup, data),
+        MediaMessageId::MEDIA_MESSAGE_START => parse_pretty_message!(Start, data),
+        MediaMessageId::MEDIA_MESSAGE_STOP => parse_pretty_message!(Stop, data),
+        MediaMessageId::MEDIA_MESSAGE_CONFIG => parse_pretty_message!(Config, data),
+        MediaMessageId::MEDIA_MESSAGE_ACK => parse_pretty_message!(Ack, data),
+        MediaMessageId::MEDIA_MESSAGE_MICROPHONE_REQUEST => {
+            parse_pretty_message!(MicrophoneRequest, data)
+        }
+        MediaMessageId::MEDIA_MESSAGE_MICROPHONE_RESPONSE => {
+            parse_pretty_message!(MicrophoneResponse, data)
+        }
+        MediaMessageId::MEDIA_MESSAGE_VIDEO_FOCUS_REQUEST => {
+            parse_pretty_message!(VideoFocusRequestNotification, data)
+        }
+        MediaMessageId::MEDIA_MESSAGE_VIDEO_FOCUS_NOTIFICATION => {
+            parse_pretty_message!(VideoFocusNotification, data)
+        }
+        MediaMessageId::MEDIA_MESSAGE_UPDATE_UI_CONFIG_REQUEST => {
+            parse_pretty_message!(UpdateUiConfigRequest, data)
+        }
+        MediaMessageId::MEDIA_MESSAGE_UPDATE_UI_CONFIG_REPLY => {
+            parse_pretty_message!(UpdateUiConfigReply, data)
+        }
+        MediaMessageId::MEDIA_MESSAGE_AUDIO_UNDERFLOW_NOTIFICATION => {
+            parse_pretty_message!(AudioUnderflowNotification, data)
+        }
+    }
+}
+
+fn pretty_input_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match InputMessageId::from_i32(message_id.into())? {
+        InputMessageId::INPUT_MESSAGE_INPUT_REPORT => parse_pretty_message!(InputReport, data),
+        InputMessageId::INPUT_MESSAGE_KEY_BINDING_REQUEST => {
+            parse_pretty_message!(KeyBindingRequest, data)
+        }
+        InputMessageId::INPUT_MESSAGE_KEY_BINDING_RESPONSE => {
+            parse_pretty_message!(KeyBindingResponse, data)
+        }
+        InputMessageId::INPUT_MESSAGE_INPUT_FEEDBACK => parse_pretty_message!(InputFeedback, data),
+    }
+}
+
+fn pretty_bluetooth_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match BluetoothMessageId::from_i32(message_id.into())? {
+        BluetoothMessageId::BLUETOOTH_MESSAGE_PAIRING_REQUEST => {
+            parse_pretty_message!(BluetoothPairingRequest, data)
+        }
+        BluetoothMessageId::BLUETOOTH_MESSAGE_PAIRING_RESPONSE => {
+            parse_pretty_message!(BluetoothPairingResponse, data)
+        }
+        BluetoothMessageId::BLUETOOTH_MESSAGE_AUTHENTICATION_DATA => {
+            parse_pretty_message!(BluetoothAuthenticationData, data)
+        }
+        BluetoothMessageId::BLUETOOTH_MESSAGE_AUTHENTICATION_RESULT => {
+            parse_pretty_message!(BluetoothAuthenticationResult, data)
+        }
+    }
+}
+
+fn pretty_wifi_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match WifiProjectionMessageId::from_i32(message_id.into())? {
+        WifiProjectionMessageId::WIFI_MESSAGE_CREDENTIALS_REQUEST => {
+            parse_pretty_message!(WifiCredentialsRequest, data)
+        }
+        WifiProjectionMessageId::WIFI_MESSAGE_CREDENTIALS_RESPONSE => {
+            parse_pretty_message!(WifiCredentialsResponse, data)
+        }
+    }
+}
+
+fn pretty_radio_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match RadioMessageId::from_i32(message_id.into())? {
+        RadioMessageId::RADIO_MESSAGE_ACTIVE_RADIO_NOTIFICATION => {
+            parse_pretty_message!(ActiveRadioNotification, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_SELECT_ACTIVE_RADIO_REQUEST => {
+            parse_pretty_message!(SelectActiveRadioRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_STEP_CHANNEL_REQUEST => {
+            parse_pretty_message!(StepChannelRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_STEP_CHANNEL_RESPONSE => {
+            parse_pretty_message!(StepChannelResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_SEEK_STATION_REQUEST => {
+            parse_pretty_message!(SeekStationRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_SEEK_STATION_RESPONSE => {
+            parse_pretty_message!(SeekStationResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_SCAN_STATIONS_REQUEST => {
+            parse_pretty_message!(ScanStationsRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_SCAN_STATIONS_RESPONSE => {
+            parse_pretty_message!(ScanStationsResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_TUNE_TO_STATION_REQUEST => {
+            parse_pretty_message!(TuneToStationRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_TUNE_TO_STATION_RESPONSE => {
+            parse_pretty_message!(TuneToStationResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_GET_PROGRAM_LIST_REQUEST => {
+            parse_pretty_message!(GetProgramListRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_GET_PROGRAM_LIST_RESPONSE => {
+            parse_pretty_message!(GetProgramListResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_STATION_PRESETS_NOTIFICATION => {
+            parse_pretty_message!(StationPresetsNotification, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_CANCEL_OPERATIONS_REQUEST => {
+            parse_pretty_message!(CancelRadioOperationsRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_CANCEL_OPERATIONS_RESPONSE => {
+            parse_pretty_message!(CancelRadioOperationsResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_CONFIGURE_CHANNEL_SPACING_REQUEST => {
+            parse_pretty_message!(ConfigureChannelSpacingRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_CONFIGURE_CHANNEL_SPACING_RESPONSE => {
+            parse_pretty_message!(ConfigureChannelSpacingResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_RADIO_STATION_INFO_NOTIFICATION => {
+            parse_pretty_message!(RadioStationInfoNotification, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_MUTE_RADIO_REQUEST => {
+            parse_pretty_message!(MuteRadioRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_MUTE_RADIO_RESPONSE => {
+            parse_pretty_message!(MuteRadioResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_GET_TRAFFIC_UPDATE_REQUEST => {
+            parse_pretty_message!(GetTrafficUpdateRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_GET_TRAFFIC_UPDATE_RESPONSE => {
+            parse_pretty_message!(GetTrafficUpdateResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_RADIO_SOURCE_REQUEST => {
+            parse_pretty_message!(RadioSourceRequest, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_RADIO_SOURCE_RESPONSE => {
+            parse_pretty_message!(RadioSourceResponse, data)
+        }
+        RadioMessageId::RADIO_MESSAGE_STATE_NOTIFICATION => {
+            parse_pretty_message!(RadioStateNotification, data)
+        }
+    }
+}
+
+fn pretty_navigation_status_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match NavigationStatusMessageId::from_i32(message_id.into())? {
+        NavigationStatusMessageId::INSTRUMENT_CLUSTER_START => {
+            parse_pretty_message!(NavigationStatusStart, data)
+        }
+        NavigationStatusMessageId::INSTRUMENT_CLUSTER_STOP => {
+            parse_pretty_message!(NavigationStatusStop, data)
+        }
+        NavigationStatusMessageId::INSTRUMENT_CLUSTER_NAVIGATION_STATUS => {
+            parse_pretty_message!(NavigationStatus, data)
+        }
+        NavigationStatusMessageId::INSTRUMENT_CLUSTER_NAVIGATION_TURN_EVENT => {
+            parse_pretty_message!(NavigationNextTurnEvent, data)
+        }
+        NavigationStatusMessageId::INSTRUMENT_CLUSTER_NAVIGATION_DISTANCE_EVENT => {
+            parse_pretty_message!(NavigationNextTurnDistanceEvent, data)
+        }
+        NavigationStatusMessageId::INSTRUMENT_CLUSTER_NAVIGATION_STATE => {
+            parse_pretty_message!(NavigationState, data)
+        }
+        NavigationStatusMessageId::INSTRUMENT_CLUSTER_NAVIGATION_CURRENT_POSITION => {
+            parse_pretty_message!(NavigationCurrentPosition, data)
+        }
+    }
+}
+
+fn pretty_media_playback_status_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match MediaPlaybackStatusMessageId::from_i32(message_id.into())? {
+        MediaPlaybackStatusMessageId::MEDIA_PLAYBACK_STATUS => {
+            parse_pretty_message!(MediaPlaybackStatus, data)
+        }
+        MediaPlaybackStatusMessageId::MEDIA_PLAYBACK_INPUT => {
+            parse_pretty_message!(InstrumentClusterInput, data)
+        }
+        MediaPlaybackStatusMessageId::MEDIA_PLAYBACK_METADATA => {
+            parse_pretty_message!(MediaPlaybackMetadata, data)
+        }
+    }
+}
+
+fn pretty_phone_status_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match PhoneStatusMessageId::from_i32(message_id.into())? {
+        PhoneStatusMessageId::PHONE_STATUS => parse_pretty_message!(PhoneStatus, data),
+        PhoneStatusMessageId::PHONE_STATUS_INPUT => parse_pretty_message!(PhoneStatusInput, data),
+    }
+}
+
+fn pretty_media_browser_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match MediaBrowserMessageId::from_i32(message_id.into())? {
+        MediaBrowserMessageId::MEDIA_ROOT_NODE => parse_pretty_message!(MediaRootNode, data),
+        MediaBrowserMessageId::MEDIA_SOURCE_NODE => parse_pretty_message!(MediaSourceNode, data),
+        MediaBrowserMessageId::MEDIA_LIST_NODE => parse_pretty_message!(MediaListNode, data),
+        MediaBrowserMessageId::MEDIA_SONG_NODE => parse_pretty_message!(MediaSongNode, data),
+        MediaBrowserMessageId::MEDIA_GET_NODE => parse_pretty_message!(MediaGetNode, data),
+        MediaBrowserMessageId::MEDIA_BROWSE_INPUT => parse_pretty_message!(MediaBrowserInput, data),
+    }
+}
+
+fn pretty_gal_verification_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match GalVerificationVendorExtensionMessageId::from_i32(message_id.into())? {
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_SET_SENSOR => {
+            parse_pretty_message!(GalVerificationSetSensor, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_MEDIA_SINK_STATUS => {
+            parse_pretty_message!(GalVerificationMediaSinkStatus, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_VIDEO_FOCUS => {
+            parse_pretty_message!(GalVerificationVideoFocus, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_AUDIO_FOCUS => {
+            parse_pretty_message!(GalVerificationAudioFocus, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_INJECT_INPUT => {
+            parse_pretty_message!(GalVerificationInjectInput, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_BUG_REPORT_REQUEST => {
+            parse_pretty_message!(GalVerificationBugReportRequest, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_BUG_REPORT_RESPONSE => {
+            parse_pretty_message!(GalVerificationBugReportResponse, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_SCREEN_CAPTURE_REQUEST => {
+            parse_pretty_message!(GalVerificationScreenCaptureRequest, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_SCREEN_CAPTURE_RESPONSE => {
+            parse_pretty_message!(GalVerificationScreenCaptureResponse, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_DISPLAY_INFORMATION_REQUEST => {
+            parse_pretty_message!(GalVerificationDisplayInformationRequest, data)
+        }
+        GalVerificationVendorExtensionMessageId::GAL_VERIFICATION_DISPLAY_INFORMATION_RESPONSE => {
+            parse_pretty_message!(GalVerificationDisplayInformationResponse, data)
+        }
+    }
+}
+
+fn pretty_generic_notification_message(message_id: u16, data: &[u8]) -> Option<String> {
+    match GenericNotificationMessageId::from_i32(message_id.into())? {
+        GenericNotificationMessageId::GENERIC_NOTIFICATION_SUBSCRIBE => {
+            parse_pretty_message!(GenericNotificationSubscribe, data)
+        }
+        GenericNotificationMessageId::GENERIC_NOTIFICATION_UNSUBSCRIBE => {
+            parse_pretty_message!(GenericNotificationUnsubscribe, data)
+        }
+        GenericNotificationMessageId::GENERIC_NOTIFICATION_MESSAGE => {
+            parse_pretty_message!(GenericNotificationMessage, data)
+        }
+        GenericNotificationMessageId::GENERIC_NOTIFICATION_ACK => {
+            parse_pretty_message!(GenericNotificationAck, data)
+        }
+    }
+}
+
+fn pretty_packet_message(
+    service_kind: PacketDebugServiceKind,
+    control: Option<ControlMessageType>,
+    message_id: u16,
+    data: &[u8],
+    pkt: &Packet,
+) -> Option<String> {
+    match service_kind {
+        PacketDebugServiceKind::Control => pretty_control_message(control, data),
+        PacketDebugServiceKind::SensorSource => pretty_sensor_message(message_id, data),
+        PacketDebugServiceKind::MediaSink | PacketDebugServiceKind::MediaSource => {
+            pretty_media_message(message_id, data)
+        }
+        PacketDebugServiceKind::InputSource => pretty_input_message(message_id, data),
+        PacketDebugServiceKind::Bluetooth => pretty_bluetooth_message(message_id, data),
+        PacketDebugServiceKind::Radio => pretty_radio_message(message_id, data),
+        PacketDebugServiceKind::NavigationStatus => {
+            pretty_navigation_status_message(message_id, data)
+        }
+        PacketDebugServiceKind::MediaPlaybackStatus => {
+            pretty_media_playback_status_message(message_id, data)
+        }
+        PacketDebugServiceKind::PhoneStatus => pretty_phone_status_message(message_id, data),
+        PacketDebugServiceKind::MediaBrowser => pretty_media_browser_message(message_id, data),
+        PacketDebugServiceKind::VendorExtension => {
+            if pkt.payload.len() >= 2 && pkt.payload[0] == 0x01 {
+                pretty_vec_app_packet(pkt)
+            } else {
+                pretty_gal_verification_message(message_id, data)
+            }
+        }
+        PacketDebugServiceKind::GenericNotification => {
+            pretty_generic_notification_message(message_id, data)
+        }
+        PacketDebugServiceKind::WifiProjection => pretty_wifi_message(message_id, data),
+        PacketDebugServiceKind::Unknown | PacketDebugServiceKind::CarProperty => None,
+    }
+}
+
 /// shows packet/message contents as pretty string for debug
 pub async fn pkt_debug(
     proxy_type: ProxyType,
@@ -388,12 +1004,12 @@ pub async fn pkt_debug(
         return Ok(());
     }
 
-    // trying to obtain an Enum from message_id
     let control = ControlMessageType::from_i32(message_id.into());
+    let message_name = message_name_for_kind(service_kind, message_id, pkt);
     emit_pkt_debug(format!(
-        "message_id = {:04X}, {:?}, channel={:#04x}, service_kind={}",
+        "message_id = {:04X}, {}, channel={:#04x}, service_kind={}",
         message_id,
-        control,
+        message_name,
         pkt.channel,
         service_kind.as_str()
     ));
@@ -418,24 +1034,9 @@ pub async fn pkt_debug(
 
     // parsing data
     let data = &pkt.payload[2..]; // start of message data
-    let message: &dyn MessageDyn = match control.unwrap_or(MESSAGE_UNEXPECTED_MESSAGE) {
-        MESSAGE_BYEBYE_REQUEST => &ByeByeRequest::parse_from_bytes(data)?,
-        MESSAGE_BYEBYE_RESPONSE => &ByeByeResponse::parse_from_bytes(data)?,
-        MESSAGE_AUTH_COMPLETE => &AuthResponse::parse_from_bytes(data)?,
-        MESSAGE_SERVICE_DISCOVERY_REQUEST => &ServiceDiscoveryRequest::parse_from_bytes(data)?,
-        MESSAGE_SERVICE_DISCOVERY_RESPONSE => &ServiceDiscoveryResponse::parse_from_bytes(data)?,
-        MESSAGE_SERVICE_DISCOVERY_UPDATE => &ServiceDiscoveryUpdate::parse_from_bytes(data)?,
-        MESSAGE_PING_REQUEST => &PingRequest::parse_from_bytes(data)?,
-        MESSAGE_PING_RESPONSE => &PingResponse::parse_from_bytes(data)?,
-        MESSAGE_NAV_FOCUS_REQUEST => &NavFocusRequestNotification::parse_from_bytes(data)?,
-        MESSAGE_CHANNEL_OPEN_RESPONSE => &ChannelOpenResponse::parse_from_bytes(data)?,
-        MESSAGE_CHANNEL_OPEN_REQUEST => &ChannelOpenRequest::parse_from_bytes(data)?,
-        MESSAGE_AUDIO_FOCUS_REQUEST => &AudioFocusRequestNotification::parse_from_bytes(data)?,
-        MESSAGE_AUDIO_FOCUS_NOTIFICATION => &AudioFocusNotification::parse_from_bytes(data)?,
-        _ => return Ok(()),
-    };
-    // show pretty string from the message
-    emit_pkt_debug(print_to_string_pretty(message));
+    if let Some(pretty) = pretty_packet_message(service_kind, control, message_id, data, pkt) {
+        emit_pkt_debug(pretty);
+    }
 
     Ok(())
 }
