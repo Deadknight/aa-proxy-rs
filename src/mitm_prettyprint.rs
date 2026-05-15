@@ -733,6 +733,22 @@ fn pretty_packet_message(
     }
 }
 
+fn wrap_pretty_block(title: &str, text: &str) -> String {
+    let trimmed = text.trim();
+
+    if trimmed.is_empty() {
+        return format!("\n{} {{}}", title);
+    }
+
+    let body = trimmed
+        .lines()
+        .map(|line| format!("  {}", line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("\n{} {{\n{}\n}}", title, body)
+}
+
 /// shows packet/message contents as pretty string for debug
 pub async fn pkt_debug(
     proxy_type: ProxyType,
@@ -802,7 +818,7 @@ pub async fn pkt_debug(
     // parsing data
     let data = &pkt.payload[2..]; // start of message data
     if let Some(pretty) = pretty_packet_message(service_kind, control, message_id, data, pkt) {
-        emit_pkt_debug(pretty);
+        emit_pkt_debug(wrap_pretty_block("proto", &pretty));
     }
 
     Ok(())
