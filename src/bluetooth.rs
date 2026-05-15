@@ -3,6 +3,7 @@ use crate::config::Action;
 use crate::config::WifiConfig;
 use crate::config::IDENTITY_NAME;
 use crate::config_types::BluetoothAddressList;
+use crate::sdr_ui;
 use crate::web::AppState;
 use anyhow::anyhow;
 use backon::{ExponentialBuilder, Retryable};
@@ -712,6 +713,13 @@ impl Bluetooth {
         let (address, mut stream) = self
             .get_aa_profile_connection(connect, bt_timeout, stopped)
             .await?;
+
+        let phone_name = match self.adapter.device(address) {
+            Ok(device) => device.name().await.ok().flatten(),
+            Err(_) => None,
+        };
+        sdr_ui::set_current_phone_from_bt(&address.to_string(), phone_name);
+
         Self::send_params(wifi_config.clone(), &mut stream).await?;
 
         // Record this device as a known-good AA device (only when using wildcard connect)

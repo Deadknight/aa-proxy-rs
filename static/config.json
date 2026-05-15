@@ -353,6 +353,21 @@
           "typ": "integer",
           "description": "Force DPI\n0 = do not change DPI\nIf you are unsure what value to use, start experimenting with e.g. 130. Logs are helpful, as they show both the original HU value and the new one."
         },
+        "sdr_ui_override_enabled": {
+          "typ": "boolean",
+          "description": "Enable per-vehicle SDR UI config overrides for `content_insets`, `stable_content_insets`, and `margins` in media sink video configs.",
+          "values": null
+        },
+        "sdr_ui_override_autocreate_profiles": {
+          "typ": "boolean",
+          "description": "Automatically create disabled SDR UI override profiles from the first observed ServiceDiscoveryResponse for each vehicle.",
+          "values": null
+        },
+        "sdr_ui_override_file": {
+          "typ": "string",
+          "description": "TOML file used to store per-vehicle and optional per-phone SDR UI overrides. Default: `/data/aa-proxy-rs/sdr-ui-overrides.toml`.",
+          "values": null
+        },
         "audio_max_unacked": {
           "typ": "integer",
           "description": "Override the `max_unacked` setting for audio channels. This may improve audio performance on some head units, but may worsen it on others. Adjust this value experimentally only if you experience audio stuttering.\n0 = leave unchanged."

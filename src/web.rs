@@ -26,6 +26,7 @@ use crate::mitm::{send_odometer_data, OdometerData};
 use crate::mitm::{send_tire_pressure_data, TirePressureData};
 #[cfg(feature = "wasm-scripting")]
 use crate::script_wasm::{LoadedScript, ScriptRegistry};
+use crate::sdr_ui;
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
 use axum::{
@@ -176,6 +177,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/factory-reset", post(factory_reset_handler))
         .route("/set-time", post(set_time_handler))
         .route("/speed", get(speed_handler))
+        .route("/sdr-ui/current", get(sdr_ui_current_handler))
+        .route("/sdr-ui/profiles", get(sdr_ui_profiles_list_handler))
+        .route(
+            "/sdr-ui/profiles/:vehicle_id",
+            get(sdr_ui_profile_get_handler)
+                .put(sdr_ui_profile_put_handler)
+                .delete(sdr_ui_profile_delete_handler),
+        )
         .route(
             "/service-discovery-response",
             get(service_discovery_response_handler),
@@ -1289,6 +1298,120 @@ async fn speed_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         Json(serde_json::json!({ "speed": d })).into_response()
     } else {
         (StatusCode::NO_CONTENT, "No speed data yet").into_response()
+    }
+}
+
+async fn sdr_ui_current_handler() -> impl IntoResponse {
+    if let Some(current) = sdr_ui::current_sdr_ui() {
+        Json(current).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "sdr_ui_current_not_available",
+                "message": "No ServiceDiscoveryResponse has been observed yet"
+            })),
+        )
+            .into_response()
+    }
+}
+
+async fn sdr_ui_profiles_list_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let path = state.config.read().await.sdr_ui_override_file.clone();
+    match sdr_ui::list_profiles(path.clone()).await {
+        Ok(profiles) => Json(json!({
+            "profile_file": path.display().to_string(),
+            "profiles": profiles,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": format!("Failed to list SDR UI profiles: {:#}", e),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sdr_ui_profile_get_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(vehicle_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let path = state.config.read().await.sdr_ui_override_file.clone();
+    match sdr_ui::get_vehicle_profile(path, &vehicle_id).await {
+        Ok(Some(profile)) => Json(profile).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "status": "error",
+                "message": format!("SDR UI vehicle profile not found: {}", vehicle_id),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": format!("Failed to read SDR UI profile: {:#}", e),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sdr_ui_profile_put_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(vehicle_id): axum::extract::Path<String>,
+    Json(profile): Json<sdr_ui::SdrUiVehicleProfile>,
+) -> impl IntoResponse {
+    let path = state.config.read().await.sdr_ui_override_file.clone();
+    match sdr_ui::upsert_vehicle_profile(path, &vehicle_id, profile).await {
+        Ok(saved) => Json(json!({
+            "status": "success",
+            "profile": saved,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": format!("Failed to save SDR UI profile: {:#}", e),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sdr_ui_profile_delete_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(vehicle_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let path = state.config.read().await.sdr_ui_override_file.clone();
+    match sdr_ui::delete_vehicle_profile(path, &vehicle_id).await {
+        Ok(true) => Json(json!({
+            "status": "success",
+            "deleted": true,
+            "vehicle_id": vehicle_id,
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "status": "error",
+                "message": format!("SDR UI vehicle profile not found: {}", vehicle_id),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": format!("Failed to delete SDR UI profile: {:#}", e),
+            })),
+        )
+            .into_response(),
     }
 }
 

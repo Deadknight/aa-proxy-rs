@@ -28,6 +28,7 @@ pub const TCP_DHU_PORT: i32 = 5277;
 
 pub const DEFAULT_WASM_HOOKS_DIR: &str = "/data/wasm-hooks";
 pub const DEFAULT_CRASH_DIR: &str = "/data/aa-proxy-rs/crashes";
+pub const DEFAULT_SDR_UI_OVERRIDE_FILE: &str = "/data/aa-proxy-rs/sdr-ui-overrides.toml";
 
 pub type SharedConfig = Arc<RwLock<AppConfig>>;
 pub type SharedConfigJson = Arc<RwLock<ConfigJson>>;
@@ -239,6 +240,12 @@ pub struct AppConfig {
     pub crash_handler_enabled: bool,
     /// Directory where panic reports are written.
     pub crash_dir: PathBuf,
+    /// Enable SDR ui_config margin/content inset overrides.
+    pub sdr_ui_override_enabled: bool,
+    /// Auto-create per-vehicle SDR UI profiles from the first observed ServiceDiscoveryResponse.
+    pub sdr_ui_override_autocreate_profiles: bool,
+    /// TOML file that stores per-vehicle and optional per-phone SDR UI overrides.
+    pub sdr_ui_override_file: PathBuf,
     pub stats_interval: u16,
     #[serde(default, deserialize_with = "empty_string_as_none")]
     pub udc: Option<String>,
@@ -545,6 +552,9 @@ impl Default for AppConfig {
             logfile: "/var/log/aa-proxy-rs.log".into(),
             crash_handler_enabled: true,
             crash_dir: DEFAULT_CRASH_DIR.into(),
+            sdr_ui_override_enabled: true,
+            sdr_ui_override_autocreate_profiles: true,
+            sdr_ui_override_file: DEFAULT_SDR_UI_OVERRIDE_FILE.into(),
             stats_interval: 0,
             udc: None,
             iface: "wlan0".to_string(),
@@ -796,6 +806,10 @@ impl AppConfig {
         doc["logfile"] = value(self.logfile.display().to_string());
         doc["crash_handler_enabled"] = value(self.crash_handler_enabled);
         doc["crash_dir"] = value(self.crash_dir.display().to_string());
+        doc["sdr_ui_override_enabled"] = value(self.sdr_ui_override_enabled);
+        doc["sdr_ui_override_autocreate_profiles"] =
+            value(self.sdr_ui_override_autocreate_profiles);
+        doc["sdr_ui_override_file"] = value(self.sdr_ui_override_file.display().to_string());
         doc["stats_interval"] = value(self.stats_interval as i64);
         if let Some(udc) = &self.udc {
             doc["udc"] = value(udc);
