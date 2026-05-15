@@ -120,11 +120,7 @@
         "pkt_debug_filter_proxy": {
           "typ": "select",
           "description": "Packet debug proxy filter.",
-          "values": [
-            "both",
-            "hu",
-            "md"
-          ]
+          "values": ["both", "hu", "md"]
         },
         "pkt_debug_filter_stages": {
           "typ": "multi-select",
@@ -241,11 +237,7 @@
         "bt_sco_media_bridge_audio_type": {
           "typ": "select",
           "description": "Preferred AA PCM sink for SCO downlink.",
-          "values": [
-            "guidance",
-            "media",
-            "auto"
-          ]
+          "values": ["guidance", "media", "auto"]
         },
         "bt_sco_media_bridge_gain_percent": {
           "typ": "integer",
@@ -254,19 +246,12 @@
         "bt_sco_media_bridge_limiter": {
           "typ": "select",
           "description": "Limiter applied after gain: off preserves the proven path except unavoidable i16 saturation, hard clips peaks earlier, soft compresses peaks more gently.",
-          "values": [
-            "off",
-            "hard",
-            "soft"
-          ]
+          "values": ["off", "hard", "soft"]
         },
         "bt_sco_media_bridge_resampler": {
           "typ": "select",
           "description": "SCO 8 kHz to AA 48 kHz resampler: repeat preserves the proven path, linear smooths the 6x upsampling and may reduce roughness/crackle.",
-          "values": [
-            "repeat",
-            "linear"
-          ]
+          "values": ["repeat", "linear"]
         },
         "bt_sco_media_bridge_ring_capacity": {
           "typ": "integer",
@@ -319,10 +304,7 @@
         "bt_sco_mic_echo_control": {
           "typ": "select",
           "description": "Microphone echo handling for SCO uplink. off preserves current behavior; ducking lowers mic while downlink audio is active.",
-          "values": [
-            "off",
-            "ducking"
-          ]
+          "values": ["off", "ducking"]
         },
         "bt_sco_mic_gain_percent": {
           "typ": "integer",
@@ -407,10 +389,7 @@
         "inject_display_types": {
           "typ": "multi-select",
           "description": "Add video display services to the service discovery response. Select one or more display types. Leave empty to disable. Useful when forcing additional display channels for capture. Requires mitm = true.",
-          "values": [
-            "DISPLAY_TYPE_CLUSTER",
-            "DISPLAY_TYPE_AUXILIARY"
-          ]
+          "values": ["DISPLAY_TYPE_CLUSTER", "DISPLAY_TYPE_AUXILIARY"]
         },
         "inject_add_input_sources": {
           "typ": "boolean",
