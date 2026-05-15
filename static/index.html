@@ -578,8 +578,18 @@
       function setValue(id, value) {
         const el = document.getElementById(id);
         if (!el) return;
+        if (el.tagName === "SELECT" && el.multiple) {
+          const selectedValues = Array.isArray(value)
+            ? value.map(String)
+            : String(value ?? "")
+                .split(",")
+                .map((part) => part.trim())
+                .filter(Boolean);
 
-        if (el.type === "checkbox") {
+          for (const option of el.options) {
+            option.selected = selectedValues.includes(option.value);
+          }
+        } else if (el.type === "checkbox") {
           el.checked = value;
         } else {
           if (
@@ -597,7 +607,11 @@
 
       function getValue(id) {
         const el = document.getElementById(id);
-        if (el.type === "checkbox") {
+        if (el.tagName === "SELECT" && el.multiple) {
+          return Array.from(el.selectedOptions)
+            .map((option) => option.value)
+            .join(",");
+        } else if (el.type === "checkbox") {
           return el.checked;
         } else if (el.type === "number") {
           return el.value ? parseFloat(el.value) : null;
