@@ -340,9 +340,8 @@ async fn tokio_main(
             cfg.aa_server_tcp_addr.trim()
         );
     }
-    let bt_sco_enabled = cfg.bt_sco || cfg.bt_sco_media_bridge || cfg.bt_sco_mic_bridge;
 
-    if bt_sco_enabled {
+    if cfg.bt_sco {
         match bt_sco::spawn(BtScoOptions {
             bridge_aa_media_pcm: cfg.bt_sco_media_bridge,
             bridge_ring_capacity: cfg.bt_sco_media_bridge_ring_capacity,
@@ -494,7 +493,7 @@ async fn tokio_main(
                             cfg.action_requested == Some(Action::Stop),
                             cfg.quick_reconnect,
                             cfg.bt_poweroff,
-                            cfg.bt_sco || cfg.bt_sco_media_bridge || cfg.bt_sco_mic_bridge,
+                            cfg.bt_sco,
                             cfg.bt_sco_keep_bluetooth_alive,
                             restart_tx.subscribe(),
                             restart_tx.clone(),

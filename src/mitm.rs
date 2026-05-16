@@ -937,7 +937,8 @@ pub async fn pkt_modify_hook(
         }
     }
 
-    if cfg.bt_sco_media_bridge
+    if cfg.bt_sco
+        && cfg.bt_sco_media_bridge
         && proxy_type == ProxyType::MobileDevice
         && pkt.channel != 0
         && message_id == MEDIA_MESSAGE_CONFIG as i32
@@ -947,7 +948,11 @@ pub async fn pkt_modify_hook(
         }
     }
 
-    if cfg.bt_sco_mic_bridge && proxy_type == ProxyType::MobileDevice && pkt.channel != 0 {
+    if cfg.bt_sco
+        && cfg.bt_sco_mic_bridge
+        && proxy_type == ProxyType::MobileDevice
+        && pkt.channel != 0
+    {
         match protos::MediaMessageId::from_i32(message_id).unwrap_or(MEDIA_MESSAGE_DATA) {
             MEDIA_MESSAGE_DATA => {
                 if let Some((sample_rate, channels, bits)) =
@@ -1313,7 +1318,7 @@ pub async fn pkt_modify_hook(
                 }
             }
 
-            if cfg.bt_sco_media_bridge && proxy_type == ProxyType::MobileDevice {
+            if cfg.bt_sco && cfg.bt_sco_media_bridge && proxy_type == ProxyType::MobileDevice {
                 if let Some((bridge_channel, acfg, audio_type, score)) =
                     choose_bt_sco_media_bridge_sink(&msg, cfg.bt_sco_media_bridge_audio_type)
                 {
@@ -1371,7 +1376,7 @@ pub async fn pkt_modify_hook(
                 }
             }
 
-            if cfg.bt_sco_mic_bridge && proxy_type == ProxyType::MobileDevice {
+            if cfg.bt_sco && cfg.bt_sco_mic_bridge && proxy_type == ProxyType::MobileDevice {
                 if let Some((mic_channel, acfg, score)) = choose_bt_sco_microphone_source(&msg) {
                     if let Some(tx) = ctx.hu_tx.clone() {
                         bt_sco_media_bridge::init_or_update(tx);
