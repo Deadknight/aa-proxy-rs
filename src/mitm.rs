@@ -1416,28 +1416,6 @@ pub async fn pkt_modify_hook(
                 return Ok(PacketAction::Forward);
             }
 
-            match sdr_ui::process_service_discovery_response(&mut msg, cfg).await {
-                Ok(summary) => {
-                    info!(
-                        "{} <blue>SDR UI:</> vehicle=<b>{}</> ({}) profile_enabled={} phone_profile_enabled={} patch_applied={} patch_count={}",
-                        get_name(proxy_type),
-                        summary.vehicle_id,
-                        summary.vehicle_name,
-                        summary.vehicle_profile_enabled,
-                        summary.phone_profile_enabled,
-                        summary.patch_applied,
-                        summary.patch_count,
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "{} <blue>SDR UI:</> failed to process overrides; forwarding original UI config: {:#}",
-                        get_name(proxy_type),
-                        e
-                    );
-                }
-            }
-
             // DPI
             if cfg.dpi > 0 {
                 if let Some(svc) = msg
@@ -1863,6 +1841,28 @@ pub async fn pkt_modify_hook(
                             }
                         }
                     }
+                }
+            }
+
+            match sdr_ui::process_service_discovery_response(&mut msg, cfg).await {
+                Ok(summary) => {
+                    info!(
+                        "{} <blue>SDR UI:</> vehicle=<b>{}</> ({}) profile_enabled={} phone_profile_enabled={} patch_applied={} patch_count={}",
+                        get_name(proxy_type),
+                        summary.vehicle_id,
+                        summary.vehicle_name,
+                        summary.vehicle_profile_enabled,
+                        summary.phone_profile_enabled,
+                        summary.patch_applied,
+                        summary.patch_count,
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "{} <blue>SDR UI:</> failed to process overrides; forwarding original UI config: {:#}",
+                        get_name(proxy_type),
+                        e
+                    );
                 }
             }
 
