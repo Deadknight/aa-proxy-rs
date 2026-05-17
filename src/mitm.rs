@@ -1416,6 +1416,28 @@ pub async fn pkt_modify_hook(
                 return Ok(PacketAction::Forward);
             }
 
+            // DPI
+            if cfg.dpi > 0 {
+                if let Some(svc) = msg
+                    .services
+                    .iter_mut()
+                    .find(|svc| !svc.media_sink_service.video_configs.is_empty())
+                {
+                    // get previous/original value
+                    let prev_val = svc.media_sink_service.video_configs[0].density();
+                    // set new value
+                    svc.media_sink_service.as_mut().unwrap().video_configs[0]
+                        .set_density(cfg.dpi.into());
+                    info!(
+                        "{} <yellow>{:?}</>: replacing DPI value: from <b>{}</> to <b>{}</>",
+                        get_name(proxy_type),
+                        control.unwrap(),
+                        prev_val,
+                        cfg.dpi
+                    );
+                }
+            }
+
             // disable tts sink
             if cfg.disable_tts_sink {
                 while let Some(svc) = msg.services.iter_mut().find(|svc| {
