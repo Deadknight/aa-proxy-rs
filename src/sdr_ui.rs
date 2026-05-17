@@ -618,45 +618,50 @@ fn apply_video_profile(
 ) -> Result<usize> {
     let mut patched = 0usize;
     let resolution = video_cfg.codec_resolution();
+    let mut derived_margins: Option<(u32, u32)> = None;
+
     if video_cfg.ui_config.is_none() {
         video_cfg.ui_config = Some(UiConfig::new()).into();
     }
-    let Some(ui_config) = video_cfg.ui_config.as_mut() else {
-        return Err(anyhow!("failed to create ui_config"));
-    };
 
-    if let Some(insets) = &profile.content_insets {
-        let mut current = ui_config
-            .content_insets
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(Insets::new);
-        if apply_insets(&mut current, insets, resolution, "content_insets") {
-            ui_config.content_insets = Some(current).into();
-            patched += 1;
+    {
+        let Some(ui_config) = video_cfg.ui_config.as_mut() else {
+            return Err(anyhow!("failed to create ui_config"));
+        };
+
+        if let Some(insets) = &profile.content_insets {
+            let mut current = ui_config.content_insets.as_ref().cloned().unwrap_or_else(Insets::new);
+            if apply_insets(&mut current, insets, resolution, "content_insets") {
+                ui_config.content_insets = Some(current).into();
+                patched += 1;
+            }
+        }
+        if let Some(insets) = &profile.stable_content_insets {
+            let mut current = ui_config
+                .stable_content_insets
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(Insets::new);
+            if apply_insets(&mut current, insets, resolution, "stable_content_insets") {
+                ui_config.stable_content_insets = Some(current).into();
+                patched += 1;
+            }
+        }
+        if let Some(insets) = &profile.margins {
+            let mut current = ui_config.margins.as_ref().cloned().unwrap_or_else(Insets::new);
+            if apply_insets(&mut current, insets, resolution, "margins") {
+                let width_margin = current.left().saturating_add(current.right());
+                let height_margin = current.top().saturating_add(current.bottom());
+                ui_config.margins = Some(current).into();
+                derived_margins = Some((width_margin, height_margin));
+                patched += 1;
+            }
         }
     }
-    if let Some(insets) = &profile.stable_content_insets {
-        let mut current = ui_config
-            .stable_content_insets
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(Insets::new);
-        if apply_insets(&mut current, insets, resolution, "stable_content_insets") {
-            ui_config.stable_content_insets = Some(current).into();
-            patched += 1;
-        }
-    }
-    if let Some(insets) = &profile.margins {
-        let mut current = ui_config
-            .margins
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(Insets::new);
-        if apply_insets(&mut current, insets, resolution, "margins") {
-            ui_config.margins = Some(current).into();
-            patched += 1;
-        }
+
+    if let Some((width_margin, height_margin)) = derived_margins {
+        video_cfg.set_width_margin(width_margin);
+        video_cfg.set_height_margin(height_margin);
     }
 
     if patched > 0 {

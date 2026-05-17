@@ -1416,50 +1416,6 @@ pub async fn pkt_modify_hook(
                 return Ok(PacketAction::Forward);
             }
 
-            match sdr_ui::process_service_discovery_response(&mut msg, cfg).await {
-                Ok(summary) => {
-                    info!(
-                        "{} <blue>SDR UI:</> vehicle=<b>{}</> ({}) profile_enabled={} phone_profile_enabled={} patch_applied={} patch_count={}",
-                        get_name(proxy_type),
-                        summary.vehicle_id,
-                        summary.vehicle_name,
-                        summary.vehicle_profile_enabled,
-                        summary.phone_profile_enabled,
-                        summary.patch_applied,
-                        summary.patch_count,
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "{} <blue>SDR UI:</> failed to process overrides; forwarding original UI config: {:#}",
-                        get_name(proxy_type),
-                        e
-                    );
-                }
-            }
-
-            // DPI
-            if cfg.dpi > 0 {
-                if let Some(svc) = msg
-                    .services
-                    .iter_mut()
-                    .find(|svc| !svc.media_sink_service.video_configs.is_empty())
-                {
-                    // get previous/original value
-                    let prev_val = svc.media_sink_service.video_configs[0].density();
-                    // set new value
-                    svc.media_sink_service.as_mut().unwrap().video_configs[0]
-                        .set_density(cfg.dpi.into());
-                    info!(
-                        "{} <yellow>{:?}</>: replacing DPI value: from <b>{}</> to <b>{}</>",
-                        get_name(proxy_type),
-                        control.unwrap(),
-                        prev_val,
-                        cfg.dpi
-                    );
-                }
-            }
-
             // disable tts sink
             if cfg.disable_tts_sink {
                 while let Some(svc) = msg.services.iter_mut().find(|svc| {
@@ -1863,6 +1819,28 @@ pub async fn pkt_modify_hook(
                             }
                         }
                     }
+                }
+            }
+
+            match sdr_ui::process_service_discovery_response(&mut msg, cfg).await {
+                Ok(summary) => {
+                    info!(
+                        "{} <blue>SDR UI:</> vehicle=<b>{}</> ({}) profile_enabled={} phone_profile_enabled={} patch_applied={} patch_count={}",
+                        get_name(proxy_type),
+                        summary.vehicle_id,
+                        summary.vehicle_name,
+                        summary.vehicle_profile_enabled,
+                        summary.phone_profile_enabled,
+                        summary.patch_applied,
+                        summary.patch_count,
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "{} <blue>SDR UI:</> failed to process overrides; forwarding original UI config: {:#}",
+                        get_name(proxy_type),
+                        e
+                    );
                 }
             }
 
