@@ -513,6 +513,15 @@ impl Bluetooth {
         start_index: usize,
     ) -> Result<usize> {
         let n = addresses.len();
+
+        // Pre-fetch device handles and names once before the attempt rounds begin.
+        // This avoids redundant name lookups on every attempt.
+        struct DeviceEntry {
+            idx: usize,
+            addr: Address,
+            dev_name: String,
+        }
+        let mut entries: Vec<DeviceEntry> = Vec::with_capacity(n);
         for i in 0..n {
             // Calculate the actual index, taking start_index into account
             let idx = (start_index + i) % n;
@@ -523,7 +532,25 @@ impl Bluetooth {
                 Ok(Some(name)) => format!(" (<b><blue>{}</>)", name),
                 _ => String::new(),
             };
-            for j in 1..=ATTEMPTS {
+            entries.push(DeviceEntry {
+                idx,
+                addr,
+                dev_name,
+            });
+        }
+
+        // Connect in an interleaved order:
+        // Each device gets one attempt per round before any device is retried,
+        // so a user whose phone is device #N does not have to wait through all
+        // ATTEMPTS failures on devices #0..N-1 before being tried.
+        for j in 1..=ATTEMPTS {
+            for entry in &entries {
+                let DeviceEntry {
+                    idx,
+                    addr,
+                    dev_name,
+                } = entry;
+                let device = adapter.device(*addr)?;
                 info!(
                     "{} 🧲 Trying to connect to: {}{}, attempt: {}/{}",
                     NAME, addr, dev_name, j, ATTEMPTS
@@ -535,7 +562,7 @@ impl Bluetooth {
                                 "{} 🔗 Successfully connected to device: {}{}",
                                 NAME, addr, dev_name
                             );
-                            return Ok((idx + 1) % n);
+                            return Ok((*idx + 1) % n);
                         }
                         Err(e) => {
                             warn!("{} 🔇 {}{}: Error connecting: {}", NAME, addr, dev_name, e)
