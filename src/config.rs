@@ -30,6 +30,7 @@ pub const DEFAULT_WASM_HOOKS_DIR: &str = "/data/wasm-hooks";
 pub const DEFAULT_CRASH_DIR: &str = "/data/aa-proxy-rs/crashes";
 pub const DEFAULT_SDR_UI_OVERRIDE_FILE: &str = "/data/aa-proxy-rs/sdr-ui-overrides.toml";
 pub const DEFAULT_INJECT_DISPLAYS_FILE: &str = "/data/aa-proxy-rs/inject-displays.toml";
+pub const DEFAULT_MAP_ALBUM_ART_FILE: &str = "/data/aa-proxy-rs/map-album-art.png";
 
 pub type SharedConfig = Arc<RwLock<AppConfig>>;
 pub type SharedConfigJson = Arc<RwLock<ConfigJson>>;
@@ -332,6 +333,15 @@ pub struct AppConfig {
     /// true  = wait for a fresh live IDR before forwarding inter-frames (clean decode)
     /// false = forward immediately after cached-IDR preview (lower latency, may artifact)
     pub media_wait_for_live_idr: bool,
+    /// Enable replacing MediaPlaybackMetadata.album_art with a PNG generated from the map/video path.
+    /// The first implementation patches in-place and therefore requires the replacement PNG
+    /// to be no larger than the original album art bytes from the phone.
+    pub map_album_art_enabled: bool,
+    /// PNG file used as replacement album art. A future video sampler can update this file
+    /// with a cropped frame from the injected AUX/cluster video stream.
+    pub map_album_art_file: PathBuf,
+    /// Maximum replacement PNG size accepted by the metadata patcher.
+    pub map_album_art_max_bytes: usize,
     pub collect_speed: bool,
     pub disable_driving_status: bool,
     /// Optional shell command invoked on HU media-key long press.
@@ -637,6 +647,9 @@ impl Default for AppConfig {
             external_antenna: false,
             media_dump_base_port: None,
             media_wait_for_live_idr: true,
+            map_album_art_enabled: false,
+            map_album_art_file: DEFAULT_MAP_ALBUM_ART_FILE.into(),
+            map_album_art_max_bytes: 262_144,
             collect_speed: false,
             disable_driving_status: false,
             hu_button_handler: None,
@@ -888,6 +901,9 @@ impl AppConfig {
             doc["media_dump_base_port"] = value(port as i64);
         }
         doc["media_wait_for_live_idr"] = value(self.media_wait_for_live_idr);
+        doc["map_album_art_enabled"] = value(self.map_album_art_enabled);
+        doc["map_album_art_file"] = value(self.map_album_art_file.display().to_string());
+        doc["map_album_art_max_bytes"] = value(self.map_album_art_max_bytes as i64);
         doc["collect_speed"] = value(self.collect_speed);
         doc["disable_driving_status"] = value(self.disable_driving_status);
         if let Some(cmd) = &self.hu_button_handler {

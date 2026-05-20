@@ -360,6 +360,18 @@
           "description": "TOML file used to store injected display service profiles. Supports multiple main/cluster/auxiliary media sink entries. Display IDs are assigned automatically from the current SDR. Default: `/data/aa-proxy-rs/inject-displays.toml`.",
           "values": null
         },
+        "map_album_art_enabled": {
+          "typ": "boolean",
+          "description": "Enable replacing MediaPlaybackMetadata album art with the PNG from map_album_art_file. Requires mitm = true. Disabled by default."
+        },
+        "map_album_art_file": {
+          "typ": "string",
+          "description": "PNG file used as replacement album art. For the first implementation, put a 256x256-ish PNG here; later the AUX video sampler can update this file. Default: /data/aa-proxy-rs/map-album-art.png."
+        },
+        "map_album_art_max_bytes": {
+          "typ": "integer",
+          "description": "Maximum replacement PNG size accepted by the metadata patcher. Default: 262144 bytes."
+        },
         "audio_max_unacked": {
           "typ": "integer",
           "description": "Override the `max_unacked` setting for audio channels. This may improve audio performance on some head units, but may worsen it on others. Adjust this value experimentally only if you experience audio stuttering.\n0 = leave unchanged."

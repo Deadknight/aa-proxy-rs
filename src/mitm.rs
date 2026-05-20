@@ -1,3 +1,4 @@
+use crate::album_art_inject::MapAlbumArtInjector;
 use crate::bt_sco;
 use crate::bt_sco_media_bridge;
 use crate::ev::send_ev_data;
@@ -165,6 +166,8 @@ pub struct ModifyContext {
     /// Per-channel reassembly state for tapped media messages that span multiple
     /// AA transport frames.
     pub(crate) media_fragments: HashMap<u8, MediaFrameBuffer>,
+    /// In-place album-art patch state for fragmented MediaPlaybackMetadata messages.
+    pub(crate) map_album_art_injector: MapAlbumArtInjector,
     /// Original HU-advertised services from ServiceDiscoveryResponse.
     pub(crate) hu_service_ids: HashSet<i32>,
     /// Services synthesized by aa-proxy-rs and exposed only to the phone side.
@@ -1078,6 +1081,16 @@ pub async fn pkt_modify_hook(
 
     // message_id is the first 2 bytes of payload
     let message_id: i32 = u16::from_be_bytes(pkt.payload[0..=1].try_into()?).into();
+
+    // Optional map-preview album art injection.
+    // This runs on the phone -> proxy ingress path so the mutated metadata is
+    // forwarded normally to the HU. It patches fragmented protobuf bytes in-place,
+    // preserving AA transport frame sizes and avoiding extra packet scheduling.
+    if proxy_type == ProxyType::MobileDevice && flow == PacketFlow::FromEndpoint {
+        ctx.map_album_art_injector
+            .patch_packet(pkt, message_id, cfg);
+    }
+
     let data = &pkt.payload[2..]; // start of message data
 
     // handling data on sensor channel
@@ -3026,6 +3039,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         media_wait_for_live_idr: cfg.media_wait_for_live_idr,
         media_channels: HashMap::new(),
         media_fragments: HashMap::new(),
+        map_album_art_injector: MapAlbumArtInjector::default(),
         hu_service_ids: HashSet::new(),
         injected_service_ids: HashSet::new(),
         injected_channels: HashSet::new(),
@@ -3258,6 +3272,7 @@ mod tests {
             media_wait_for_live_idr: false,
             media_channels: HashMap::new(),
             media_fragments: HashMap::new(),
+            map_album_art_injector: MapAlbumArtInjector::default(),
             hu_service_ids: HashSet::new(),
             injected_service_ids: HashSet::new(),
             injected_channels: HashSet::new(),

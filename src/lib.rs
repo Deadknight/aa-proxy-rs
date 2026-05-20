@@ -1,3 +1,4 @@
+pub mod album_art_inject;
 pub mod aoa;
 pub mod bluetooth;
 pub mod bt_helper;
