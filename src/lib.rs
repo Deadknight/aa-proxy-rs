@@ -18,6 +18,7 @@ pub mod inject_displays;
 pub mod io_uring;
 pub mod led;
 pub mod media_tap;
+pub mod packet_fragment;
 pub mod mitm;
 pub mod mitm_prettyprint;
 pub mod mpegts;

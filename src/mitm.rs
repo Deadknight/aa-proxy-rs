@@ -166,7 +166,7 @@ pub struct ModifyContext {
     /// Per-channel reassembly state for tapped media messages that span multiple
     /// AA transport frames.
     pub(crate) media_fragments: HashMap<u8, MediaFrameBuffer>,
-    /// In-place album-art patch state for fragmented MediaPlaybackMetadata messages.
+    /// Album-art rewrite state for fragmented MediaPlaybackMetadata messages.
     pub(crate) map_album_art_injector: MapAlbumArtInjector,
     /// Original HU-advertised services from ServiceDiscoveryResponse.
     pub(crate) hu_service_ids: HashSet<i32>,
@@ -640,8 +640,9 @@ pub enum PacketAction {
     Drop,
     /// Send the packet back toward the originating side (crafted reply).
     SendBack,
-    /// Replace this packet/message with one or more plaintext packets.
-    /// The normal forwarding loop will encrypt each packet before transmit.
+    /// Replace the current packet with a complete list of packets.
+    /// Used by buffered rewriters that must drop original fragments and emit a
+    /// re-fragmented message after the final original fragment arrives.
     Replace(Vec<Packet>),
 }
 
@@ -1078,8 +1079,7 @@ pub async fn pkt_modify_hook(
                     debug!("{} hu_input: sending packet back", get_name(proxy_type));
                     return Ok(PacketAction::SendBack);
                 }
-                PacketAction::Forward => {}
-                PacketAction::Replace(_) => {}
+                PacketAction::Forward | PacketAction::Replace(_) => {}
             }
         }
     }
@@ -1088,8 +1088,9 @@ pub async fn pkt_modify_hook(
     let message_id: i32 = u16::from_be_bytes(pkt.payload[0..=1].try_into()?).into();
 
     // Optional map-preview album art injection.
-    // It only runs on the phone -> proxy ingress path. When disabled, keep this
-    // completely out of the hot path and clear any stale fragmented state.
+    // This runs on the phone -> proxy ingress path. Fragmented metadata is buffered,
+    // rewritten with the real replacement PNG length, then re-fragmented before
+    // forwarding so there is no padding/trailing-data inside album_art.
     if proxy_type == ProxyType::MobileDevice && flow == PacketFlow::FromEndpoint {
         if cfg.map_album_art_enabled {
             match ctx
@@ -1098,9 +1099,7 @@ pub async fn pkt_modify_hook(
             {
                 AlbumArtProcessResult::Forward => {}
                 AlbumArtProcessResult::Drop => return Ok(PacketAction::Drop),
-                AlbumArtProcessResult::Replace(packets) => {
-                    return Ok(PacketAction::Replace(packets));
-                }
+                AlbumArtProcessResult::Replace(packets) => return Ok(PacketAction::Replace(packets)),
             }
         } else {
             ctx.map_album_art_injector.clear();
@@ -3220,6 +3219,15 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         packets.len()
                     );
                     for mut out_pkt in packets {
+                        let _ = pkt_debug(
+                            proxy_type,
+                            HexdumpLevel::DecryptedOutput,
+                            hex_requested,
+                            &out_pkt,
+                            &cfg,
+                            Some(&ctx.debug_channel_kinds),
+                        )
+                        .await;
                         out_pkt.encrypt_payload(&mut mem_buf, &mut server).await?;
                         let _ = pkt_debug(
                             proxy_type,
@@ -3231,11 +3239,12 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         )
                         .await;
                         out_pkt.transmit(&mut device).await.with_context(|| {
-                            format!("proxy/{}: transmit replacement failed", get_name(proxy_type))
+                            format!("proxy/{}: transmit failed", get_name(proxy_type))
                         })?;
-
-                        bytes_written
-                            .fetch_add(HEADER_LENGTH + out_pkt.payload.len(), Ordering::Relaxed);
+                        bytes_written.fetch_add(
+                            HEADER_LENGTH + out_pkt.payload.len(),
+                            Ordering::Relaxed,
+                        );
                     }
                 }
             }
@@ -3279,7 +3288,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         }
                         PacketAction::Replace(packets) => {
                             debug!(
-                                "{} pkt_modify_hook: enqueueing {} replacement packet(s)",
+                                "{} pkt_modify_hook: replacing inbound packet with {} packet(s)",
                                 get_name(proxy_type),
                                 packets.len()
                             );
