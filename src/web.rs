@@ -472,18 +472,20 @@ async fn map_album_art_upload_handler(
         return (status, e).into_response();
     }
 
-    global_album_art_store().set_png("rest", bytes.to_vec());
+    let version = global_album_art_store().set_png("rest", bytes.to_vec());
     info!(
-        "{} map album art: accepted REST PNG upload ({} bytes, RAM only)",
+        "{} map album art: accepted REST PNG upload ({} bytes, RAM only, version={})",
         NAME,
-        bytes.len()
+        bytes.len(),
+        version
     );
 
     Json(serde_json::json!({
         "status": "ok",
         "source": "rest",
         "bytes": bytes.len(),
-        "stored": "memory"
+        "stored": "memory",
+        "version": version
     }))
     .into_response()
 }
@@ -512,10 +514,11 @@ async fn map_album_art_status_handler(State(state): State<Arc<AppState>>) -> imp
 }
 
 async fn map_album_art_delete_handler() -> impl IntoResponse {
-    global_album_art_store().clear();
+    let version = global_album_art_store().clear();
     Json(serde_json::json!({
         "status": "ok",
-        "cleared": true
+        "cleared": true,
+        "version": version
     }))
     .into_response()
 }

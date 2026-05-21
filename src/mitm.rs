@@ -3283,7 +3283,19 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                     .await;
                     match action {
                         PacketAction::Drop => {}
-                        PacketAction::SendBack | PacketAction::Forward => {
+                        PacketAction::SendBack => {
+                            tx.send(pkt).await?;
+                        }
+                        PacketAction::Forward => {
+                            if proxy_type == ProxyType::MobileDevice && cfg.map_album_art_enabled {
+                                if let Some(packets) =
+                                    ctx.map_album_art_injector.take_pending_metadata_emit(&cfg)
+                                {
+                                    for out_pkt in packets {
+                                        tx.send(out_pkt).await?;
+                                    }
+                                }
+                            }
                             tx.send(pkt).await?;
                         }
                         PacketAction::Replace(packets) => {

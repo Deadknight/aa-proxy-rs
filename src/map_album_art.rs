@@ -3,7 +3,7 @@ use log::{debug, warn};
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{atomic::{AtomicU64, Ordering}, OnceLock, RwLock};
 use std::time::Instant;
 
 /// 1x1 transparent PNG used when no configured file or runtime art is available.
@@ -66,26 +66,45 @@ pub(crate) struct StoredAlbumArt {
     pub source: String,
     pub png: Vec<u8>,
     pub updated_at: Instant,
+    pub version: u64,
 }
 
-#[derive(Default)]
 pub(crate) struct LatestAlbumArtStore {
     latest: RwLock<Option<StoredAlbumArt>>,
+    version: AtomicU64,
+}
+
+impl Default for LatestAlbumArtStore {
+    fn default() -> Self {
+        Self {
+            latest: RwLock::new(None),
+            version: AtomicU64::new(0),
+        }
+    }
 }
 
 impl LatestAlbumArtStore {
-    pub(crate) fn set_png(&self, source: impl Into<String>, png: Vec<u8>) {
+    pub(crate) fn set_png(&self, source: impl Into<String>, png: Vec<u8>) -> u64 {
+        let version = self.version.fetch_add(1, Ordering::SeqCst).saturating_add(1);
         let mut latest = self.latest.write().expect("map album art store poisoned");
         *latest = Some(StoredAlbumArt {
             source: source.into(),
             png,
             updated_at: Instant::now(),
+            version,
         });
+        version
     }
 
-    pub(crate) fn clear(&self) {
+    pub(crate) fn clear(&self) -> u64 {
+        let version = self.version.fetch_add(1, Ordering::SeqCst).saturating_add(1);
         let mut latest = self.latest.write().expect("map album art store poisoned");
         *latest = None;
+        version
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
     }
 
     pub(crate) fn get(&self) -> Option<StoredAlbumArt> {
@@ -106,6 +125,10 @@ pub(crate) fn global_album_art_store() -> &'static LatestAlbumArtStore {
 pub(crate) struct ResolvedAlbumArt {
     pub source: String,
     pub png: Vec<u8>,
+    /// Monotonic runtime artwork version. File/builtin fallbacks inherit the
+    /// global store version so REST clear/upload can trigger a metadata refresh
+    /// even when falling back to the configured file.
+    pub version: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -121,6 +144,7 @@ pub(crate) struct AlbumArtStatus {
     pub memory_age_ms: Option<u128>,
     pub resolved_source: String,
     pub resolved_bytes: usize,
+    pub store_version: u64,
 }
 
 pub(crate) fn is_png(data: &[u8]) -> bool {
@@ -151,12 +175,16 @@ fn read_file_png(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
 
 pub(crate) fn resolve_album_art(cfg: &AppConfig) -> ResolvedAlbumArt {
     let source = MapAlbumArtSource::parse(&cfg.map_album_art_source);
+    let store = global_album_art_store();
+    let store_version = store.version();
+    let fallback_version = if source == MapAlbumArtSource::File { 0 } else { store_version };
 
-    if let Some(entry) = global_album_art_store().get() {
+    if let Some(entry) = store.get() {
         if source.accepts_memory_source(&entry.source) {
             return ResolvedAlbumArt {
                 source: entry.source,
                 png: entry.png,
+                version: entry.version,
             };
         }
     }
@@ -165,6 +193,7 @@ pub(crate) fn resolve_album_art(cfg: &AppConfig) -> ResolvedAlbumArt {
         Ok(png) => ResolvedAlbumArt {
             source: "file".to_string(),
             png,
+            version: fallback_version,
         },
         Err(e) => {
             debug!(
@@ -174,6 +203,7 @@ pub(crate) fn resolve_album_art(cfg: &AppConfig) -> ResolvedAlbumArt {
             ResolvedAlbumArt {
                 source: "builtin_1x1".to_string(),
                 png: BUILTIN_1X1_PNG.to_vec(),
+                version: fallback_version,
             }
         }
     }
@@ -191,6 +221,7 @@ pub(crate) fn replacement_png_for_config(cfg: &AppConfig) -> ResolvedAlbumArt {
         return ResolvedAlbumArt {
             source: "builtin_1x1".to_string(),
             png: BUILTIN_1X1_PNG.to_vec(),
+            version: global_album_art_store().version(),
         };
     }
     resolved
@@ -216,5 +247,6 @@ pub(crate) fn status_for_config(cfg: &AppConfig) -> AlbumArtStatus {
             .map(|m| m.updated_at.elapsed().as_millis()),
         resolved_source: resolved.source,
         resolved_bytes: resolved.png.len(),
+        store_version: global_album_art_store().version(),
     }
 }

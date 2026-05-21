@@ -17,6 +17,8 @@ const MEDIA_PLAYBACK_METADATA_ID: i32 = 0x8003;
 #[derive(Default)]
 pub(crate) struct MapAlbumArtInjector {
     states: HashMap<u8, AlbumArtRewriteState>,
+    last_metadata: Option<CachedMetadata>,
+    last_emitted_art_version: u64,
 }
 
 pub(crate) enum AlbumArtProcessResult {
@@ -33,9 +35,17 @@ struct AlbumArtRewriteState {
     payload: Vec<u8>,
     replacement: Vec<u8>,
     replacement_source: String,
+    replacement_version: u64,
     base_flags: u8,
     first_final_length: Option<u32>,
     original_fragments: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CachedMetadata {
+    channel: u8,
+    base_flags: u8,
+    payload: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +57,70 @@ enum RewriteError {
 impl MapAlbumArtInjector {
     pub(crate) fn clear(&mut self) {
         self.states.clear();
+    }
+
+    /// Build a synthetic MediaPlaybackMetadata packet from the last metadata seen
+    /// on the phone side when the runtime artwork store changes (for example via
+    /// POST /map-album-art). The packets are plaintext/application payloads and
+    /// should be sent through the normal MD -> HU replacement/forward path so the
+    /// existing TLS encrypt + transmit code writes correct frame sizes.
+    pub(crate) fn take_pending_metadata_emit(&mut self, cfg: &AppConfig) -> Option<Vec<Packet>> {
+        if !cfg.map_album_art_enabled {
+            self.states.clear();
+            return None;
+        }
+
+        let replacement = load_png_replacement(cfg);
+        if replacement.version == self.last_emitted_art_version {
+            return None;
+        }
+
+        let cached = match self.last_metadata.clone() {
+            Some(cached) => cached,
+            None => {
+                debug!(
+                    "map album art: runtime artwork version {} is pending but no metadata template has been cached yet",
+                    replacement.version
+                );
+                return None;
+            }
+        };
+
+        match self.build_rewritten_packets(
+            cached.channel,
+            cached.base_flags,
+            &cached.payload,
+            &replacement.png,
+            cfg,
+        ) {
+            Ok((packets, rewritten_payload_len)) => {
+                self.last_emitted_art_version = replacement.version;
+                info!(
+                    "map album art: emitted cached MEDIA_PLAYBACK_METADATA after artwork update (source={} version={} channel={:#04x} payload={} replacement_png={} fragments={})",
+                    replacement.source,
+                    replacement.version,
+                    cached.channel,
+                    rewritten_payload_len,
+                    replacement.png.len(),
+                    packets.len()
+                );
+                Some(packets)
+            }
+            Err(RewriteError::NotFound) => {
+                warn!(
+                    "map album art: cached MEDIA_PLAYBACK_METADATA has no album_art field; cannot emit artwork update"
+                );
+                self.last_emitted_art_version = replacement.version;
+                None
+            }
+            Err(RewriteError::Malformed) => {
+                warn!(
+                    "map album art: cached MEDIA_PLAYBACK_METADATA is malformed; cannot emit artwork update"
+                );
+                self.last_emitted_art_version = replacement.version;
+                None
+            }
+        }
     }
 
     pub(crate) fn process_packet(
@@ -90,6 +164,7 @@ impl MapAlbumArtInjector {
                     pkt.payload.clone(),
                     replacement.png,
                     replacement.source,
+                    replacement.version,
                     pkt.final_length,
                     1,
                     cfg,
@@ -102,6 +177,7 @@ impl MapAlbumArtInjector {
                     payload: pkt.payload.clone(),
                     replacement: replacement.png,
                     replacement_source: replacement.source,
+                    replacement_version: replacement.version,
                     base_flags,
                     first_final_length: pkt.final_length,
                     original_fragments: 1,
@@ -122,6 +198,7 @@ impl MapAlbumArtInjector {
                         state.payload,
                         state.replacement,
                         state.replacement_source,
+                        state.replacement_version,
                         state.first_final_length,
                         state.original_fragments,
                         cfg,
@@ -136,81 +213,101 @@ impl MapAlbumArtInjector {
     }
 
     fn finish_rewrite(
-        &self,
+        &mut self,
         channel: u8,
         base_flags: u8,
         original_payload: Vec<u8>,
         replacement: Vec<u8>,
         replacement_source: String,
+        replacement_version: u64,
         first_final_length: Option<u32>,
         original_fragments: usize,
         cfg: &AppConfig,
     ) -> AlbumArtProcessResult {
-        let chunk_bytes = effective_chunk_bytes(cfg);
-
         let original_payload_len = original_payload.len();
-        let (rewritten_payload, replaced_album_art) = match rewrite_album_art_payload(&original_payload, &replacement) {
-            Ok(payload) => (payload, true),
+
+        // Cache the unmodified metadata as a template. When REST/companion/rust_h264
+        // updates the PNG later, we can re-emit MediaPlaybackMetadata immediately
+        // without waiting for the phone to send a new track metadata packet.
+        self.last_metadata = Some(CachedMetadata {
+            channel,
+            base_flags,
+            payload: original_payload.clone(),
+        });
+
+        match self.build_rewritten_packets(channel, base_flags, &original_payload, &replacement, cfg) {
+            Ok((rewritten, rewritten_payload_len)) => {
+                let rewritten_final_length = Some(rewritten_payload_len as u32);
+                self.last_emitted_art_version = replacement_version;
+                info!(
+                    "map album art: rewrote MEDIA_PLAYBACK_METADATA album_art on channel {:#04x} (source={} mode=dynamic version={} original_payload={} rewritten_payload={} replacement_png={} original_fragments={} rewritten_fragments={} chunk_bytes={} original_final_length={:?} rewritten_final_length={:?})",
+                    channel,
+                    replacement_source,
+                    replacement_version,
+                    original_payload_len,
+                    rewritten_payload_len,
+                    replacement.len(),
+                    original_fragments,
+                    rewritten.len(),
+                    effective_chunk_bytes(cfg),
+                    first_final_length,
+                    rewritten_final_length
+                );
+                AlbumArtProcessResult::Replace(rewritten)
+            }
             Err(RewriteError::NotFound) => {
                 debug!(
                     "map album art: MEDIA_PLAYBACK_METADATA on channel {:#04x} has no album_art field; replaying original metadata",
                     channel
                 );
-                (original_payload, false)
+                let rewritten = self.fragment_metadata(channel, base_flags, &original_payload, cfg);
+                self.last_emitted_art_version = replacement_version;
+                AlbumArtProcessResult::Replace(rewritten)
             }
             Err(RewriteError::Malformed) => {
                 warn!(
                     "map album art: malformed MEDIA_PLAYBACK_METADATA protobuf on channel {:#04x}; replaying original metadata",
                     channel
                 );
-                (original_payload, false)
+                let rewritten = self.fragment_metadata(channel, base_flags, &original_payload, cfg);
+                self.last_emitted_art_version = replacement_version;
+                AlbumArtProcessResult::Replace(rewritten)
             }
-        };
+        }
+    }
 
-        // OpenAuto/aasdk and the captured AA traces both show that the FIRST
-        // frame extended length is the total plaintext/application payload
-        // length, not the encrypted byte count. The normal transmit path will
-        // fill each frame's 2-byte payload size after TLS encryption.
-        let rewritten_final_length = Some(rewritten_payload.len() as u32);
-        let continuation_chunk_bytes = openauto_continuation_fragment_payload_bytes(chunk_bytes);
-        let rewritten = fragment_plain_payload(
-            &rewritten_payload,
+    fn build_rewritten_packets(
+        &self,
+        channel: u8,
+        base_flags: u8,
+        original_payload: &[u8],
+        replacement: &[u8],
+        cfg: &AppConfig,
+    ) -> Result<(Vec<Packet>, usize), RewriteError> {
+        let rewritten_payload = rewrite_album_art_payload(original_payload, replacement)?;
+        let rewritten_payload_len = rewritten_payload.len();
+        let packets = self.fragment_metadata(channel, base_flags, &rewritten_payload, cfg);
+        Ok((packets, rewritten_payload_len))
+    }
+
+    fn fragment_metadata(
+        &self,
+        channel: u8,
+        base_flags: u8,
+        payload: &[u8],
+        cfg: &AppConfig,
+    ) -> Vec<Packet> {
+        let chunk_bytes = effective_chunk_bytes(cfg);
+        fragment_plain_payload(
+            payload,
             PlainPayloadFragmentOptions {
                 channel,
                 base_flags,
                 first_fragment_payload_bytes: chunk_bytes,
-                continuation_fragment_payload_bytes: continuation_chunk_bytes,
-                first_final_length: rewritten_final_length,
+                continuation_fragment_payload_bytes: openauto_continuation_fragment_payload_bytes(chunk_bytes),
+                first_final_length: Some(payload.len() as u32),
             },
-        );
-
-        if replaced_album_art {
-            info!(
-                "map album art: rewrote MEDIA_PLAYBACK_METADATA album_art on channel {:#04x} (source={} mode=dynamic original_payload={} rewritten_payload={} replacement_png={} original_fragments={} rewritten_fragments={} chunk_bytes={} original_final_length={:?} rewritten_final_length={:?})",
-                channel,
-                replacement_source,
-                original_payload_len,
-                rewritten_payload.len(),
-                replacement.len(),
-                original_fragments,
-                rewritten.len(),
-                chunk_bytes,
-                first_final_length,
-                rewritten_final_length
-            );
-        } else {
-            info!(
-                "map album art: replayed MEDIA_PLAYBACK_METADATA unchanged on channel {:#04x} (mode=dynamic payload={} fragments={} chunk_bytes={} original_final_length={:?} rewritten_final_length={:?})",
-                channel,
-                rewritten_payload.len(),
-                rewritten.len(),
-                chunk_bytes,
-                first_final_length,
-                rewritten_final_length
-            );
-        }
-
-        AlbumArtProcessResult::Replace(rewritten)
+        )
     }
 }
 
