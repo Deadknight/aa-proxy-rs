@@ -342,6 +342,14 @@ pub struct AppConfig {
     pub map_album_art_file: PathBuf,
     /// Maximum replacement PNG size accepted by the metadata patcher.
     pub map_album_art_max_bytes: usize,
+    /// Album-art rewrite strategy:
+    /// in_place = keep protobuf/frame lengths unchanged and pad inside the original bytes field.
+    /// identity = reassemble and re-fragment the same metadata without changing contents.
+    /// dynamic = rewrite album_art with the real PNG length and re-fragment the metadata.
+    pub map_album_art_rewrite_mode: String,
+    /// Plaintext payload size for FIRST fragments when dynamic/identity re-fragmenting.
+    /// Continuation fragments use this value + 4, matching the observed AA/OpenAuto layout.
+    pub map_album_art_chunk_bytes: usize,
     pub collect_speed: bool,
     pub disable_driving_status: bool,
     /// Optional shell command invoked on HU media-key long press.
@@ -650,6 +658,8 @@ impl Default for AppConfig {
             map_album_art_enabled: false,
             map_album_art_file: DEFAULT_MAP_ALBUM_ART_FILE.into(),
             map_album_art_max_bytes: 262_144,
+            map_album_art_rewrite_mode: "in_place".to_string(),
+            map_album_art_chunk_bytes: 16_120,
             collect_speed: false,
             disable_driving_status: false,
             hu_button_handler: None,
@@ -904,6 +914,8 @@ impl AppConfig {
         doc["map_album_art_enabled"] = value(self.map_album_art_enabled);
         doc["map_album_art_file"] = value(self.map_album_art_file.display().to_string());
         doc["map_album_art_max_bytes"] = value(self.map_album_art_max_bytes as i64);
+        doc["map_album_art_rewrite_mode"] = value(self.map_album_art_rewrite_mode.to_string());
+        doc["map_album_art_chunk_bytes"] = value(self.map_album_art_chunk_bytes as i64);
         doc["collect_speed"] = value(self.collect_speed);
         doc["disable_driving_status"] = value(self.disable_driving_status);
         if let Some(cmd) = &self.hu_button_handler {

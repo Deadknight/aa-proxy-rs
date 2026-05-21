@@ -1,4 +1,4 @@
-use crate::album_art_inject::MapAlbumArtInjector;
+use crate::album_art_inject::{AlbumArtProcessResult, MapAlbumArtInjector};
 use crate::bt_sco;
 use crate::bt_sco_media_bridge;
 use crate::ev::send_ev_data;
@@ -640,6 +640,9 @@ pub enum PacketAction {
     Drop,
     /// Send the packet back toward the originating side (crafted reply).
     SendBack,
+    /// Replace this packet/message with one or more plaintext packets.
+    /// The normal forwarding loop will encrypt each packet before transmit.
+    Replace(Vec<Packet>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -692,6 +695,7 @@ impl SslMemBuf {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct Packet {
     pub channel: u8,
     pub flags: u8,
@@ -1075,6 +1079,7 @@ pub async fn pkt_modify_hook(
                     return Ok(PacketAction::SendBack);
                 }
                 PacketAction::Forward => {}
+                PacketAction::Replace(_) => {}
             }
         }
     }
@@ -1083,12 +1088,23 @@ pub async fn pkt_modify_hook(
     let message_id: i32 = u16::from_be_bytes(pkt.payload[0..=1].try_into()?).into();
 
     // Optional map-preview album art injection.
-    // This runs on the phone -> proxy ingress path so the mutated metadata is
-    // forwarded normally to the HU. It patches fragmented protobuf bytes in-place,
-    // preserving AA transport frame sizes and avoiding extra packet scheduling.
+    // It only runs on the phone -> proxy ingress path. When disabled, keep this
+    // completely out of the hot path and clear any stale fragmented state.
     if proxy_type == ProxyType::MobileDevice && flow == PacketFlow::FromEndpoint {
-        ctx.map_album_art_injector
-            .patch_packet(pkt, message_id, cfg);
+        if cfg.map_album_art_enabled {
+            match ctx
+                .map_album_art_injector
+                .process_packet(pkt, message_id, cfg)
+            {
+                AlbumArtProcessResult::Forward => {}
+                AlbumArtProcessResult::Drop => return Ok(PacketAction::Drop),
+                AlbumArtProcessResult::Replace(packets) => {
+                    return Ok(PacketAction::Replace(packets));
+                }
+            }
+        } else {
+            ctx.map_album_art_injector.clear();
+        }
     }
 
     let data = &pkt.payload[2..]; // start of message data
@@ -3197,6 +3213,31 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                     // fixme: compute final_len for precise stats
                     bytes_written.fetch_add(HEADER_LENGTH + pkt.payload.len(), Ordering::Relaxed);
                 }
+                PacketAction::Replace(packets) => {
+                    debug!(
+                        "{} pkt_modify_hook: replacing packet with {} packet(s)",
+                        get_name(proxy_type),
+                        packets.len()
+                    );
+                    for mut out_pkt in packets {
+                        out_pkt.encrypt_payload(&mut mem_buf, &mut server).await?;
+                        let _ = pkt_debug(
+                            proxy_type,
+                            HexdumpLevel::RawOutput,
+                            hex_requested,
+                            &out_pkt,
+                            &cfg,
+                            Some(&ctx.debug_channel_kinds),
+                        )
+                        .await;
+                        out_pkt.transmit(&mut device).await.with_context(|| {
+                            format!("proxy/{}: transmit replacement failed", get_name(proxy_type))
+                        })?;
+
+                        bytes_written
+                            .fetch_add(HEADER_LENGTH + out_pkt.payload.len(), Ordering::Relaxed);
+                    }
+                }
             }
         }
 
@@ -3235,6 +3276,16 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                         PacketAction::Drop => {}
                         PacketAction::SendBack | PacketAction::Forward => {
                             tx.send(pkt).await?;
+                        }
+                        PacketAction::Replace(packets) => {
+                            debug!(
+                                "{} pkt_modify_hook: enqueueing {} replacement packet(s)",
+                                get_name(proxy_type),
+                                packets.len()
+                            );
+                            for out_pkt in packets {
+                                tx.send(out_pkt).await?;
+                            }
                         }
                     }
                 }

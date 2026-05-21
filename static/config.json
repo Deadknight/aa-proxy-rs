@@ -372,6 +372,19 @@
           "typ": "integer",
           "description": "Maximum replacement PNG size accepted by the metadata patcher. Default: 262144 bytes."
         },
+        "map_album_art_rewrite_mode": {
+          "typ": "select",
+          "description": "Album art rewrite strategy. in_place keeps existing protobuf/frame lengths and is the known-good default. identity reassembles and re-fragments without changing metadata, useful for testing dynamic packetization. dynamic rewrites album_art with the real PNG length and re-fragments metadata.",
+          "values": [
+            "in_place",
+            "identity",
+            "dynamic"
+          ]
+        },
+        "map_album_art_chunk_bytes": {
+          "typ": "integer",
+          "description": "Plaintext payload size for FIRST fragments when using identity/dynamic album-art re-fragmenting. Continuation fragments use this value + 4 to match the observed AA/OpenAuto layout. 0 uses default 16120."
+        },
         "audio_max_unacked": {
           "typ": "integer",
           "description": "Override the `max_unacked` setting for audio channels. This may improve audio performance on some head units, but may worsen it on others. Adjust this value experimentally only if you experience audio stuttering.\n0 = leave unchanged."
