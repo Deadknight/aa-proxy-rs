@@ -6,16 +6,6 @@ use std::path::Path;
 use std::sync::{atomic::{AtomicU64, Ordering}, OnceLock, RwLock};
 use std::time::Instant;
 
-/// 1x1 transparent PNG used when no configured file or runtime art is available.
-/// This keeps the metadata rewrite path deterministic without touching storage.
-pub(crate) const BUILTIN_1X1_PNG: &[u8] = &[
-    0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R',
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
-    0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63,
-    0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00,
-    0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
-];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MapAlbumArtSource {
@@ -125,9 +115,9 @@ pub(crate) fn global_album_art_store() -> &'static LatestAlbumArtStore {
 pub(crate) struct ResolvedAlbumArt {
     pub source: String,
     pub png: Vec<u8>,
-    /// Monotonic runtime artwork version. File/builtin fallbacks inherit the
-    /// global store version so REST clear/upload can trigger a metadata refresh
-    /// even when falling back to the configured file.
+    /// Monotonic runtime artwork version. File source uses version 0;
+    /// runtime sources use the store version so REST/companion/rust_h264
+    /// updates can trigger cached metadata re-emission.
     pub version: u64,
 }
 
@@ -142,8 +132,8 @@ pub(crate) struct AlbumArtStatus {
     pub memory_source: Option<String>,
     pub memory_bytes: Option<usize>,
     pub memory_age_ms: Option<u128>,
-    pub resolved_source: String,
-    pub resolved_bytes: usize,
+    pub resolved_source: Option<String>,
+    pub resolved_bytes: Option<usize>,
     pub store_version: u64,
 }
 
@@ -173,58 +163,56 @@ fn read_file_png(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-pub(crate) fn resolve_album_art(cfg: &AppConfig) -> ResolvedAlbumArt {
+pub(crate) fn resolve_album_art(cfg: &AppConfig) -> Option<ResolvedAlbumArt> {
     let source = MapAlbumArtSource::parse(&cfg.map_album_art_source);
     let store = global_album_art_store();
-    let store_version = store.version();
-    let fallback_version = if source == MapAlbumArtSource::File { 0 } else { store_version };
 
     if let Some(entry) = store.get() {
         if source.accepts_memory_source(&entry.source) {
-            return ResolvedAlbumArt {
-                source: entry.source,
-                png: entry.png,
-                version: entry.version,
-            };
+            if entry.png.len() <= cfg.map_album_art_max_bytes {
+                return Some(ResolvedAlbumArt {
+                    source: entry.source,
+                    png: entry.png,
+                    version: entry.version,
+                });
+            }
+
+            warn!(
+                "map album art: runtime replacement from {} is larger than max bytes ({} > {}); not overriding metadata",
+                entry.source,
+                entry.png.len(),
+                cfg.map_album_art_max_bytes
+            );
+            return None;
         }
     }
 
-    match read_file_png(&cfg.map_album_art_file, cfg.map_album_art_max_bytes) {
-        Ok(png) => ResolvedAlbumArt {
-            source: "file".to_string(),
-            png,
-            version: fallback_version,
-        },
-        Err(e) => {
-            debug!(
-                "map album art: using built-in 1x1 PNG fallback; {}",
-                e
-            );
-            ResolvedAlbumArt {
-                source: "builtin_1x1".to_string(),
-                png: BUILTIN_1X1_PNG.to_vec(),
-                version: fallback_version,
+    if source == MapAlbumArtSource::File {
+        match read_file_png(&cfg.map_album_art_file, cfg.map_album_art_max_bytes) {
+            Ok(png) => Some(ResolvedAlbumArt {
+                source: "file".to_string(),
+                png,
+                version: 0,
+            }),
+            Err(e) => {
+                debug!(
+                    "map album art: configured file is not available; metadata will not be overridden; {}",
+                    e
+                );
+                None
             }
         }
+    } else {
+        debug!(
+            "map album art: source={} has no runtime art yet; metadata will not be overridden",
+            source.as_str()
+        );
+        None
     }
 }
 
-pub(crate) fn replacement_png_for_config(cfg: &AppConfig) -> ResolvedAlbumArt {
-    let resolved = resolve_album_art(cfg);
-    if resolved.png.len() > cfg.map_album_art_max_bytes {
-        warn!(
-            "map album art: resolved replacement from {} is larger than max bytes ({} > {}); using built-in fallback",
-            resolved.source,
-            resolved.png.len(),
-            cfg.map_album_art_max_bytes
-        );
-        return ResolvedAlbumArt {
-            source: "builtin_1x1".to_string(),
-            png: BUILTIN_1X1_PNG.to_vec(),
-            version: global_album_art_store().version(),
-        };
-    }
-    resolved
+pub(crate) fn replacement_png_for_config(cfg: &AppConfig) -> Option<ResolvedAlbumArt> {
+    resolve_album_art(cfg)
 }
 
 pub(crate) fn status_for_config(cfg: &AppConfig) -> AlbumArtStatus {
@@ -245,8 +233,8 @@ pub(crate) fn status_for_config(cfg: &AppConfig) -> AlbumArtStatus {
         memory_age_ms: memory
             .as_ref()
             .map(|m| m.updated_at.elapsed().as_millis()),
-        resolved_source: resolved.source,
-        resolved_bytes: resolved.png.len(),
+        resolved_source: resolved.as_ref().map(|r| r.source.clone()),
+        resolved_bytes: resolved.as_ref().map(|r| r.png.len()),
         store_version: global_album_art_store().version(),
     }
 }

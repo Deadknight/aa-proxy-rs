@@ -492,7 +492,14 @@ async fn map_album_art_upload_handler(
 
 async fn map_album_art_get_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cfg = state.config.read().await.clone();
-    let resolved = replacement_png_for_config(&cfg);
+    let Some(resolved) = replacement_png_for_config(&cfg) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "no map album art is available for the selected source",
+        )
+            .into_response();
+    };
+
     match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "image/png")

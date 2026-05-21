@@ -17,6 +17,7 @@ const MEDIA_PLAYBACK_METADATA_ID: i32 = 0x8003;
 #[derive(Default)]
 pub(crate) struct MapAlbumArtInjector {
     states: HashMap<u8, AlbumArtRewriteState>,
+    observe_states: HashMap<u8, MetadataObserveState>,
     last_metadata: Option<CachedMetadata>,
     last_emitted_art_version: u64,
 }
@@ -41,6 +42,11 @@ struct AlbumArtRewriteState {
     original_fragments: usize,
 }
 
+struct MetadataObserveState {
+    payload: Vec<u8>,
+    base_flags: u8,
+}
+
 #[derive(Clone, Debug)]
 struct CachedMetadata {
     channel: u8,
@@ -57,6 +63,7 @@ enum RewriteError {
 impl MapAlbumArtInjector {
     pub(crate) fn clear(&mut self) {
         self.states.clear();
+        self.observe_states.clear();
     }
 
     /// Build a synthetic MediaPlaybackMetadata packet from the last metadata seen
@@ -66,11 +73,20 @@ impl MapAlbumArtInjector {
     /// existing TLS encrypt + transmit code writes correct frame sizes.
     pub(crate) fn take_pending_metadata_emit(&mut self, cfg: &AppConfig) -> Option<Vec<Packet>> {
         if !cfg.map_album_art_enabled {
-            self.states.clear();
+            self.clear();
             return None;
         }
 
-        let replacement = load_png_replacement(cfg);
+        let replacement = match load_png_replacement(cfg) {
+            Some(replacement) => replacement,
+            None => {
+                // No runtime/file artwork is currently available for the selected source.
+                // Do not synthesize metadata; leave the phone's metadata untouched until
+                // a real PNG appears (REST/companion/rust_h264 upload or file source).
+                self.last_emitted_art_version = crate::map_album_art::global_album_art_store().version();
+                return None;
+            }
+        };
         if replacement.version == self.last_emitted_art_version {
             return None;
         }
@@ -130,7 +146,7 @@ impl MapAlbumArtInjector {
         cfg: &AppConfig,
     ) -> AlbumArtProcessResult {
         if !cfg.map_album_art_enabled {
-            self.states.clear();
+            self.clear();
             return AlbumArtProcessResult::Forward;
         }
 
@@ -148,12 +164,33 @@ impl MapAlbumArtInjector {
                     pkt.channel
                 );
             }
+            self.observe_states.remove(&pkt.channel);
 
             if message_id != MEDIA_PLAYBACK_METADATA_ID || pkt.payload.len() < 2 {
                 return AlbumArtProcessResult::Forward;
             }
 
-            let replacement = load_png_replacement(cfg);
+            let replacement = match load_png_replacement(cfg) {
+                Some(replacement) => replacement,
+                None => {
+                    // No selected source has artwork to send. Do not override metadata and
+                    // do not drop fragments. Still keep a passive copy of the latest metadata
+                    // so a later REST/companion/rust_h264 update can emit immediately.
+                    let base_flags = frame_base_flags(pkt.flags);
+                    if is_last {
+                        self.cache_metadata_template(pkt.channel, base_flags, pkt.payload.clone());
+                    } else {
+                        self.observe_states.insert(
+                            pkt.channel,
+                            MetadataObserveState {
+                                payload: pkt.payload.clone(),
+                                base_flags,
+                            },
+                        );
+                    }
+                    return AlbumArtProcessResult::Forward;
+                }
+            };
 
             let base_flags = frame_base_flags(pkt.flags);
 
@@ -209,7 +246,27 @@ impl MapAlbumArtInjector {
             return AlbumArtProcessResult::Drop;
         }
 
+        if self.observe_states.contains_key(&pkt.channel) {
+            if is_last {
+                if let Some(mut state) = self.observe_states.remove(&pkt.channel) {
+                    state.payload.extend_from_slice(&pkt.payload);
+                    self.cache_metadata_template(pkt.channel, state.base_flags, state.payload);
+                }
+            } else if let Some(state) = self.observe_states.get_mut(&pkt.channel) {
+                state.payload.extend_from_slice(&pkt.payload);
+            }
+            return AlbumArtProcessResult::Forward;
+        }
+
         AlbumArtProcessResult::Forward
+    }
+
+    fn cache_metadata_template(&mut self, channel: u8, base_flags: u8, payload: Vec<u8>) {
+        self.last_metadata = Some(CachedMetadata {
+            channel,
+            base_flags,
+            payload,
+        });
     }
 
     fn finish_rewrite(
@@ -229,11 +286,7 @@ impl MapAlbumArtInjector {
         // Cache the unmodified metadata as a template. When REST/companion/rust_h264
         // updates the PNG later, we can re-emit MediaPlaybackMetadata immediately
         // without waiting for the phone to send a new track metadata packet.
-        self.last_metadata = Some(CachedMetadata {
-            channel,
-            base_flags,
-            payload: original_payload.clone(),
-        });
+        self.cache_metadata_template(channel, base_flags, original_payload.clone());
 
         match self.build_rewritten_packets(channel, base_flags, &original_payload, &replacement, cfg) {
             Ok((rewritten, rewritten_payload_len)) => {
@@ -311,7 +364,7 @@ impl MapAlbumArtInjector {
     }
 }
 
-fn load_png_replacement(cfg: &AppConfig) -> crate::map_album_art::ResolvedAlbumArt {
+fn load_png_replacement(cfg: &AppConfig) -> Option<crate::map_album_art::ResolvedAlbumArt> {
     replacement_png_for_config(cfg)
 }
 

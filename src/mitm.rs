@@ -654,6 +654,21 @@ pub enum PacketFlow {
     ToEndpoint,
 }
 
+fn is_complete_frame_boundary(flags: u8) -> bool {
+    let frame_type = flags & FRAME_TYPE_MASK;
+    frame_type == (FRAME_TYPE_FIRST | FRAME_TYPE_LAST) || frame_type == FRAME_TYPE_LAST
+}
+
+fn should_emit_pending_map_album_art_metadata(
+    proxy_type: ProxyType,
+    pkt: &Packet,
+    cfg: &AppConfig,
+) -> bool {
+    proxy_type == ProxyType::MobileDevice
+        && cfg.map_album_art_enabled
+        && is_complete_frame_boundary(pkt.flags)
+}
+
 /// rust-openssl doesn't support BIO_s_mem
 /// This SslMemBuf is about to provide `Read` and `Write` implementations
 /// to be used with `openssl::ssl::SslStream`
@@ -3287,16 +3302,30 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
                             tx.send(pkt).await?;
                         }
                         PacketAction::Forward => {
-                            if proxy_type == ProxyType::MobileDevice && cfg.map_album_art_enabled {
+                            let emit_pending_metadata_after_forward =
+                                should_emit_pending_map_album_art_metadata(proxy_type, &pkt, &cfg);
+
+                            tx.send(pkt).await?;
+
+                            // If REST/companion/rust_h264 updated the album art, re-emit the
+                            // cached MediaPlaybackMetadata only after forwarding the current
+                            // complete message. Emitting before the packet (or while the current
+                            // packet is a FIRST/MIDDLE fragment) can interleave synthetic metadata
+                            // into an active fragmented stream and upset some HUs/DHU builds.
+                            if emit_pending_metadata_after_forward {
                                 if let Some(packets) =
                                     ctx.map_album_art_injector.take_pending_metadata_emit(&cfg)
                                 {
+                                    debug!(
+                                        "{} map album art: sending cached MEDIA_PLAYBACK_METADATA after safe boundary ({} packet(s))",
+                                        get_name(proxy_type),
+                                        packets.len()
+                                    );
                                     for out_pkt in packets {
                                         tx.send(out_pkt).await?;
                                     }
                                 }
                             }
-                            tx.send(pkt).await?;
                         }
                         PacketAction::Replace(packets) => {
                             debug!(
