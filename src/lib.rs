@@ -17,6 +17,7 @@ pub mod hu_input;
 pub mod inject_displays;
 pub mod io_uring;
 pub mod led;
+pub mod map_album_art;
 pub mod media_tap;
 pub mod packet_fragment;
 pub mod mitm;

@@ -120,7 +120,11 @@
         "pkt_debug_filter_proxy": {
           "typ": "select",
           "description": "Packet debug proxy filter.",
-          "values": ["both", "hu", "md"]
+          "values": [
+            "both",
+            "hu",
+            "md"
+          ]
         },
         "pkt_debug_filter_stages": {
           "typ": "multi-select",
@@ -242,7 +246,11 @@
         "bt_sco_media_bridge_audio_type": {
           "typ": "select",
           "description": "Preferred AA PCM sink for SCO downlink.",
-          "values": ["guidance", "media", "auto"]
+          "values": [
+            "guidance",
+            "media",
+            "auto"
+          ]
         },
         "bt_sco_media_bridge_gain_percent": {
           "typ": "integer",
@@ -251,12 +259,19 @@
         "bt_sco_media_bridge_limiter": {
           "typ": "select",
           "description": "Limiter applied after gain: off preserves the proven path except unavoidable i16 saturation, hard clips peaks earlier, soft compresses peaks more gently.",
-          "values": ["off", "hard", "soft"]
+          "values": [
+            "off",
+            "hard",
+            "soft"
+          ]
         },
         "bt_sco_media_bridge_resampler": {
           "typ": "select",
           "description": "SCO 8 kHz to AA 48 kHz resampler: repeat preserves the proven path, linear smooths the 6x upsampling and may reduce roughness/crackle.",
-          "values": ["repeat", "linear"]
+          "values": [
+            "repeat",
+            "linear"
+          ]
         },
         "bt_sco_media_bridge_ring_capacity": {
           "typ": "integer",
@@ -309,7 +324,10 @@
         "bt_sco_mic_echo_control": {
           "typ": "select",
           "description": "Microphone echo handling for SCO uplink. off preserves current behavior; ducking lowers mic while downlink audio is active.",
-          "values": ["off", "ducking"]
+          "values": [
+            "off",
+            "ducking"
+          ]
         },
         "bt_sco_mic_gain_percent": {
           "typ": "integer",
@@ -362,28 +380,65 @@
         },
         "map_album_art_enabled": {
           "typ": "boolean",
-          "description": "Enable replacing MediaPlaybackMetadata album art with the PNG from map_album_art_file. Requires mitm = true. Disabled by default."
+          "description": "Enable replacing MediaPlaybackMetadata album art. Requires mitm = true. Disabled by default."
+        },
+        "map_album_art_source": {
+          "typ": "select",
+          "description": "Artwork provider for MediaPlaybackMetadata album art. file reads map_album_art_file. rest and companion use the last PNG uploaded via POST /map-album-art and fall back to file. rust_h264 is reserved for the in-process video decoder provider and falls back to file until it produces a frame.",
+          "values": [
+            "file",
+            "rest",
+            "companion",
+            "rust_h264"
+          ]
         },
         "map_album_art_file": {
           "typ": "string",
-          "description": "PNG file used as replacement album art. For the first implementation, put a 256x256-ish PNG here; later the AUX video sampler can update this file. Default: /data/aa-proxy-rs/map-album-art.png."
+          "description": "PNG file used as replacement album art and as fallback for rest/companion/rust_h264 sources. If missing, a built-in 1x1 PNG is used."
         },
         "map_album_art_max_bytes": {
           "typ": "integer",
-          "description": "Maximum replacement PNG size accepted by the metadata patcher. Default: 262144 bytes."
+          "description": "Maximum replacement PNG size accepted by all album-art providers. Default: 262144 bytes."
         },
         "map_album_art_rewrite_mode": {
           "typ": "select",
-          "description": "Album art rewrite strategy. in_place keeps existing protobuf/frame lengths and is the known-good default. identity reassembles and re-fragments without changing metadata, useful for testing dynamic packetization. dynamic rewrites album_art with the real PNG length and re-fragments metadata.",
+          "description": "Album art rewrite strategy. in_place keeps existing protobuf/frame lengths and is the known-good default. dynamic rewrites album_art with the real PNG length and re-fragments metadata.",
           "values": [
             "in_place",
-            "identity",
             "dynamic"
           ]
         },
         "map_album_art_chunk_bytes": {
           "typ": "integer",
-          "description": "Plaintext payload size for FIRST fragments when using identity/dynamic album-art re-fragmenting. Continuation fragments use this value + 4 to match the observed AA/OpenAuto layout. 0 uses default 16120."
+          "description": "Plaintext payload size for FIRST fragments when using dynamic album-art re-fragmenting. Continuation fragments use this value + 4 to match the observed AA/OpenAuto layout. 0 uses default 16120."
+        },
+        "map_album_art_video_channel": {
+          "typ": "integer",
+          "description": "Video/media channel to sample when map_album_art_source is companion or rust_h264. Default: 2."
+        },
+        "map_album_art_capture_interval_ms": {
+          "typ": "integer",
+          "description": "Minimum interval between sampled video frames for runtime artwork providers. Default: 2000 ms."
+        },
+        "map_album_art_output_size_px": {
+          "typ": "integer",
+          "description": "Output artwork size after crop/resize for runtime video providers. Default: 256 px."
+        },
+        "map_album_art_crop_x_percent": {
+          "typ": "integer",
+          "description": "Runtime video crop X offset in percent. Default: 30."
+        },
+        "map_album_art_crop_y_percent": {
+          "typ": "integer",
+          "description": "Runtime video crop Y offset in percent. Default: 20."
+        },
+        "map_album_art_crop_w_percent": {
+          "typ": "integer",
+          "description": "Runtime video crop width in percent. Default: 40."
+        },
+        "map_album_art_crop_h_percent": {
+          "typ": "integer",
+          "description": "Runtime video crop height in percent. Default: 40."
         },
         "audio_max_unacked": {
           "typ": "integer",
@@ -424,7 +479,10 @@
         "inject_display_types": {
           "typ": "multi-select",
           "description": "Add video display services to the service discovery response. Select one or more display types. Leave empty to disable. Useful when forcing additional display channels for capture. Requires mitm = true.",
-          "values": ["DISPLAY_TYPE_CLUSTER", "DISPLAY_TYPE_AUXILIARY"]
+          "values": [
+            "DISPLAY_TYPE_CLUSTER",
+            "DISPLAY_TYPE_AUXILIARY"
+          ]
         },
         "inject_add_input_sources": {
           "typ": "boolean",

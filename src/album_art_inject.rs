@@ -1,4 +1,5 @@
 use crate::config::AppConfig;
+use crate::map_album_art::replacement_png_for_config;
 use crate::mitm::{Packet, FRAME_TYPE_FIRST, FRAME_TYPE_LAST, FRAME_TYPE_MASK};
 use crate::packet_fragment::{
     clamp_first_fragment_payload_bytes, fragment_plain_payload, frame_base_flags,
@@ -8,7 +9,6 @@ use crate::packet_fragment::{
 };
 use log::{debug, info, warn};
 use std::collections::HashMap;
-use std::fs;
 
 /// MediaPlaybackStatusMessageId::MEDIA_PLAYBACK_METADATA.
 /// Kept as a constant here so this helper only needs raw packet/protobuf bytes.
@@ -32,6 +32,7 @@ pub(crate) enum AlbumArtProcessResult {
 struct AlbumArtRewriteState {
     payload: Vec<u8>,
     replacement: Vec<u8>,
+    replacement_source: String,
     base_flags: u8,
     first_final_length: Option<u32>,
     original_fragments: usize,
@@ -78,9 +79,7 @@ impl MapAlbumArtInjector {
                 return AlbumArtProcessResult::Forward;
             }
 
-            let Some(replacement) = load_png_replacement(cfg) else {
-                return AlbumArtProcessResult::Forward;
-            };
+            let replacement = load_png_replacement(cfg);
 
             let base_flags = frame_base_flags(pkt.flags);
 
@@ -89,7 +88,8 @@ impl MapAlbumArtInjector {
                     pkt.channel,
                     base_flags,
                     pkt.payload.clone(),
-                    replacement,
+                    replacement.png,
+                    replacement.source,
                     pkt.final_length,
                     1,
                     cfg,
@@ -100,7 +100,8 @@ impl MapAlbumArtInjector {
                 pkt.channel,
                 AlbumArtRewriteState {
                     payload: pkt.payload.clone(),
-                    replacement,
+                    replacement: replacement.png,
+                    replacement_source: replacement.source,
                     base_flags,
                     first_final_length: pkt.final_length,
                     original_fragments: 1,
@@ -120,6 +121,7 @@ impl MapAlbumArtInjector {
                         state.base_flags,
                         state.payload,
                         state.replacement,
+                        state.replacement_source,
                         state.first_final_length,
                         state.original_fragments,
                         cfg,
@@ -139,6 +141,7 @@ impl MapAlbumArtInjector {
         base_flags: u8,
         original_payload: Vec<u8>,
         replacement: Vec<u8>,
+        replacement_source: String,
         first_final_length: Option<u32>,
         original_fragments: usize,
         cfg: &AppConfig,
@@ -183,8 +186,9 @@ impl MapAlbumArtInjector {
 
         if replaced_album_art {
             info!(
-                "map album art: rewrote MEDIA_PLAYBACK_METADATA album_art on channel {:#04x} (mode=dynamic original_payload={} rewritten_payload={} replacement_png={} original_fragments={} rewritten_fragments={} chunk_bytes={} original_final_length={:?} rewritten_final_length={:?})",
+                "map album art: rewrote MEDIA_PLAYBACK_METADATA album_art on channel {:#04x} (source={} mode=dynamic original_payload={} rewritten_payload={} replacement_png={} original_fragments={} rewritten_fragments={} chunk_bytes={} original_final_length={:?} rewritten_final_length={:?})",
                 channel,
+                replacement_source,
                 original_payload_len,
                 rewritten_payload.len(),
                 replacement.len(),
@@ -210,48 +214,8 @@ impl MapAlbumArtInjector {
     }
 }
 
-fn load_png_replacement(cfg: &AppConfig) -> Option<Vec<u8>> {
-    let path = &cfg.map_album_art_file;
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(e) => {
-            warn!(
-                "map album art: cannot read replacement PNG {}: {}",
-                path.display(),
-                e
-            );
-            return None;
-        }
-    };
-
-    if data.is_empty() {
-        warn!("map album art: replacement file {} is empty", path.display());
-        return None;
-    }
-
-    if data.len() > cfg.map_album_art_max_bytes {
-        warn!(
-            "map album art: replacement file {} is larger than map_album_art_max_bytes ({} > {})",
-            path.display(),
-            data.len(),
-            cfg.map_album_art_max_bytes
-        );
-        return None;
-    }
-
-    if !is_png(&data) {
-        warn!(
-            "map album art: replacement file {} is not a PNG; expected PNG signature",
-            path.display()
-        );
-        return None;
-    }
-
-    Some(data)
-}
-
-fn is_png(data: &[u8]) -> bool {
-    data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+fn load_png_replacement(cfg: &AppConfig) -> crate::map_album_art::ResolvedAlbumArt {
+    replacement_png_for_config(cfg)
 }
 
 fn effective_chunk_bytes(cfg: &AppConfig) -> usize {

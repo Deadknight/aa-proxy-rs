@@ -15,6 +15,7 @@ use crate::ev::BatteryData;
 use crate::ev::EV_MODEL_FILE;
 use crate::inject_displays;
 use crate::io_uring::media_tap_reverse_bridge_once;
+use crate::map_album_art::{global_album_art_store, replacement_png_for_config, status_for_config, validate_png};
 use crate::mitm::protos::KeyCode;
 use crate::mitm::send_byebye;
 use crate::mitm::send_input_key;
@@ -152,6 +153,13 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/config", get(get_config).post(set_config))
         .route("/config-entry", post(update_config_entry))
         .route("/config-data", get(get_config_data))
+        .route(
+            "/map-album-art",
+            post(map_album_art_upload_handler)
+                .get(map_album_art_get_handler)
+                .delete(map_album_art_delete_handler),
+        )
+        .route("/map-album-art-status", get(map_album_art_status_handler))
         .route("/download", get(download_handler))
         .route(
             "/crashes",
@@ -398,6 +406,118 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         .replace("{CONFIG_VALUES}", &render_config_values(&config_json))
         .replace("{CONFIG_IDS}", &render_config_ids(&config_json));
     Html(html)
+}
+
+
+async fn map_album_art_upload_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: RawBody,
+) -> impl IntoResponse {
+    if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
+        if let Ok(content_type) = content_type.to_str() {
+            if !content_type
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("image/png")
+            {
+                return (
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "Content-Type must be image/png",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    let cfg = state.config.read().await.clone();
+    let max_bytes = cfg.map_album_art_max_bytes;
+
+    if let Some(len) = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if len > max_bytes {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "PNG is larger than map_album_art_max_bytes ({} > {})",
+                    len, max_bytes
+                ),
+            )
+                .into_response();
+        }
+    }
+
+    let bytes = match hyper::body::to_bytes(body.0).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("failed to read request body: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = validate_png(&bytes, max_bytes) {
+        let status = if bytes.len() > max_bytes {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        return (status, e).into_response();
+    }
+
+    global_album_art_store().set_png("rest", bytes.to_vec());
+    info!(
+        "{} map album art: accepted REST PNG upload ({} bytes, RAM only)",
+        NAME,
+        bytes.len()
+    );
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "source": "rest",
+        "bytes": bytes.len(),
+        "stored": "memory"
+    }))
+    .into_response()
+}
+
+async fn map_album_art_get_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.config.read().await.clone();
+    let resolved = replacement_png_for_config(&cfg);
+    match Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header("x-aa-proxy-album-art-source", resolved.source)
+        .body(Body::from(resolved.png))
+    {
+        Ok(response) => response.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build response: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+async fn map_album_art_status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.config.read().await.clone();
+    Json(status_for_config(&cfg)).into_response()
+}
+
+async fn map_album_art_delete_handler() -> impl IntoResponse {
+    global_album_art_store().clear();
+    Json(serde_json::json!({
+        "status": "ok",
+        "cleared": true
+    }))
+    .into_response()
 }
 
 pub async fn battery_handler(
