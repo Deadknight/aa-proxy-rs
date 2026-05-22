@@ -335,10 +335,10 @@ pub struct AppConfig {
     pub media_wait_for_live_idr: bool,
     /// Enable replacing MediaPlaybackMetadata.album_art with a PNG generated from the map/video path.
     pub map_album_art_enabled: bool,
-    /// Artwork provider: file, rest, companion, or rust_h264. Non-file providers fall back
-    /// to map_album_art_file and then to a built-in 1x1 PNG until they produce runtime art.
+    /// Artwork provider: file, rest, companion, or rust_h264. If the selected source
+    /// has no artwork yet, metadata is left untouched.
     pub map_album_art_source: String,
-    /// PNG file used as replacement album art and as fallback for runtime providers.
+    /// PNG file used as replacement album art when map_album_art_source=file.
     pub map_album_art_file: PathBuf,
     /// Maximum replacement PNG size accepted by all album-art providers.
     pub map_album_art_max_bytes: usize,
@@ -349,8 +349,9 @@ pub struct AppConfig {
     /// Plaintext payload size for FIRST fragments when dynamic re-fragmenting.
     /// Continuation fragments use this value + 4, matching the observed AA/OpenAuto layout.
     pub map_album_art_chunk_bytes: usize,
-    /// Media/video channel to sample when map_album_art_source = rust_h264 or companion.
-    pub map_album_art_video_channel: u8,
+    /// Injected display profile id to sample when map_album_art_source = rust_h264 or companion.
+    /// Example: aux-1 or cluster-1 from inject-displays.toml.
+    pub map_album_art_video_display_id: String,
     /// Minimum interval between sampled video frames for runtime artwork providers.
     pub map_album_art_capture_interval_ms: u64,
     /// Output artwork size in pixels after crop/resize.
@@ -662,7 +663,7 @@ impl Default for AppConfig {
             startup_delay: 0,
             ble_password: String::new(),
             external_antenna: false,
-            media_dump_base_port: None,
+            media_dump_base_port: Some(12345),
             media_wait_for_live_idr: true,
             map_album_art_enabled: false,
             map_album_art_source: "file".to_string(),
@@ -670,7 +671,7 @@ impl Default for AppConfig {
             map_album_art_max_bytes: 262_144,
             map_album_art_rewrite_mode: "in_place".to_string(),
             map_album_art_chunk_bytes: 16_120,
-            map_album_art_video_channel: 2,
+            map_album_art_video_display_id: "aux-1".to_string(),
             map_album_art_capture_interval_ms: 2_000,
             map_album_art_output_size_px: 256,
             map_album_art_crop_x_percent: 30,
@@ -934,7 +935,7 @@ impl AppConfig {
         doc["map_album_art_max_bytes"] = value(self.map_album_art_max_bytes as i64);
         doc["map_album_art_rewrite_mode"] = value(self.map_album_art_rewrite_mode.to_string());
         doc["map_album_art_chunk_bytes"] = value(self.map_album_art_chunk_bytes as i64);
-        doc["map_album_art_video_channel"] = value(self.map_album_art_video_channel as i64);
+        doc["map_album_art_video_display_id"] = value(self.map_album_art_video_display_id.to_string());
         doc["map_album_art_capture_interval_ms"] = value(self.map_album_art_capture_interval_ms as i64);
         doc["map_album_art_output_size_px"] = value(self.map_album_art_output_size_px as i64);
         doc["map_album_art_crop_x_percent"] = value(self.map_album_art_crop_x_percent as i64);

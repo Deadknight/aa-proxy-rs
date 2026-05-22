@@ -384,7 +384,7 @@
         },
         "map_album_art_source": {
           "typ": "select",
-          "description": "Artwork provider for MediaPlaybackMetadata album art. file reads map_album_art_file. rest and companion use the last PNG uploaded via POST /map-album-art and fall back to file. rust_h264 is reserved for the in-process video decoder provider and falls back to file until it produces a frame.",
+          "description": "Artwork provider for MediaPlaybackMetadata album art. file reads map_album_art_file. rest and companion use the last PNG uploaded via POST /map-album-art. rust_h264 decodes the selected injected display video stream. If the selected source has no art yet, metadata is left untouched.",
           "values": [
             "file",
             "rest",
@@ -394,7 +394,7 @@
         },
         "map_album_art_file": {
           "typ": "string",
-          "description": "PNG file used as replacement album art and as fallback for rest/companion/rust_h264 sources. If missing, a built-in 1x1 PNG is used."
+          "description": "PNG file used as replacement album art when map_album_art_source=file. If missing, metadata is left untouched."
         },
         "map_album_art_max_bytes": {
           "typ": "integer",
@@ -412,9 +412,9 @@
           "typ": "integer",
           "description": "Plaintext payload size for FIRST fragments when using dynamic album-art re-fragmenting. Continuation fragments use this value + 4 to match the observed AA/OpenAuto layout. 0 uses default 16120."
         },
-        "map_album_art_video_channel": {
-          "typ": "integer",
-          "description": "Video/media channel to sample when map_album_art_source is companion or rust_h264. Default: 2."
+        "map_album_art_video_display_id": {
+          "typ": "string",
+          "description": "Injected display id to sample when map_album_art_source is companion or rust_h264, for example aux-1 or cluster-1 from inject-displays.toml."
         },
         "map_album_art_capture_interval_ms": {
           "typ": "integer",

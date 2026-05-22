@@ -18,6 +18,7 @@ pub mod inject_displays;
 pub mod io_uring;
 pub mod led;
 pub mod map_album_art;
+pub mod map_album_art_h264;
 pub mod media_tap;
 pub mod packet_fragment;
 pub mod mitm;

@@ -1485,18 +1485,36 @@ pub async fn pkt_modify_hook(
         }
     }
 
-    // tap media frames for debug streaming (only on MobileDevice path = phone → HU direction)
-    if tap_media && proxy_type == ProxyType::MobileDevice {
+    // tap media frames for debug streaming and map-album-art H.264 capture
+    // (only on MobileDevice path = phone → HU direction).
+    // H.264 album-art capture must not depend on an external media tap client;
+    // if source=rust_h264 is active, reassemble media packets and feed the
+    // selected injected display directly.
+    let map_album_art_h264_active = crate::map_album_art_h264::is_active(cfg);
+    if proxy_type == ProxyType::MobileDevice && (tap_media || map_album_art_h264_active) {
         if let Some(frame_data) = reassemble_media_packet(&mut ctx.media_fragments, pkt) {
             if frame_data.len() >= 2 {
-                if let Some(sink) = media_sink_for_channel(ctx, pkt.channel).await {
-                    tap_media_message(proxy_type, pkt, &sink, &frame_data).await;
-                } else {
-                    debug!(
-                        "{} media tap: no sink registered for channel {:#04x}",
-                        get_name(proxy_type),
-                        pkt.channel
+                if map_album_art_h264_active {
+                    crate::map_album_art_h264::maybe_feed_media_frame(
+                        cfg,
+                        pkt.channel,
+                        ctx.injected_media_profile_ids
+                            .get(&pkt.channel)
+                            .map(|id| id.as_str()),
+                        &frame_data,
                     );
+                }
+
+                if tap_media {
+                    if let Some(sink) = media_sink_for_channel(ctx, pkt.channel).await {
+                        tap_media_message(proxy_type, pkt, &sink, &frame_data).await;
+                    } else {
+                        debug!(
+                            "{} media tap: no sink registered for channel {:#04x}",
+                            get_name(proxy_type),
+                            pkt.channel
+                        );
+                    }
                 }
             }
         }
