@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::map_album_art::{global_album_art_store, validate_png, MapAlbumArtSource};
-use log::{info, warn};
+use log::{info, warn, debug};
 use rust_h264::decoder::{Decoder, Frame};
 use rust_h264::nal::parse_annex_b;
 use std::sync::mpsc::{self, Receiver, Sender};
