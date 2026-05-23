@@ -74,8 +74,17 @@ impl Default for LatestAlbumArtStore {
 }
 
 impl LatestAlbumArtStore {
+    fn next_version(&self) -> u64 {
+        self.version
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(if current == u64::MAX { 1 } else { current + 1 })
+            })
+            .map(|previous| if previous == u64::MAX { 1 } else { previous + 1 })
+            .unwrap_or(1)
+    }
+
     pub(crate) fn set_png(&self, source: impl Into<String>, png: Vec<u8>) -> u64 {
-        let version = self.version.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        let version = self.next_version();
         let mut latest = self.latest.write().expect("map album art store poisoned");
         *latest = Some(StoredAlbumArt {
             source: source.into(),
@@ -87,7 +96,7 @@ impl LatestAlbumArtStore {
     }
 
     pub(crate) fn clear(&self) -> u64 {
-        let version = self.version.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        let version = self.next_version();
         let mut latest = self.latest.write().expect("map album art store poisoned");
         *latest = None;
         version

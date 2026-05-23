@@ -217,7 +217,7 @@ pub(crate) fn maybe_feed_media_frame(
                 .is_ok()
                 && is_idr
             {
-                info!(
+                debug!(
                     "map album art h264: queued IDR sync frame from display={} ch={:#04x} match={} ({} bytes)",
                     matched_display,
                     channel,
@@ -310,14 +310,14 @@ fn h264_worker(rx: Receiver<H264ArtCommand>) {
                     }
 
                     if synced_to_idr {
-                        info!(
+                        debug!(
                             "map album art h264: IDR resync observed (idr_count={}, seen={} AUs, decoded={} frames)",
                             idr_frames_seen,
                             access_units_seen,
                             decoded_frames_seen
                         );
                     } else {
-                        info!(
+                        debug!(
                             "map album art h264: first IDR sync observed after {} AUs; starting continuous decode",
                             access_units_seen
                         );
@@ -365,7 +365,7 @@ fn h264_worker(rx: Receiver<H264ArtCommand>) {
                         let bytes = captured.png.len();
                         let version = global_album_art_store().set_png(RUST_H264_SOURCE, captured.png);
                         last_emit_at = Some(Instant::now());
-                        info!(
+                        debug!(
                             "map album art h264: captured decoded frame as PNG ({} bytes, version={}, frame={}x{}, crop=x{} y{} w{} h{}, output={}x{}, nals={}, au_idr={}, seen={} AUs, decoded={} frames, idrs={})",
                             bytes,
                             version,

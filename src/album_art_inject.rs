@@ -96,7 +96,7 @@ impl MapAlbumArtInjector {
             Some(cached) => cached,
             None => {
                 if self.last_missing_template_log_version != replacement.version {
-                    info!(
+                    debug!(
                         "map album art: runtime artwork version {} is pending but no MEDIA_PLAYBACK_METADATA template has been cached yet",
                         replacement.version
                     );
