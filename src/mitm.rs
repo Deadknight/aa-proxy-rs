@@ -184,6 +184,11 @@ pub struct ModifyContext {
     pub(crate) injected_media_connect_gen: HashMap<u8, u64>,
     /// Last observed tap-consumer presence by media channel.
     pub(crate) injected_media_had_tap_client: HashMap<u8, bool>,
+    /// Internal broadcast receivers kept alive while map_album_art_source=rust_h264.
+    /// They make the selected injected display behave like it has a tap client, so
+    /// the projected video stream starts without requiring an external mpv/VLC client.
+    pub(crate) map_album_art_h264_virtual_taps:
+        HashMap<u8, tokio::sync::broadcast::Receiver<Arc<(u64, Vec<u8>)>>>,
     /// VEC service ids injected by aa-proxy-rs into the service discovery response.
     pub(crate) vendor_service_ids: HashSet<u8>,
     /// Active VEC channel ids opened by the mobile device against our injected VEC(s).
@@ -3096,6 +3101,7 @@ pub async fn proxy<A: Endpoint<A> + 'static>(
         injected_media_state: HashMap::new(),
         injected_media_connect_gen: HashMap::new(),
         injected_media_had_tap_client: HashMap::new(),
+        map_album_art_h264_virtual_taps: HashMap::new(),
         vendor_service_ids: HashSet::new(),
         vendor_channel_states: HashMap::new(),
         vendor_topic_event_bridges: HashMap::new(),
@@ -3400,6 +3406,7 @@ mod tests {
             injected_media_state: HashMap::new(),
             injected_media_connect_gen: HashMap::new(),
             injected_media_had_tap_client: HashMap::new(),
+            map_album_art_h264_virtual_taps: HashMap::new(),
             vendor_service_ids: HashSet::new(),
             vendor_channel_states: HashMap::new(),
             vendor_topic_event_bridges: HashMap::new(),

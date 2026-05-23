@@ -58,10 +58,23 @@ fn h264_art_tx() -> &'static Sender<H264ArtCommand> {
     })
 }
 
+pub(crate) fn target_display_id<'a>(cfg: &'a AppConfig) -> Option<&'a str> {
+    if !cfg.map_album_art_enabled
+        || MapAlbumArtSource::parse(&cfg.map_album_art_source) != MapAlbumArtSource::RustH264
+    {
+        return None;
+    }
+
+    let id = cfg.map_album_art_video_display_id.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 pub(crate) fn is_active(cfg: &AppConfig) -> bool {
-    cfg.map_album_art_enabled
-        && MapAlbumArtSource::parse(&cfg.map_album_art_source) == MapAlbumArtSource::RustH264
-        && !cfg.map_album_art_video_display_id.trim().is_empty()
+    target_display_id(cfg).is_some()
 }
 
 pub(crate) fn maybe_feed_media_frame(
