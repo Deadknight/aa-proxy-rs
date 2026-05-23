@@ -52,7 +52,11 @@ struct CapturedPng {
 #[derive(Debug)]
 enum H264ArtCommand {
     CodecConfig { data: Vec<u8> },
-    VideoFrame { data: Vec<u8>, options: H264ArtOptions },
+    VideoFrame {
+        data: Vec<u8>,
+        options: H264ArtOptions,
+        is_idr: bool,
+    },
 }
 
 static H264_ART_TX: OnceLock<Sender<H264ArtCommand>> = OnceLock::new();
@@ -202,19 +206,19 @@ pub(crate) fn maybe_feed_media_frame(
                 return;
             }
             let media_data = &payload[TIMESTAMP_HEADER..];
-            if !contains_idr_nal(media_data) {
-                return;
-            }
+            let is_idr = contains_idr_nal(media_data);
             let options = H264ArtOptions::from_config(cfg);
             if h264_art_tx()
                 .send(H264ArtCommand::VideoFrame {
                     data: media_data.to_vec(),
                     options,
+                    is_idr,
                 })
                 .is_ok()
+                && is_idr
             {
                 info!(
-                    "map album art h264: queued IDR frame from display={} ch={:#04x} match={} ({} bytes)",
+                    "map album art h264: queued IDR sync frame from display={} ch={:#04x} match={} ({} bytes)",
                     matched_display,
                     channel,
                     match_reason,
@@ -227,17 +231,119 @@ pub(crate) fn maybe_feed_media_frame(
 }
 
 fn h264_worker(rx: Receiver<H264ArtCommand>) {
+    let mut decoder = Decoder::new();
     let mut codec_config: Option<Vec<u8>> = None;
+    let mut synced_to_idr = false;
     let mut last_emit_at: Option<Instant> = None;
     let mut last_warn_at: Option<Instant> = None;
+    let mut access_units_seen: u64 = 0;
+    let mut decoded_frames_seen: u64 = 0;
+    let mut idr_frames_seen: u64 = 0;
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             H264ArtCommand::CodecConfig { data } => {
+                decoder = Decoder::new();
+                synced_to_idr = false;
+                access_units_seen = 0;
+                decoded_frames_seen = 0;
+                idr_frames_seen = 0;
+                last_emit_at = None;
+
+                let nal_count = match feed_codec_config_to_decoder(&mut decoder, &data) {
+                    Ok(nal_count) => nal_count,
+                    Err(e) => {
+                        decoder = Decoder::new();
+                        throttle_warn(
+                            &mut last_warn_at,
+                            &format!("map album art h264: stored codec config but decoder rejected it: {}", e),
+                        );
+                        0
+                    }
+                };
+
+                info!(
+                    "map album art h264: stored codec config ({} bytes, nals={}); decoder reset, waiting for first IDR",
+                    data.len(),
+                    nal_count
+                );
                 codec_config = Some(data);
-                info!("map album art h264: stored codec config");
             }
-            H264ArtCommand::VideoFrame { data, options } => {
+            H264ArtCommand::VideoFrame {
+                data,
+                options,
+                is_idr,
+            } => {
+                access_units_seen = access_units_seen.saturating_add(1);
+
+                let Some(codec_config) = codec_config.as_ref() else {
+                    throttle_warn(
+                        &mut last_warn_at,
+                        "map album art h264: DATA arrived before codec config; skipping",
+                    );
+                    continue;
+                };
+
+                if !synced_to_idr && !is_idr {
+                    if access_units_seen == 1 || access_units_seen % 256 == 0 {
+                        info!(
+                            "map album art h264: waiting for first IDR before feeding P-frames (seen={} AUs)",
+                            access_units_seen
+                        );
+                    }
+                    continue;
+                }
+
+                if is_idr {
+                    idr_frames_seen = idr_frames_seen.saturating_add(1);
+
+                    // IDR is a clean random-access point. Re-prime the decoder with
+                    // the latest SPS/PPS before feeding this AU, then keep the same
+                    // decoder alive for all following P/B frames.
+                    decoder = Decoder::new();
+                    if let Err(e) = feed_codec_config_to_decoder(&mut decoder, codec_config) {
+                        decoder = Decoder::new();
+                        throttle_warn(
+                            &mut last_warn_at,
+                            &format!("map album art h264: failed to prime decoder from codec config; trying IDR anyway: {}", e),
+                        );
+                    }
+
+                    if synced_to_idr {
+                        info!(
+                            "map album art h264: IDR resync observed (idr_count={}, seen={} AUs, decoded={} frames)",
+                            idr_frames_seen,
+                            access_units_seen,
+                            decoded_frames_seen
+                        );
+                    } else {
+                        info!(
+                            "map album art h264: first IDR sync observed after {} AUs; starting continuous decode",
+                            access_units_seen
+                        );
+                    }
+                    synced_to_idr = true;
+                }
+
+                let (decoded, nal_count) = match feed_access_unit_to_decoder(&mut decoder, &data) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        throttle_warn(
+                            &mut last_warn_at,
+                            &format!("map album art h264: decoder rejected AU (idr={}): {}", is_idr, e),
+                        );
+                        if is_idr {
+                            synced_to_idr = false;
+                        }
+                        continue;
+                    }
+                };
+
+                let Some(frame) = decoded else {
+                    continue;
+                };
+                decoded_frames_seen = decoded_frames_seen.saturating_add(1);
+
                 let interval = Duration::from_millis(options.capture_interval_ms);
                 if options.capture_interval_ms > 0 {
                     if let Some(last) = last_emit_at {
@@ -247,12 +353,7 @@ fn h264_worker(rx: Receiver<H264ArtCommand>) {
                     }
                 }
 
-                let Some(codec_config) = codec_config.as_ref() else {
-                    throttle_warn(&mut last_warn_at, "map album art h264: IDR arrived before codec config; skipping");
-                    continue;
-                };
-
-                match decode_idr_to_png(codec_config, &data, &options) {
+                match capture_frame_to_png(&frame, nal_count, &options) {
                     Ok(captured) => {
                         if let Err(e) = validate_png(&captured.png, options.max_bytes) {
                             throttle_warn(
@@ -265,7 +366,7 @@ fn h264_worker(rx: Receiver<H264ArtCommand>) {
                         let version = global_album_art_store().set_png(RUST_H264_SOURCE, captured.png);
                         last_emit_at = Some(Instant::now());
                         info!(
-                            "map album art h264: captured map frame as PNG ({} bytes, version={}, frame={}x{}, crop=x{} y{} w{} h{}, output={}x{}, nals={}, codec_config={} bytes, idr={} bytes)",
+                            "map album art h264: captured decoded frame as PNG ({} bytes, version={}, frame={}x{}, crop=x{} y{} w{} h{}, output={}x{}, nals={}, au_idr={}, seen={} AUs, decoded={} frames, idrs={})",
                             bytes,
                             version,
                             captured.frame_width,
@@ -277,14 +378,16 @@ fn h264_worker(rx: Receiver<H264ArtCommand>) {
                             captured.output_size,
                             captured.output_size,
                             captured.nal_count,
-                            codec_config.len(),
-                            data.len()
+                            is_idr,
+                            access_units_seen,
+                            decoded_frames_seen,
+                            idr_frames_seen
                         );
                     }
                     Err(e) => {
                         throttle_warn(
                             &mut last_warn_at,
-                            &format!("map album art h264: failed to decode/capture IDR: {}", e),
+                            &format!("map album art h264: failed to capture decoded frame: {}", e),
                         );
                     }
                 }
@@ -303,22 +406,27 @@ fn throttle_warn(last_warn_at: &mut Option<Instant>, message: &str) {
     }
 }
 
-fn decode_idr_to_png(
-    codec_config: &[u8],
-    data: &[u8],
-    options: &H264ArtOptions,
-) -> Result<CapturedPng, String> {
-    let mut bitstream = Vec::with_capacity(codec_config.len() + data.len() + 8);
-    bitstream.extend_from_slice(codec_config);
-    bitstream.extend_from_slice(data);
-
-    let nals = parse_annex_b(&bitstream);
-    if nals.is_empty() {
-        return Err("no Annex-B NAL units found".to_string());
-    }
+fn feed_codec_config_to_decoder(decoder: &mut Decoder, codec_config: &[u8]) -> Result<usize, String> {
+    let nals = parse_annex_b(codec_config);
     let nal_count = nals.len();
 
-    let mut decoder = Decoder::new();
+    for nal in &nals {
+        decoder
+            .decode_nal(nal)
+            .map_err(|e| format!("codec config decoder error: {}", e))?;
+    }
+    Ok(nal_count)
+}
+
+fn feed_access_unit_to_decoder(
+    decoder: &mut Decoder,
+    data: &[u8],
+) -> Result<(Option<Frame>, usize), String> {
+    let nals = parse_annex_b(data);
+    if nals.is_empty() {
+        return Err("access unit contained no Annex-B NAL units".to_string());
+    }
+    let nal_count = nals.len();
     let mut decoded: Option<Frame> = None;
 
     for nal in &nals {
@@ -329,15 +437,15 @@ fn decode_idr_to_png(
         }
     }
 
-    if let Some(frame) = decoder.flush() {
-        decoded = Some(frame);
-    }
+    Ok((decoded, nal_count))
+}
 
-    let Some(frame) = decoded else {
-        return Err("decoder produced no frame".to_string());
-    };
-
-    let (png, crop, output_size) = frame_to_png(&frame, options)?;
+fn capture_frame_to_png(
+    frame: &Frame,
+    nal_count: usize,
+    options: &H264ArtOptions,
+) -> Result<CapturedPng, String> {
+    let (png, crop, output_size) = frame_to_png(frame, options)?;
     Ok(CapturedPng {
         png,
         frame_width: frame.width as usize,
