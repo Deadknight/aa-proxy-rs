@@ -361,6 +361,7 @@ fn ensure_map_album_art_h264_virtual_tap(
                 get_name(proxy_type)
             );
             ctx.map_album_art_h264_virtual_taps.clear();
+            crate::map_album_art_h264::clear_internal_tap_channel();
         }
         return;
     };
@@ -385,8 +386,13 @@ fn ensure_map_album_art_h264_virtual_tap(
                 target_display_id
             );
             ctx.map_album_art_h264_virtual_taps.clear();
+            crate::map_album_art_h264::clear_internal_tap_channel();
         }
         return;
+    }
+
+    if let Some(&channel) = target_channels.first() {
+        crate::map_album_art_h264::set_internal_tap_channel(target_display_id, channel);
     }
 
     ctx.map_album_art_h264_virtual_taps

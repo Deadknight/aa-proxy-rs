@@ -4,7 +4,7 @@ use log::{debug, info, warn};
 use rust_h264::decoder::{Decoder, Frame};
 use rust_h264::nal::parse_annex_b;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MEDIA_MESSAGE_CODEC_CONFIG: u16 = 0x0001;
@@ -47,6 +47,58 @@ enum H264ArtCommand {
 
 static H264_ART_TX: OnceLock<Sender<H264ArtCommand>> = OnceLock::new();
 
+#[derive(Clone, Debug)]
+struct SelectedInternalTap {
+    display_id: String,
+    channel: u8,
+}
+
+static SELECTED_INTERNAL_TAP: OnceLock<Mutex<Option<SelectedInternalTap>>> = OnceLock::new();
+
+fn selected_internal_tap() -> &'static Mutex<Option<SelectedInternalTap>> {
+    SELECTED_INTERNAL_TAP.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_internal_tap_channel(display_id: &str, channel: u8) {
+    let mut guard = selected_internal_tap().lock().unwrap();
+    let changed = guard
+        .as_ref()
+        .map(|tap| tap.display_id != display_id || tap.channel != channel)
+        .unwrap_or(true);
+
+    *guard = Some(SelectedInternalTap {
+        display_id: display_id.to_string(),
+        channel,
+    });
+
+    if changed {
+        info!(
+            "map album art h264: selected internal tap display={} ch={:#04x}",
+            display_id,
+            channel
+        );
+    }
+}
+
+pub(crate) fn clear_internal_tap_channel() {
+    let mut guard = selected_internal_tap().lock().unwrap();
+    if guard.take().is_some() {
+        info!("map album art h264: cleared selected internal tap");
+    }
+}
+
+fn internal_tap_matches(target_display_id: &str, channel: u8) -> Option<String> {
+    let guard = selected_internal_tap().lock().unwrap();
+    guard.as_ref().and_then(|tap| {
+        if tap.display_id == target_display_id && tap.channel == channel {
+            Some(tap.display_id.clone())
+        } else {
+            None
+        }
+    })
+}
+
+
 fn h264_art_tx() -> &'static Sender<H264ArtCommand> {
     H264_ART_TX.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<H264ArtCommand>();
@@ -88,18 +140,28 @@ pub(crate) fn maybe_feed_media_frame(
     }
 
     let target_display_id = cfg.map_album_art_video_display_id.trim();
+    let display_matches = inject_display_id
+        .map(|id| id == target_display_id)
+        .unwrap_or(false);
+    let internal_match_display = internal_tap_matches(target_display_id, channel);
 
-    let Some(inject_display_id) = inject_display_id else {
-        return;
-    };
-
-    if inject_display_id != target_display_id {
+    if !display_matches && internal_match_display.is_none() {
         return;
     }
 
     if frame_data.len() < 2 {
         return;
     }
+
+    let matched_display = inject_display_id
+        .map(|id| id.to_string())
+        .or(internal_match_display)
+        .unwrap_or_else(|| target_display_id.to_string());
+    let match_reason = if display_matches {
+        "display_id"
+    } else {
+        "internal_tap"
+    };
 
     let message_id = u16::from_be_bytes([frame_data[0], frame_data[1]]);
     match message_id {
@@ -115,9 +177,10 @@ pub(crate) fn maybe_feed_media_frame(
                 .is_ok()
             {
                 info!(
-                    "map album art h264: queued codec config from display={} ch={:#04x} ({} bytes)",
-                    inject_display_id,
+                    "map album art h264: queued codec config from display={} ch={:#04x} match={} ({} bytes)",
+                    matched_display,
                     channel,
+                    match_reason,
                     codec_data.len()
                 );
             }
@@ -141,9 +204,10 @@ pub(crate) fn maybe_feed_media_frame(
                 .is_ok()
             {
                 info!(
-                    "map album art h264: queued IDR frame from display={} ch={:#04x} ({} bytes)",
-                    inject_display_id,
+                    "map album art h264: queued IDR frame from display={} ch={:#04x} match={} ({} bytes)",
+                    matched_display,
                     channel,
+                    match_reason,
                     media_data.len()
                 );
             }
