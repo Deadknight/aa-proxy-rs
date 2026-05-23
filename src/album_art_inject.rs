@@ -20,6 +20,7 @@ pub(crate) struct MapAlbumArtInjector {
     observe_states: HashMap<u8, MetadataObserveState>,
     last_metadata: Option<CachedMetadata>,
     last_emitted_art_version: u64,
+    last_missing_template_log_version: u64,
 }
 
 pub(crate) enum AlbumArtProcessResult {
@@ -94,10 +95,13 @@ impl MapAlbumArtInjector {
         let cached = match self.last_metadata.clone() {
             Some(cached) => cached,
             None => {
-                debug!(
-                    "map album art: runtime artwork version {} is pending but no metadata template has been cached yet",
-                    replacement.version
-                );
+                if self.last_missing_template_log_version != replacement.version {
+                    info!(
+                        "map album art: runtime artwork version {} is pending but no MEDIA_PLAYBACK_METADATA template has been cached yet",
+                        replacement.version
+                    );
+                    self.last_missing_template_log_version = replacement.version;
+                }
                 return None;
             }
         };
@@ -262,11 +266,17 @@ impl MapAlbumArtInjector {
     }
 
     fn cache_metadata_template(&mut self, channel: u8, base_flags: u8, payload: Vec<u8>) {
+        let payload_len = payload.len();
         self.last_metadata = Some(CachedMetadata {
             channel,
             base_flags,
             payload,
         });
+        debug!(
+            "map album art: cached MEDIA_PLAYBACK_METADATA template channel={:#04x} payload={}",
+            channel,
+            payload_len
+        );
     }
 
     fn finish_rewrite(

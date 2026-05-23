@@ -1506,8 +1506,6 @@ pub async fn pkt_modify_hook(
                         ctx.injected_media_profile_ids
                             .get(&pkt.channel)
                             .map(|id| id.as_str()),
-                        ctx.map_album_art_h264_virtual_taps
-                            .contains_key(&pkt.channel),
                         &frame_data,
                     );
                 }

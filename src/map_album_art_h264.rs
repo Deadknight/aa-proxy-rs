@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::map_album_art::{global_album_art_store, validate_png, MapAlbumArtSource};
-use log::{debug, info, warn};
+use log::{info, warn};
 use rust_h264::decoder::{Decoder, Frame};
 use rust_h264::nal::parse_annex_b;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -37,6 +37,16 @@ impl H264ArtOptions {
             max_bytes: cfg.map_album_art_max_bytes,
         }
     }
+}
+
+#[derive(Debug)]
+struct CapturedPng {
+    png: Vec<u8>,
+    frame_width: usize,
+    frame_height: usize,
+    crop: CropRect,
+    output_size: u32,
+    nal_count: usize,
 }
 
 #[derive(Debug)]
@@ -243,21 +253,32 @@ fn h264_worker(rx: Receiver<H264ArtCommand>) {
                 };
 
                 match decode_idr_to_png(codec_config, &data, &options) {
-                    Ok(png) => {
-                        if let Err(e) = validate_png(&png, options.max_bytes) {
+                    Ok(captured) => {
+                        if let Err(e) = validate_png(&captured.png, options.max_bytes) {
                             throttle_warn(
                                 &mut last_warn_at,
                                 &format!("map album art h264: generated PNG rejected: {}", e),
                             );
                             continue;
                         }
-                        let bytes = png.len();
-                        let version = global_album_art_store().set_png(RUST_H264_SOURCE, png);
+                        let bytes = captured.png.len();
+                        let version = global_album_art_store().set_png(RUST_H264_SOURCE, captured.png);
                         last_emit_at = Some(Instant::now());
                         info!(
-                            "map album art h264: captured map frame as PNG ({} bytes, version={})",
+                            "map album art h264: captured map frame as PNG ({} bytes, version={}, frame={}x{}, crop=x{} y{} w{} h{}, output={}x{}, nals={}, codec_config={} bytes, idr={} bytes)",
                             bytes,
-                            version
+                            version,
+                            captured.frame_width,
+                            captured.frame_height,
+                            captured.crop.x,
+                            captured.crop.y,
+                            captured.crop.w,
+                            captured.crop.h,
+                            captured.output_size,
+                            captured.output_size,
+                            captured.nal_count,
+                            codec_config.len(),
+                            data.len()
                         );
                     }
                     Err(e) => {
@@ -286,7 +307,7 @@ fn decode_idr_to_png(
     codec_config: &[u8],
     data: &[u8],
     options: &H264ArtOptions,
-) -> Result<Vec<u8>, String> {
+) -> Result<CapturedPng, String> {
     let mut bitstream = Vec::with_capacity(codec_config.len() + data.len() + 8);
     bitstream.extend_from_slice(codec_config);
     bitstream.extend_from_slice(data);
@@ -295,6 +316,7 @@ fn decode_idr_to_png(
     if nals.is_empty() {
         return Err("no Annex-B NAL units found".to_string());
     }
+    let nal_count = nals.len();
 
     let mut decoder = Decoder::new();
     let mut decoded: Option<Frame> = None;
@@ -315,10 +337,18 @@ fn decode_idr_to_png(
         return Err("decoder produced no frame".to_string());
     };
 
-    frame_to_png(&frame, options)
+    let (png, crop, output_size) = frame_to_png(&frame, options)?;
+    Ok(CapturedPng {
+        png,
+        frame_width: frame.width as usize,
+        frame_height: frame.height as usize,
+        crop,
+        output_size,
+        nal_count,
+    })
 }
 
-fn frame_to_png(frame: &Frame, options: &H264ArtOptions) -> Result<Vec<u8>, String> {
+fn frame_to_png(frame: &Frame, options: &H264ArtOptions) -> Result<(Vec<u8>, CropRect, u32), String> {
     let width = frame.width as usize;
     let height = frame.height as usize;
     if width == 0 || height == 0 {
@@ -344,7 +374,8 @@ fn frame_to_png(frame: &Frame, options: &H264ArtOptions) -> Result<Vec<u8>, Stri
         }
     }
 
-    encode_rgb_png(output_size as u32, output_size as u32, &rgb)
+    let png = encode_rgb_png(output_size as u32, output_size as u32, &rgb)?;
+    Ok((png, crop, output_size as u32))
 }
 
 #[derive(Clone, Copy, Debug)]
