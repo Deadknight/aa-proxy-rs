@@ -356,6 +356,9 @@ pub struct AppConfig {
     pub map_album_art_capture_interval_ms: u64,
     /// Output artwork size in pixels after crop/resize.
     pub map_album_art_output_size_px: u32,
+    /// Enable cropping before resizing runtime video frames into album art.
+    /// When false, the full decoded frame is resized to the configured output size.
+    pub map_album_art_crop_enabled: bool,
     pub map_album_art_crop_x_percent: u8,
     pub map_album_art_crop_y_percent: u8,
     pub map_album_art_crop_w_percent: u8,
@@ -674,6 +677,7 @@ impl Default for AppConfig {
             map_album_art_video_display_id: "aux-1".to_string(),
             map_album_art_capture_interval_ms: 2_000,
             map_album_art_output_size_px: 256,
+            map_album_art_crop_enabled: true,
             map_album_art_crop_x_percent: 30,
             map_album_art_crop_y_percent: 20,
             map_album_art_crop_w_percent: 40,
@@ -938,6 +942,7 @@ impl AppConfig {
         doc["map_album_art_video_display_id"] = value(self.map_album_art_video_display_id.to_string());
         doc["map_album_art_capture_interval_ms"] = value(self.map_album_art_capture_interval_ms as i64);
         doc["map_album_art_output_size_px"] = value(self.map_album_art_output_size_px as i64);
+        doc["map_album_art_crop_enabled"] = value(self.map_album_art_crop_enabled);
         doc["map_album_art_crop_x_percent"] = value(self.map_album_art_crop_x_percent as i64);
         doc["map_album_art_crop_y_percent"] = value(self.map_album_art_crop_y_percent as i64);
         doc["map_album_art_crop_w_percent"] = value(self.map_album_art_crop_w_percent as i64);

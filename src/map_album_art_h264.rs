@@ -18,6 +18,7 @@ const MAX_OUTPUT_SIZE: u32 = 1024;
 struct H264ArtOptions {
     capture_interval_ms: u64,
     output_size_px: u32,
+    crop_enabled: bool,
     crop_x_percent: u8,
     crop_y_percent: u8,
     crop_w_percent: u8,
@@ -30,6 +31,7 @@ impl H264ArtOptions {
         Self {
             capture_interval_ms: cfg.map_album_art_capture_interval_ms,
             output_size_px: clamp_output_size(cfg.map_album_art_output_size_px),
+            crop_enabled: cfg.map_album_art_crop_enabled,
             crop_x_percent: cfg.map_album_art_crop_x_percent.min(100),
             crop_y_percent: cfg.map_album_art_crop_y_percent.min(100),
             crop_w_percent: cfg.map_album_art_crop_w_percent.min(100),
@@ -495,6 +497,15 @@ struct CropRect {
 }
 
 fn compute_crop(width: usize, height: usize, options: &H264ArtOptions) -> CropRect {
+    if !options.crop_enabled {
+        return CropRect {
+            x: 0,
+            y: 0,
+            w: width.max(1),
+            h: height.max(1),
+        };
+    }
+
     let crop_w = percent_size(width, options.crop_w_percent).unwrap_or(width).min(width).max(1);
     let crop_h = percent_size(height, options.crop_h_percent).unwrap_or(height).min(height).max(1);
 

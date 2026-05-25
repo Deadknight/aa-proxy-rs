@@ -424,6 +424,10 @@
           "typ": "integer",
           "description": "Output artwork size after crop/resize for runtime video providers. Default: 256 px."
         },
+        "map_album_art_crop_enabled": {
+          "typ": "boolean",
+          "description": "Enable crop before resizing runtime video frames into album art. Default: true. Set false to use the full decoded frame."
+        },
         "map_album_art_crop_x_percent": {
           "typ": "integer",
           "description": "Runtime video crop X offset in percent. Default: 30."
