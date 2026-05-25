@@ -19,11 +19,28 @@ struct H264ArtOptions {
     capture_interval_ms: u64,
     output_size_px: u32,
     crop_enabled: bool,
-    crop_x_percent: u8,
-    crop_y_percent: u8,
-    crop_w_percent: u8,
-    crop_h_percent: u8,
+    crop_mode: CropMode,
+    crop_x: u32,
+    crop_y: u32,
+    crop_w: u32,
+    crop_h: u32,
     max_bytes: usize,
+}
+
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CropMode {
+    Percent,
+    Pixel,
+}
+
+impl CropMode {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pixel" | "pixels" | "px" => Self::Pixel,
+            _ => Self::Percent,
+        }
+    }
 }
 
 impl H264ArtOptions {
@@ -32,10 +49,11 @@ impl H264ArtOptions {
             capture_interval_ms: cfg.map_album_art_capture_interval_ms,
             output_size_px: clamp_output_size(cfg.map_album_art_output_size_px),
             crop_enabled: cfg.map_album_art_crop_enabled,
-            crop_x_percent: cfg.map_album_art_crop_x_percent.min(100),
-            crop_y_percent: cfg.map_album_art_crop_y_percent.min(100),
-            crop_w_percent: cfg.map_album_art_crop_w_percent.min(100),
-            crop_h_percent: cfg.map_album_art_crop_h_percent.min(100),
+            crop_mode: CropMode::parse(&cfg.map_album_art_crop_mode),
+            crop_x: cfg.map_album_art_crop_x,
+            crop_y: cfg.map_album_art_crop_y,
+            crop_w: cfg.map_album_art_crop_w,
+            crop_h: cfg.map_album_art_crop_h,
             max_bytes: cfg.map_album_art_max_bytes,
         }
     }
@@ -498,21 +516,37 @@ struct CropRect {
 
 fn compute_crop(width: usize, height: usize, options: &H264ArtOptions) -> CropRect {
     if !options.crop_enabled {
-        return CropRect {
-            x: 0,
-            y: 0,
-            w: width.max(1),
-            h: height.max(1),
-        };
+        return full_frame_crop(width, height);
     }
 
-    let crop_w = percent_size(width, options.crop_w_percent).unwrap_or(width).min(width).max(1);
-    let crop_h = percent_size(height, options.crop_h_percent).unwrap_or(height).min(height).max(1);
+    match options.crop_mode {
+        CropMode::Percent => compute_percent_crop(width, height, options),
+        CropMode::Pixel => compute_pixel_crop(width, height, options),
+    }
+}
+
+fn full_frame_crop(width: usize, height: usize) -> CropRect {
+    CropRect {
+        x: 0,
+        y: 0,
+        w: width.max(1),
+        h: height.max(1),
+    }
+}
+
+fn compute_percent_crop(width: usize, height: usize, options: &H264ArtOptions) -> CropRect {
+    let crop_x_percent = options.crop_x.min(100) as usize;
+    let crop_y_percent = options.crop_y.min(100) as usize;
+    let crop_w_percent = options.crop_w.min(100);
+    let crop_h_percent = options.crop_h.min(100);
+
+    let crop_w = percent_size(width, crop_w_percent).unwrap_or(width).min(width).max(1);
+    let crop_h = percent_size(height, crop_h_percent).unwrap_or(height).min(height).max(1);
 
     let max_x = width.saturating_sub(crop_w);
     let max_y = height.saturating_sub(crop_h);
-    let x = (width.saturating_mul(options.crop_x_percent as usize) / 100).min(max_x);
-    let y = (height.saturating_mul(options.crop_y_percent as usize) / 100).min(max_y);
+    let x = (width.saturating_mul(crop_x_percent) / 100).min(max_x);
+    let y = (height.saturating_mul(crop_y_percent) / 100).min(max_y);
 
     CropRect {
         x,
@@ -522,7 +556,36 @@ fn compute_crop(width: usize, height: usize, options: &H264ArtOptions) -> CropRe
     }
 }
 
-fn percent_size(total: usize, percent: u8) -> Option<usize> {
+fn compute_pixel_crop(width: usize, height: usize, options: &H264ArtOptions) -> CropRect {
+    if width == 0 || height == 0 {
+        return full_frame_crop(width, height);
+    }
+
+    let x = (options.crop_x as usize).min(width.saturating_sub(1));
+    let y = (options.crop_y as usize).min(height.saturating_sub(1));
+    let max_w = width.saturating_sub(x).max(1);
+    let max_h = height.saturating_sub(y).max(1);
+
+    let crop_w = if options.crop_w == 0 {
+        max_w
+    } else {
+        (options.crop_w as usize).min(max_w).max(1)
+    };
+    let crop_h = if options.crop_h == 0 {
+        max_h
+    } else {
+        (options.crop_h as usize).min(max_h).max(1)
+    };
+
+    CropRect {
+        x,
+        y,
+        w: crop_w,
+        h: crop_h,
+    }
+}
+
+fn percent_size(total: usize, percent: u32) -> Option<usize> {
     if percent == 0 {
         None
     } else {

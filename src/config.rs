@@ -359,10 +359,16 @@ pub struct AppConfig {
     /// Enable cropping before resizing runtime video frames into album art.
     /// When false, the full decoded frame is resized to the configured output size.
     pub map_album_art_crop_enabled: bool,
-    pub map_album_art_crop_x_percent: u8,
-    pub map_album_art_crop_y_percent: u8,
-    pub map_album_art_crop_w_percent: u8,
-    pub map_album_art_crop_h_percent: u8,
+    /// Crop interpretation mode: percent or pixel.
+    pub map_album_art_crop_mode: String,
+    /// Crop X offset. Interpreted as percent or pixels according to map_album_art_crop_mode.
+    pub map_album_art_crop_x: u32,
+    /// Crop Y offset. Interpreted as percent or pixels according to map_album_art_crop_mode.
+    pub map_album_art_crop_y: u32,
+    /// Crop width. Interpreted as percent or pixels according to map_album_art_crop_mode.
+    pub map_album_art_crop_w: u32,
+    /// Crop height. Interpreted as percent or pixels according to map_album_art_crop_mode.
+    pub map_album_art_crop_h: u32,
     pub collect_speed: bool,
     pub disable_driving_status: bool,
     /// Optional shell command invoked on HU media-key long press.
@@ -678,10 +684,11 @@ impl Default for AppConfig {
             map_album_art_capture_interval_ms: 2_000,
             map_album_art_output_size_px: 256,
             map_album_art_crop_enabled: true,
-            map_album_art_crop_x_percent: 30,
-            map_album_art_crop_y_percent: 20,
-            map_album_art_crop_w_percent: 40,
-            map_album_art_crop_h_percent: 40,
+            map_album_art_crop_mode: "percent".to_string(),
+            map_album_art_crop_x: 30,
+            map_album_art_crop_y: 20,
+            map_album_art_crop_w: 40,
+            map_album_art_crop_h: 40,
             collect_speed: false,
             disable_driving_status: false,
             hu_button_handler: None,
@@ -943,10 +950,11 @@ impl AppConfig {
         doc["map_album_art_capture_interval_ms"] = value(self.map_album_art_capture_interval_ms as i64);
         doc["map_album_art_output_size_px"] = value(self.map_album_art_output_size_px as i64);
         doc["map_album_art_crop_enabled"] = value(self.map_album_art_crop_enabled);
-        doc["map_album_art_crop_x_percent"] = value(self.map_album_art_crop_x_percent as i64);
-        doc["map_album_art_crop_y_percent"] = value(self.map_album_art_crop_y_percent as i64);
-        doc["map_album_art_crop_w_percent"] = value(self.map_album_art_crop_w_percent as i64);
-        doc["map_album_art_crop_h_percent"] = value(self.map_album_art_crop_h_percent as i64);
+        doc["map_album_art_crop_mode"] = value(self.map_album_art_crop_mode.to_string());
+        doc["map_album_art_crop_x"] = value(self.map_album_art_crop_x as i64);
+        doc["map_album_art_crop_y"] = value(self.map_album_art_crop_y as i64);
+        doc["map_album_art_crop_w"] = value(self.map_album_art_crop_w as i64);
+        doc["map_album_art_crop_h"] = value(self.map_album_art_crop_h as i64);
         doc["collect_speed"] = value(self.collect_speed);
         doc["disable_driving_status"] = value(self.disable_driving_status);
         if let Some(cmd) = &self.hu_button_handler {
