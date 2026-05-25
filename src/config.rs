@@ -342,11 +342,7 @@ pub struct AppConfig {
     pub map_album_art_file: PathBuf,
     /// Maximum replacement PNG size accepted by all album-art providers.
     pub map_album_art_max_bytes: usize,
-    /// Album-art rewrite strategy:
-    /// in_place = keep protobuf/frame lengths unchanged and pad inside the original bytes field.
-    /// dynamic = rewrite album_art with the real PNG length and re-fragment the metadata.
-    pub map_album_art_rewrite_mode: String,
-    /// Plaintext payload size for FIRST fragments when dynamic re-fragmenting.
+    /// Plaintext payload size for FIRST fragments when re-fragmenting rewritten album-art metadata.
     /// Continuation fragments use this value + 4, matching the observed AA/OpenAuto layout.
     pub map_album_art_chunk_bytes: usize,
     /// Injected display profile id to sample when map_album_art_source = rust_h264 or companion.
@@ -678,7 +674,6 @@ impl Default for AppConfig {
             map_album_art_source: "file".to_string(),
             map_album_art_file: DEFAULT_MAP_ALBUM_ART_FILE.into(),
             map_album_art_max_bytes: 262_144,
-            map_album_art_rewrite_mode: "in_place".to_string(),
             map_album_art_chunk_bytes: 16_120,
             map_album_art_video_display_id: "aux-1".to_string(),
             map_album_art_capture_interval_ms: 2_000,
@@ -944,7 +939,6 @@ impl AppConfig {
         doc["map_album_art_source"] = value(self.map_album_art_source.to_string());
         doc["map_album_art_file"] = value(self.map_album_art_file.display().to_string());
         doc["map_album_art_max_bytes"] = value(self.map_album_art_max_bytes as i64);
-        doc["map_album_art_rewrite_mode"] = value(self.map_album_art_rewrite_mode.to_string());
         doc["map_album_art_chunk_bytes"] = value(self.map_album_art_chunk_bytes as i64);
         doc["map_album_art_video_display_id"] = value(self.map_album_art_video_display_id.to_string());
         doc["map_album_art_capture_interval_ms"] = value(self.map_album_art_capture_interval_ms as i64);
