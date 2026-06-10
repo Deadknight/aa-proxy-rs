@@ -2,10 +2,6 @@ use crate::mitm::protos::{Service, ServiceDiscoveryResponse, VendorExtensionServ
 use crate::mitm::{
     ModifyContext, Packet, PacketAction, Result, ENCRYPTED, FRAME_TYPE_FIRST, FRAME_TYPE_LAST,
 };
-use crate::packet_fragment::{
-    fragment_plain_payload, openauto_continuation_fragment_payload_bytes,
-    DEFAULT_FIRST_FRAGMENT_PAYLOAD_BYTES, PlainPayloadFragmentOptions,
-};
 #[cfg(feature = "wasm-scripting")]
 use crate::script_wasm::{LoadedScript, ScriptRegistry};
 use crate::web::ServerEvent;
@@ -299,18 +295,10 @@ fn build_vendor_app_reply_fragments_with_chunk_size(
 
         packets.push(Packet {
             channel,
-            opcode,
-            total_len,
-            packets.len(),
-            first_chunk,
-            continuation_chunk
-        );
-
-        if total_len >= 128 * 1024 {
-            info!("{}", log_line);
-        } else {
-            debug!("{}", log_line);
-        }
+            flags,
+            final_length: if first { Some(total_len) } else { None },
+            payload: chunk.to_vec(),
+        });
     }
 
     packets
@@ -341,26 +329,6 @@ struct VecRestCall {
     path: String,
     #[serde(default)]
     body: String,
-    #[serde(default)]
-    body_base64: Option<String>,
-}
-
-impl VecRestCall {
-    fn body_bytes(&self) -> std::result::Result<Vec<u8>, String> {
-        match self.body_base64.as_deref() {
-            Some(encoded) if !encoded.is_empty() => BASE64_STANDARD
-                .decode(encoded)
-                .map_err(|e| format!("invalid REST body_base64: {}", e)),
-            _ => Ok(self.body.as_bytes().to_vec()),
-        }
-    }
-}
-
-fn should_forward_rest_header(name: &str) -> bool {
-    !matches!(
-        name.to_ascii_lowercase().as_str(),
-        "content-length" | "host" | "connection" | "transfer-encoding"
-    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -731,7 +699,8 @@ pub(crate) async fn handle_vendor_channel_packet(
             };
 
             let channel = pkt.channel;
-            let result_call = rest_call_blocking_vec(rest_call, false);
+            let result_call =
+                rest_call_blocking(rest_call.method, rest_call.path, rest_call.body, false);
 
             *pkt =
                 build_vendor_app_reply(channel, COMPANION_OP_REST_CALL_RESULT, result_call.into_bytes());
@@ -780,7 +749,7 @@ pub(crate) async fn handle_vendor_channel_packet(
 
             tokio::spawn(async move {
                 let result_call = match tokio::task::spawn_blocking(move || {
-                    rest_call_blocking_vec(rest_call, false)
+                    rest_call_blocking(rest_call.method, rest_call.path, rest_call.body, false)
                 })
                 .await
                 {
@@ -891,41 +860,7 @@ pub(crate) async fn handle_vendor_channel_packet(
     }
 }
 
-fn rest_call_blocking_vec(rest_call: VecRestCall, whitelist: bool) -> String {
-    let body_bytes = match rest_call.body_bytes() {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return serde_json::json!({
-                "ok": false,
-                "status": 400,
-                "error": err,
-            })
-            .to_string();
-        }
-    };
-
-    rest_call_blocking_bytes(
-        rest_call.method,
-        rest_call.path,
-        rest_call.headers,
-        body_bytes,
-        whitelist,
-    )
-}
-
 pub fn rest_call_blocking(method: String, path: String, body: String, whitelist: bool) -> String {
-    let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "application/json".to_string());
-    rest_call_blocking_bytes(method, path, headers, body.into_bytes(), whitelist)
-}
-
-fn rest_call_blocking_bytes(
-    method: String,
-    path: String,
-    headers: HashMap<String, String>,
-    body_bytes: Vec<u8>,
-    whitelist: bool,
-) -> String {
     let path = path.trim();
 
     if whitelist {
@@ -953,40 +888,11 @@ fn rest_call_blocking_bytes(
     let url = format!("http://127.0.0.1{}", path);
 
     let result = match method.as_str() {
-        "GET" => {
-            let mut req = ureq::get(&url);
-            for (name, value) in &headers {
-                if should_forward_rest_header(name) {
-                    req = req.set(name, value);
-                }
-            }
-            req.call()
-        }
+        "GET" => ureq::get(&url).call(),
 
-        "POST" | "PUT" | "PATCH" => {
-            let mut req = match method.as_str() {
-                "POST" => ureq::post(&url),
-                "PUT" => ureq::put(&url),
-                "PATCH" => ureq::patch(&url),
-                _ => unreachable!(),
-            };
-
-            let has_content_type = headers
-                .keys()
-                .any(|name| name.eq_ignore_ascii_case("content-type"));
-
-            for (name, value) in &headers {
-                if should_forward_rest_header(name) {
-                    req = req.set(name, value);
-                }
-            }
-
-            if !has_content_type {
-                req = req.set("content-type", "application/json");
-            }
-
-            req.send_bytes(&body_bytes)
-        }
+        "POST" => ureq::post(&url)
+            .set("content-type", "application/json")
+            .send_string(&body),
 
         _ => {
             return r#"{"ok":false,"status":405,"error":"unsupported method"}"#.to_string();
