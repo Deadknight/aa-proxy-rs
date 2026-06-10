@@ -2,6 +2,10 @@ use crate::mitm::protos::{Service, ServiceDiscoveryResponse, VendorExtensionServ
 use crate::mitm::{
     ModifyContext, Packet, PacketAction, Result, ENCRYPTED, FRAME_TYPE_FIRST, FRAME_TYPE_LAST,
 };
+use crate::packet_fragment::{
+    fragment_plain_payload, openauto_continuation_fragment_payload_bytes,
+    DEFAULT_FIRST_FRAGMENT_PAYLOAD_BYTES, PlainPayloadFragmentOptions,
+};
 #[cfg(feature = "wasm-scripting")]
 use crate::script_wasm::{LoadedScript, ScriptRegistry};
 use crate::web::ServerEvent;
@@ -16,9 +20,11 @@ use crate::companion_protocol::{
 };
 #[cfg(not(feature = "wasm-scripting"))]
 type ScriptRegistry = ();
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use log::{debug, info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc::Sender, RwLock};
 use tokio::task::JoinHandle;
@@ -26,11 +32,11 @@ use tokio::task::JoinHandle;
 pub(crate) const OUR_COMPANION_SERVICE_NAME: &str = "aaproxy_companion";
 pub(crate) const OUR_COMPANION_PACKAGE: &str = "com.github.deadknight.aaproxycompanion";
 
-// Keep outbound custom companion app-data packets below the aa-proxy IO buffer
-// and below the sizes that some phone/HU stacks appear to tolerate on a
-// single vendor-extension channel frame. The AA transport supports FIRST /
-// middle / LAST fragmentation, so large REST responses are split here.
-const COMPANION_APP_FRAGMENT_CHUNK_SIZE: usize = 4 * 1024;
+// Use the same OpenAuto/aasdk-style plaintext split as dynamic packet
+// rewriters: FIRST ~= 16120 bytes, continuation ~= 16124 bytes. The old
+// 4 KiB VEC split turned large log responses into 100+ tiny AA frames and
+// could overload/drop the channel while the phone was fetching logs.
+const COMPANION_APP_FIRST_FRAGMENT_CHUNK_SIZE: usize = DEFAULT_FIRST_FRAGMENT_PAYLOAD_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VecChannelState {
@@ -243,43 +249,38 @@ fn build_vendor_app_reply_fragments(channel: u8, opcode: u8, payload: Vec<u8>) -
     out.push(opcode);
     out.extend_from_slice(&payload);
 
-    if out.len() <= COMPANION_APP_FRAGMENT_CHUNK_SIZE {
-        return vec![Packet {
+    let first_chunk = COMPANION_APP_FIRST_FRAGMENT_CHUNK_SIZE;
+    let continuation_chunk = openauto_continuation_fragment_payload_bytes(first_chunk);
+    let total_len = out.len();
+
+    let packets = fragment_plain_payload(
+        &out,
+        PlainPayloadFragmentOptions {
             channel,
             // Custom vendor app-data frame. Do not set CONTROL here.
-            flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
-            final_length: None,
-            payload: out,
-        }];
-    }
-
-    let total_len = out.len() as u32;
-    let total_chunks = (out.len() + COMPANION_APP_FRAGMENT_CHUNK_SIZE - 1) / COMPANION_APP_FRAGMENT_CHUNK_SIZE;
-
-    info!(
-        "VEC reply fragmented channel={:#04x} opcode={:#04x} total_len={} chunks={} chunk_size={}",
-        channel, opcode, total_len, total_chunks, COMPANION_APP_FRAGMENT_CHUNK_SIZE
+            base_flags: ENCRYPTED,
+            first_fragment_payload_bytes: first_chunk,
+            continuation_fragment_payload_bytes: continuation_chunk,
+            first_final_length: Some(total_len as u32),
+        },
     );
 
-    let mut packets = Vec::with_capacity(total_chunks);
-    for (index, chunk) in out.chunks(COMPANION_APP_FRAGMENT_CHUNK_SIZE).enumerate() {
-        let first = index == 0;
-        let last = index + 1 == total_chunks;
-
-        let mut flags = ENCRYPTED;
-        if first {
-            flags |= FRAME_TYPE_FIRST;
-        }
-        if last {
-            flags |= FRAME_TYPE_LAST;
-        }
-
-        packets.push(Packet {
+    if packets.len() > 1 {
+        let log_line = format!(
+            "VEC reply fragmented channel={:#04x} opcode={:#04x} total_len={} chunks={} first_chunk={} continuation_chunk={}",
             channel,
-            flags,
-            final_length: if first { Some(total_len) } else { None },
-            payload: chunk.to_vec(),
-        });
+            opcode,
+            total_len,
+            packets.len(),
+            first_chunk,
+            continuation_chunk
+        );
+
+        if total_len >= 128 * 1024 {
+            info!("{}", log_line);
+        } else {
+            debug!("{}", log_line);
+        }
     }
 
     packets
@@ -308,7 +309,30 @@ fn build_error_reply(channel: u8, message: impl Into<String>) -> Packet {
 struct VecRestCall {
     method: String,
     path: String,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
     body: String,
+    #[serde(default)]
+    body_base64: Option<String>,
+}
+
+impl VecRestCall {
+    fn body_bytes(&self) -> std::result::Result<Vec<u8>, String> {
+        match self.body_base64.as_deref() {
+            Some(encoded) if !encoded.is_empty() => BASE64_STANDARD
+                .decode(encoded)
+                .map_err(|e| format!("invalid REST body_base64: {}", e)),
+            _ => Ok(self.body.as_bytes().to_vec()),
+        }
+    }
+}
+
+fn should_forward_rest_header(name: &str) -> bool {
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-length" | "host" | "connection" | "transfer-encoding"
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -679,8 +703,7 @@ pub(crate) async fn handle_vendor_channel_packet(
             };
 
             let channel = pkt.channel;
-            let result_call =
-                rest_call_blocking(rest_call.method, rest_call.path, rest_call.body, false);
+            let result_call = rest_call_blocking_vec(rest_call, false);
 
             *pkt =
                 build_vendor_app_reply(channel, COMPANION_OP_REST_CALL_RESULT, result_call.into_bytes());
@@ -729,7 +752,7 @@ pub(crate) async fn handle_vendor_channel_packet(
 
             tokio::spawn(async move {
                 let result_call = match tokio::task::spawn_blocking(move || {
-                    rest_call_blocking(rest_call.method, rest_call.path, rest_call.body, false)
+                    rest_call_blocking_vec(rest_call, false)
                 })
                 .await
                 {
@@ -811,7 +834,41 @@ pub(crate) async fn handle_vendor_channel_packet(
     }
 }
 
+fn rest_call_blocking_vec(rest_call: VecRestCall, whitelist: bool) -> String {
+    let body_bytes = match rest_call.body_bytes() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return serde_json::json!({
+                "ok": false,
+                "status": 400,
+                "error": err,
+            })
+            .to_string();
+        }
+    };
+
+    rest_call_blocking_bytes(
+        rest_call.method,
+        rest_call.path,
+        rest_call.headers,
+        body_bytes,
+        whitelist,
+    )
+}
+
 pub fn rest_call_blocking(method: String, path: String, body: String, whitelist: bool) -> String {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    rest_call_blocking_bytes(method, path, headers, body.into_bytes(), whitelist)
+}
+
+fn rest_call_blocking_bytes(
+    method: String,
+    path: String,
+    headers: HashMap<String, String>,
+    body_bytes: Vec<u8>,
+    whitelist: bool,
+) -> String {
     let path = path.trim();
 
     if whitelist {
@@ -839,11 +896,40 @@ pub fn rest_call_blocking(method: String, path: String, body: String, whitelist:
     let url = format!("http://127.0.0.1{}", path);
 
     let result = match method.as_str() {
-        "GET" => ureq::get(&url).call(),
+        "GET" => {
+            let mut req = ureq::get(&url);
+            for (name, value) in &headers {
+                if should_forward_rest_header(name) {
+                    req = req.set(name, value);
+                }
+            }
+            req.call()
+        }
 
-        "POST" => ureq::post(&url)
-            .set("content-type", "application/json")
-            .send_string(&body),
+        "POST" | "PUT" | "PATCH" => {
+            let mut req = match method.as_str() {
+                "POST" => ureq::post(&url),
+                "PUT" => ureq::put(&url),
+                "PATCH" => ureq::patch(&url),
+                _ => unreachable!(),
+            };
+
+            let has_content_type = headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-type"));
+
+            for (name, value) in &headers {
+                if should_forward_rest_header(name) {
+                    req = req.set(name, value);
+                }
+            }
+
+            if !has_content_type {
+                req = req.set("content-type", "application/json");
+            }
+
+            req.send_bytes(&body_bytes)
+        }
 
         _ => {
             return r#"{"ok":false,"status":405,"error":"unsupported method"}"#.to_string();
@@ -854,18 +940,39 @@ pub fn rest_call_blocking(method: String, path: String, body: String, whitelist:
         Ok(response) => {
             let status = response.status();
 
-            let text = response.into_string().unwrap_or_else(|err| {
-                format!(
-                    r#"{{"ok":false,"error":"failed to read response: {}"}}"#,
-                    err
-                )
+            let mut headers = serde_json::Map::new();
+            for name in response.headers_names() {
+                if let Some(value) = response.header(&name) {
+                    headers.insert(name, serde_json::Value::String(value.to_string()));
+                }
+            }
+
+            let mut body_bytes = Vec::new();
+            if let Err(err) = response.into_reader().read_to_end(&mut body_bytes) {
+                return serde_json::json!({
+                    "ok": false,
+                    "status": status,
+                    "error": format!("failed to read response: {}", err),
+                })
+                .to_string();
+            }
+
+            let body_text = String::from_utf8(body_bytes.clone()).ok();
+            let body_base64 = BASE64_STANDARD.encode(&body_bytes);
+
+            let mut result = serde_json::json!({
+                "ok": true,
+                "status": status,
+                "headers": headers,
+                "body_base64": body_base64,
+                "body_encoding": "base64",
             });
 
-            format!(
-                r#"{{"ok":true,"status":{},"body":{}}}"#,
-                status,
-                serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string())
-            )
+            if let Some(text) = body_text {
+                result["body"] = serde_json::Value::String(text);
+            }
+
+            result.to_string()
         }
 
         Err(err) => {
