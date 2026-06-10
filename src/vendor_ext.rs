@@ -23,7 +23,7 @@ type ScriptRegistry = ();
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use log::{debug, info, warn};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Read;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc::Sender, RwLock};
@@ -32,11 +32,13 @@ use tokio::task::JoinHandle;
 pub(crate) const OUR_COMPANION_SERVICE_NAME: &str = "aaproxy_companion";
 pub(crate) const OUR_COMPANION_PACKAGE: &str = "com.github.deadknight.aaproxycompanion";
 
-// Use the same OpenAuto/aasdk-style plaintext split as dynamic packet
-// rewriters: FIRST ~= 16120 bytes, continuation ~= 16124 bytes. The old
-// 4 KiB VEC split turned large log responses into 100+ tiny AA frames and
-// could overload/drop the channel while the phone was fetching logs.
-const COMPANION_APP_FIRST_FRAGMENT_CHUNK_SIZE: usize = DEFAULT_FIRST_FRAGMENT_PAYLOAD_BYTES;
+// Keep outbound custom companion app-data packets below the aa-proxy IO buffer
+// and below the sizes that some phone/HU stacks appear to tolerate on a
+// single vendor-extension channel frame. The AA transport supports FIRST /
+// middle / LAST fragmentation, so large REST responses are split here.
+const COMPANION_APP_FRAGMENT_CHUNK_SIZE: usize = 4 * 1024;
+const COMPANION_APP_BINARY_REST_FRAGMENT_CHUNK_SIZE: usize = 16_120;
+const COMPANION_APP_BINARY_REST_FRAGMENT_PACE_MS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VecChannelState {
@@ -244,30 +246,58 @@ fn build_vendor_app_reply(channel: u8, opcode: u8, payload: Vec<u8>) -> Packet {
 }
 
 fn build_vendor_app_reply_fragments(channel: u8, opcode: u8, payload: Vec<u8>) -> Vec<Packet> {
+    build_vendor_app_reply_fragments_with_chunk_size(
+        channel,
+        opcode,
+        payload,
+        COMPANION_APP_FRAGMENT_CHUNK_SIZE,
+    )
+}
+
+fn build_vendor_app_reply_fragments_with_chunk_size(
+    channel: u8,
+    opcode: u8,
+    payload: Vec<u8>,
+    chunk_size: usize,
+) -> Vec<Packet> {
+    let chunk_size = chunk_size.max(1);
     let mut out = Vec::with_capacity(2 + payload.len());
     out.push(COMPANION_APP_VERSION);
     out.push(opcode);
     out.extend_from_slice(&payload);
 
-    let first_chunk = COMPANION_APP_FIRST_FRAGMENT_CHUNK_SIZE;
-    let continuation_chunk = openauto_continuation_fragment_payload_bytes(first_chunk);
-    let total_len = out.len();
-
-    let packets = fragment_plain_payload(
-        &out,
-        PlainPayloadFragmentOptions {
+    if out.len() <= chunk_size {
+        return vec![Packet {
             channel,
             // Custom vendor app-data frame. Do not set CONTROL here.
-            base_flags: ENCRYPTED,
-            first_fragment_payload_bytes: first_chunk,
-            continuation_fragment_payload_bytes: continuation_chunk,
-            first_final_length: Some(total_len as u32),
-        },
+            flags: ENCRYPTED | FRAME_TYPE_FIRST | FRAME_TYPE_LAST,
+            final_length: None,
+            payload: out,
+        }];
+    }
+
+    let total_len = out.len() as u32;
+    let total_chunks = (out.len() + chunk_size - 1) / chunk_size;
+
+    info!(
+        "VEC reply fragmented channel={:#04x} opcode={:#04x} total_len={} chunks={} chunk_size={}",
+        channel, opcode, total_len, total_chunks, chunk_size
     );
 
-    if packets.len() > 1 {
-        let log_line = format!(
-            "VEC reply fragmented channel={:#04x} opcode={:#04x} total_len={} chunks={} first_chunk={} continuation_chunk={}",
+    let mut packets = Vec::with_capacity(total_chunks);
+    for (index, chunk) in out.chunks(chunk_size).enumerate() {
+        let first = index == 0;
+        let last = index + 1 == total_chunks;
+
+        let mut flags = ENCRYPTED;
+        if first {
+            flags |= FRAME_TYPE_FIRST;
+        }
+        if last {
+            flags |= FRAME_TYPE_LAST;
+        }
+
+        packets.push(Packet {
             channel,
             opcode,
             total_len,
@@ -309,8 +339,6 @@ fn build_error_reply(channel: u8, message: impl Into<String>) -> Packet {
 struct VecRestCall {
     method: String,
     path: String,
-    #[serde(default)]
-    headers: HashMap<String, String>,
     #[serde(default)]
     body: String,
     #[serde(default)]
@@ -762,6 +790,9 @@ pub(crate) async fn handle_vendor_channel_packet(
                     }
                 };
 
+                let binary_rest_response = result_call.contains("\"body_encoding\":\"base64\"")
+                    || result_call.contains("\"body_encoding\": \"base64\"");
+
                 let result_payload = VecRestCallResult {
                     request_id: request_id_for_task,
                     payload: result_call,
@@ -788,15 +819,41 @@ pub(crate) async fn handle_vendor_channel_packet(
                     }
                 };
 
-                if let Err(e) = send_vendor_app_reply_fragments(
-                    tx,
+                let chunk_size = if binary_rest_response {
+                    COMPANION_APP_BINARY_REST_FRAGMENT_CHUNK_SIZE
+                } else {
+                    COMPANION_APP_FRAGMENT_CHUNK_SIZE
+                };
+
+                if binary_rest_response {
+                    info!(
+                        "VEC REST result uses binary-safe chunk size: channel={:#04x} chunk_size={} payload_len={}",
+                        channel,
+                        chunk_size,
+                        payload.len()
+                    );
+                }
+
+                let replies = build_vendor_app_reply_fragments_with_chunk_size(
                     channel,
                     COMPANION_OP_REST_CALL_RESULT,
                     payload.into_bytes(),
-                )
-                .await
-                {
-                    warn!("Failed to send async VEC REST result to phone: {}", e);
+                    chunk_size,
+                );
+
+                let reply_count = replies.len();
+                for (index, reply) in replies.into_iter().enumerate() {
+                    if let Err(e) = tx.send(reply).await {
+                        warn!("Failed to send async VEC REST result to phone: {}", e);
+                        break;
+                    }
+
+                    if binary_rest_response && index + 1 < reply_count {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            COMPANION_APP_BINARY_REST_FRAGMENT_PACE_MS,
+                        ))
+                        .await;
+                    }
                 }
             });
 
@@ -939,40 +996,48 @@ fn rest_call_blocking_bytes(
     match result {
         Ok(response) => {
             let status = response.status();
+            let mut bytes = Vec::new();
 
-            let mut headers = serde_json::Map::new();
-            for name in response.headers_names() {
-                if let Some(value) = response.header(&name) {
-                    headers.insert(name, serde_json::Value::String(value.to_string()));
+            if let Err(err) = response.into_reader().read_to_end(&mut bytes) {
+                return format!(
+                    r#"{{"ok":false,"status":{},"error":{}}}"#,
+                    status,
+                    serde_json::to_string(&format!("failed to read response: {}", err))
+                        .unwrap_or_else(|_| "\"failed to read response\"".to_string())
+                );
+            }
+
+            match String::from_utf8(bytes) {
+                Ok(text) => {
+                    // Keep the old text response shape for normal JSON/config calls.
+                    // This avoids changing the already-working VEC config path.
+                    format!(
+                        r#"{{"ok":true,"status":{},"body":{}}}"#,
+                        status,
+                        serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string())
+                    )
+                }
+                Err(err) => {
+                    let bytes = err.into_bytes();
+                    let body_base64 = BASE64_STANDARD.encode(&bytes);
+                    info!(
+                        "VEC REST binary response method={} path={} status={} body_bytes={} body_base64_chars={}",
+                        method,
+                        path,
+                        status,
+                        bytes.len(),
+                        body_base64.len()
+                    );
+
+                    serde_json::json!({
+                        "ok": true,
+                        "status": status,
+                        "body_base64": body_base64,
+                        "body_encoding": "base64",
+                    })
+                    .to_string()
                 }
             }
-
-            let mut body_bytes = Vec::new();
-            if let Err(err) = response.into_reader().read_to_end(&mut body_bytes) {
-                return serde_json::json!({
-                    "ok": false,
-                    "status": status,
-                    "error": format!("failed to read response: {}", err),
-                })
-                .to_string();
-            }
-
-            let body_text = String::from_utf8(body_bytes.clone()).ok();
-            let body_base64 = BASE64_STANDARD.encode(&body_bytes);
-
-            let mut result = serde_json::json!({
-                "ok": true,
-                "status": status,
-                "headers": headers,
-                "body_base64": body_base64,
-                "body_encoding": "base64",
-            });
-
-            if let Some(text) = body_text {
-                result["body"] = serde_json::Value::String(text);
-            }
-
-            result.to_string()
         }
 
         Err(err) => {
