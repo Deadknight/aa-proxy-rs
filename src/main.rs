@@ -1018,6 +1018,11 @@ async fn tokio_main(
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
+        } else if cfg.wired.is_some() {
+            // Wired USB mode uses the phone USB transport directly. Do not also
+            // start the normal AA Wireless Bluetooth handshake here; otherwise
+            // wildcard `connect` would load known_devices and try to nudge the
+            // same phone over BR/EDR while the USB path is being prepared.
         } else if let Some(ref wifi_conf) = wifi_config {
             if !usb_connected.load(Ordering::Relaxed)
                 && (!(cfg.quick_reconnect && profile_connected.load(Ordering::Relaxed))

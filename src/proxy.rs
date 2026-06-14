@@ -744,8 +744,6 @@ pub async fn io_loop(
             );
             usb_connected.store(false, Ordering::Relaxed);
         } else if config.wired.is_some() {
-            info!("{} 💤 waiting for USB or bluetooth handshake...", NAME);
-
             let wired_clone = config.wired.clone();
             let usb_future = async move {
                 loop {
@@ -756,37 +754,53 @@ pub async fn io_loop(
                 }
             };
 
-            tokio::select! {
-                usb_res = usb_future => {
-                    info!("{} 🔌 USB device connected, disabling wireless...", NAME);
-                    usb_connected.store(true, Ordering::Relaxed);
-                    usb_used = true;
-                    md_usb = Some(usb_res);
-                }
-                _ = tcp_start.notified() => {
-                    info!("{} 🛰️ MD TCP server: listening for phone connection...", NAME);
-                    if let Ok((s, ip, cancel)) = tcp_wait_for_connection(
-                            listener_ref!(md_listener),
-                            true,
-                            media_tap_endpoints.clone(),
-                            companion_ip.clone(),
-                        )
-                        .await {
-                        md_tcp = Some(s);
-                        client_mac = mac_from_ipv4(ip).await.unwrap_or(None);
-                        bridge_cancel = Some(cancel);
-                        let seq = tcp_phone_connection_seq.fetch_add(1, Ordering::Relaxed) + 1;
-                        info!(
-                            "{} 🧪 bt-wireless-proxy car-wifi-mitm: PHONE TCP accepted on MD listener; commit barrier seq={}",
-                            NAME,
-                            seq
-                        );
-                        tcp_phone_connected.notify_one();
-                    } else {
-                        let _ = need_restart.send(None);
-                        continue;
+            if config.bt_wireless_proxy {
+                // bt_wireless_proxy still uses tcp_start as its phone-side commit signal.
+                // Keep the old hybrid wait only for that explicit proxy mode.
+                info!(
+                    "{} 💤 waiting for USB or bt_wireless_proxy handshake...",
+                    NAME
+                );
+
+                tokio::select! {
+                    usb_res = usb_future => {
+                        info!("{} 🔌 USB device connected, disabling wireless...", NAME);
+                        usb_connected.store(true, Ordering::Relaxed);
+                        usb_used = true;
+                        md_usb = Some(usb_res);
+                    }
+                    _ = tcp_start.notified() => {
+                        info!("{} 🛰️ MD TCP server: listening for phone connection...", NAME);
+                        if let Ok((s, ip, cancel)) = tcp_wait_for_connection(
+                                listener_ref!(md_listener),
+                                true,
+                                media_tap_endpoints.clone(),
+                                companion_ip.clone(),
+                            )
+                            .await {
+                            md_tcp = Some(s);
+                            client_mac = mac_from_ipv4(ip).await.unwrap_or(None);
+                            bridge_cancel = Some(cancel);
+                            let seq = tcp_phone_connection_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                            info!(
+                                "{} 🧪 bt-wireless-proxy car-wifi-mitm: PHONE TCP accepted on MD listener; commit barrier seq={}",
+                                NAME,
+                                seq
+                            );
+                            tcp_phone_connected.notify_one();
+                        } else {
+                            let _ = need_restart.send(None);
+                            continue;
+                        }
                     }
                 }
+            } else {
+                info!("{} 💤 waiting for USB device...", NAME);
+                let usb_res = usb_future.await;
+                info!("{} 🔌 USB device connected", NAME);
+                usb_connected.store(true, Ordering::Relaxed);
+                usb_used = true;
+                md_usb = Some(usb_res);
             }
         } else {
             info!("{} 💤 waiting for bluetooth handshake...", NAME);
